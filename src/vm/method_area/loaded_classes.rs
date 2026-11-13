@@ -1,10 +1,12 @@
 use crate::vm::error::{Error, Result};
+use crate::vm::execution_engine::executor::Executor;
+use crate::vm::heap::construction::InstancePlan;
 use crate::vm::heap::heap::HEAP;
-use crate::vm::heap::java_instance::{JavaInstance, JavaInstanceBase, JavaInstanceClass};
 use crate::vm::helper::undecorate;
 use crate::vm::method_area::java_class::JavaClass;
 use crate::vm::method_area::method_area::with_method_area;
 use crate::vm::method_area::primitives_helper::PRIMITIVE_TYPE_BY_CODE;
+use crate::vm::stack::rooted_slots::RootedSlots;
 use crate::vm::UNNAMED_MODULE_REF;
 use dashmap::DashMap;
 use derive_new::new;
@@ -19,6 +21,7 @@ pub(crate) static CLASSES: LazyLock<LoadedClasses> = LazyLock::new(LoadedClasses
 
 #[derive(Debug, Default)]
 pub(crate) struct LoadedClasses {
+    loading: super::class_loading::Loading,
     loaded_classes: DashMap<String, Arc<ClassEntry>>,
     id_index: DashMap<usize, Arc<ClassEntry>>,
     next_id: AtomicUsize,
@@ -37,6 +40,42 @@ const CLASS: &str = "java/lang/Class";
 const CLASS_FILE_ACCESS_FLAGS: &str = "classFileAccessFlags";
 
 impl LoadedClasses {
+    /// Quiescent inspection only. Copy Arcs out of one index before reading any
+    /// class state; never acquire a publication claim or require a mirror.
+    pub(crate) fn root_refs(&self) -> Result<Vec<i32>> {
+        let classes: Vec<_> = self
+            .id_index
+            .iter()
+            .map(|entry| Arc::clone(&entry.klass))
+            .collect();
+        let mut roots = Vec::new();
+        for class in classes {
+            roots.extend(class.root_refs()?);
+        }
+        Ok(roots)
+    }
+
+    /// Inspection only: never class-loads or re-enters Java while collecting a trace.
+    pub(crate) fn get_loaded(&self, name: &str) -> Option<Arc<JavaClass>> {
+        self.get_full_impl(name).map(|(_, _, klass)| klass)
+    }
+
+    /// Returns the class mirror for a synchronized static method. A class can be inserted into
+    /// the registry just before its mirror is published, so wait for the same per-name publication
+    /// claim instead of running the method with a missing class monitor.
+    pub(crate) fn class_mirror_ref(&self, name: &str) -> Result<i32> {
+        if let Some(reference) = self
+            .get_full_impl(name)
+            .and_then(|(_, _, klass)| klass.mirror_ref_if_present())
+        {
+            return Ok(reference);
+        }
+
+        let _claim = self.loading.claim(name);
+        self.get_full_impl(name)
+            .and_then(|(_, _, klass)| klass.mirror_ref_if_present())
+            .ok_or_else(|| Error::new_execution("Class mirror is not published"))
+    }
     /// Checks if class is already loaded
     pub fn is_loaded(&self, fully_qualified_class_name: &str) -> bool {
         let fully_qualified_class_name = undecorate(fully_qualified_class_name);
@@ -65,18 +104,33 @@ impl LoadedClasses {
     ) -> Result<(usize, String, Arc<JavaClass>)> {
         let fully_qualified_class_name = undecorate(fully_qualified_class_name);
 
-        if let Some((id, key, klass)) = self.get_full_impl(fully_qualified_class_name) {
-            return Ok((id, key, klass));
+        self.get_or_load(fully_qualified_class_name, || {
+            if fully_qualified_class_name.starts_with('[') {
+                Ok(Self::generate_synthetic_array_class(
+                    fully_qualified_class_name,
+                ))
+            } else {
+                with_method_area(|a| a.load_class_file(fully_qualified_class_name))
+            }
+        })
+    }
+
+    /// The loader may execute Java and publish this name itself.
+    fn get_or_load(
+        &self,
+        fully_qualified_class_name: &str,
+        load: impl FnOnce() -> Result<Arc<JavaClass>>,
+    ) -> Result<(usize, String, Arc<JavaClass>)> {
+        {
+            // Wait for an in-flight publication, but never own the name while loading:
+            // load_class_file can enter Java's per-name class-loading monitor.
+            let _claim = self.loading.claim(fully_qualified_class_name);
+            if let Some((id, key, klass)) = self.get_full_impl(fully_qualified_class_name) {
+                return Ok((id, key, klass));
+            }
         }
 
-        // todo loading class can be called concurrently from multiple threads - not critical but it's better to handle that
-        let klass = if fully_qualified_class_name.starts_with('[') {
-            Self::generate_synthetic_array_class(fully_qualified_class_name)
-        } else {
-            with_method_area(|a| a.load_class_file(fully_qualified_class_name))?
-        };
-
-        self.insert_klass(klass, None)
+        self.insert_klass(load()?, None)
     }
 
     fn get_full_impl(
@@ -102,10 +156,15 @@ impl LoadedClasses {
         class_loader_ref: Option<i32>,
     ) -> Result<(usize, String, Arc<JavaClass>)> {
         let fully_qualified_class_name = klass.this_class_name();
-        if let Some((id, key, klass)) = self.get_full_impl(fully_qualified_class_name) {
-            return Ok((id, key.to_string(), Arc::clone(&klass)));
+        {
+            let _claim = self.loading.claim(fully_qualified_class_name);
+            if let Some((id, key, klass)) = self.get_full_impl(fully_qualified_class_name) {
+                return Ok((id, key, klass));
+            }
         }
 
+        // Array component loading may re-enter Java too. Only perform_insertion
+        // claims a name, after preparing everything that can load another class.
         if !fully_qualified_class_name.starts_with('[') {
             // this is not an array class - insert directly
             self.perform_insertion(&klass, None, class_loader_ref)
@@ -136,22 +195,26 @@ impl LoadedClasses {
         class_loader_ref: Option<i32>,
     ) -> Result<(usize, String, Arc<JavaClass>)> {
         let fully_qualified_class_name = klass.this_class_name();
+        let (class_klass_id, _name, class_klass) = self.get_full_impl(CLASS).ok_or_else(|| {
+            Error::new_execution(&format!("{CLASS} class not found in loaded classes"))
+        })?;
+        // Lazy field layout resolution can load classes; prepare it before claiming.
+        let class_instance = class_klass.new_instance(class_klass_id)?;
+
+        let _claim = self.loading.claim(fully_qualified_class_name);
         if let Some((id, key, klass)) = self.get_full_impl(fully_qualified_class_name) {
-            return Ok((id, key.to_string(), Arc::clone(&klass)));
+            // A loader that won during preparation owns the one initialization state.
+            return Ok((id, key, klass));
         }
 
         let klass_id = self.insert_full_impl(fully_qualified_class_name, Arc::clone(klass));
         trace!("<CLASS LOADED> -> {}", fully_qualified_class_name);
 
-        let (class_klass_id, _name, class_klass) = self.get_full_impl(CLASS).ok_or_else(|| {
-            Error::new_execution(&format!("{CLASS} class not found in loaded classes"))
-        })?;
-
         Self::create_clazz_instance(
             klass,
             klass_id,
             &class_klass,
-            class_klass_id,
+            class_instance,
             component_type_ref,
             class_loader_ref,
         )?;
@@ -221,24 +284,22 @@ impl LoadedClasses {
         klass: &Arc<JavaClass>,
         klass_id: usize,
         class_klass: &Arc<JavaClass>,
-        class_klass_id: usize,
+        class_instance: InstancePlan,
         component_type_ref: Option<i32>,
         class_loader_ref: Option<i32>,
     ) -> Result<()> {
-        let mut class_instance = JavaInstance::Class(JavaInstanceClass::new(
-            JavaInstanceBase::new(
-                class_klass_id,
-                class_klass.instance_fields_hierarchy()?.clone(),
-            ),
-            klass_id,
-        ));
-        class_instance.set_field_value(
+        let mut destination = RootedSlots::new();
+        let class_instance_id =
+            HEAP.create_instance(class_instance.mirror(klass_id), &mut destination)?;
+        HEAP.set_object_field_value(
+            class_instance_id,
             CLASS,
             "componentType",
             vec![component_type_ref.unwrap_or(0)],
         )?;
 
-        class_instance.set_field_value(
+        HEAP.set_object_field_value(
+            class_instance_id,
             CLASS,
             "primitive",
             vec![
@@ -250,43 +311,72 @@ impl LoadedClasses {
             ],
         )?;
         let class_modifiers = klass.reflection_modifiers();
-        class_instance.set_field_value(CLASS, "modifiers", vec![class_modifiers as i32])?;
+        HEAP.set_object_field_value(
+            class_instance_id,
+            CLASS,
+            "modifiers",
+            vec![class_modifiers as i32],
+        )?;
         // JDK 26+ keeps the raw class file access flags in the mirror instead of fetching them
         // through the `Reflection.getClassAccessFlags` native.
         if class_klass
             .instance_field_descriptor(CLASS_FILE_ACCESS_FLAGS)
             .is_some()
         {
-            class_instance.set_field_value(
+            HEAP.set_object_field_value(
+                class_instance_id,
                 CLASS,
                 CLASS_FILE_ACCESS_FLAGS,
                 vec![klass.class_modifiers().bits() as i32],
             )?;
         }
 
-        class_instance.set_field_value(
+        HEAP.set_object_field_value(
+            class_instance_id,
             CLASS,
             "classLoader",
             vec![class_loader_ref.unwrap_or(0)],
         )?;
 
-        let (module_ref, patch) = with_method_area(|a| {
+        let (module_ref, patch, is_unnamed_module) = with_method_area(|a| {
             let file_name = format!("{}.class", Self::module_owner(klass.this_class_name()));
             if let Some(package) = a.modules_mapping().get(&file_name) {
                 let modules = a.modules();
                 let registry = modules.registry();
                 let module_ref = registry.get(package).map(|got| *got.value()).unwrap_or(0);
                 let patch = package == "java.base" && module_ref == 0;
-                Ok::<_, Error>((module_ref, patch))
+                Ok::<_, Error>((module_ref, patch, false))
             } else {
-                // Set unnamed module
-                let module_ref = UNNAMED_MODULE_REF.get().copied().unwrap_or(0); // todo: use unnamed module per classloader
-                Ok::<_, Error>((module_ref, false))
+                Ok::<_, Error>((0, false, true))
             }
         })?;
-        class_instance.set_field_value(CLASS, "module", vec![module_ref])?;
-
-        let class_instance_id = HEAP.create_instance(class_instance);
+        // System.initPhase3 may load the configured system-loader class before the VM publishes
+        // its canonical unnamed-module reference. Use the defining loader's module in that window.
+        let early_unnamed_module = if is_unnamed_module && UNNAMED_MODULE_REF.get().is_none() {
+            class_loader_ref
+                .filter(|class_loader_ref| *class_loader_ref != 0)
+                .map(|class_loader_ref| {
+                    Executor::invoke_non_static_method(
+                        "java/lang/ClassLoader",
+                        "getUnnamedModule:()Ljava/lang/Module;",
+                        class_loader_ref,
+                        &[],
+                    )
+                })
+                .transpose()?
+        } else {
+            None
+        };
+        let module_ref = if is_unnamed_module {
+            early_unnamed_module
+                .as_ref()
+                .map(|module| module[0].value())
+                .or_else(|| UNNAMED_MODULE_REF.get().copied())
+                .unwrap_or(0)
+        } else {
+            module_ref
+        };
+        HEAP.set_object_field_value(class_instance_id, CLASS, "module", vec![module_ref])?;
 
         with_method_area(|method_area| {
             if patch {
@@ -356,7 +446,7 @@ impl LoadedClasses {
                 &class_klass,
                 class_klass_id,
                 &class_klass,
-                class_klass_id,
+                class_klass.new_instance(class_klass_id)?,
                 None,
                 None,
             )?;
@@ -370,7 +460,7 @@ impl LoadedClasses {
                 &object_klass,
                 object_klass_id,
                 &class_klass,
-                class_klass_id,
+                class_klass.new_instance(class_klass_id)?,
                 None,
                 None,
             )?;
@@ -396,3 +486,7 @@ impl LoadedClasses {
         ))
     }
 }
+
+#[cfg(test)]
+#[path = "loaded_classes_tests.rs"]
+mod tests;

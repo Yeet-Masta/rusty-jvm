@@ -5,14 +5,21 @@ use crate::vm::helper::create_array_of_strings;
 use crate::vm::properties::system_properties::{
     OVERRIDDEN_PLATFORM_PROPERTIES, OVERRIDDEN_VM_PROPERTIES,
 };
+use crate::vm::stack::rooted_slots::RootedSlots;
 
 /// `jdk.internal.util.SystemProps$Raw.platformProperties()[Ljava/lang/String;`
 pub(crate) fn platform_properties() -> Result<i32> {
     let properties = get_platform_properties()?;
-    let array_ref = HEAP.create_array("[Ljava/lang/String;", properties.len() as i32);
+    let mut destination = RootedSlots::new();
+    let array_ref = HEAP.create_array(
+        "[Ljava/lang/String;",
+        properties.len() as i32,
+        &mut destination,
+    )?;
     for (index, value) in properties.iter().enumerate() {
         // an unset property stays null
         if let Some(value) = value {
+            // interned, so permanently rooted
             let string_ref = StringPoolHelper::get_string(value)?;
             HEAP.set_array_value(array_ref, index as i32, vec![string_ref])?;
         }

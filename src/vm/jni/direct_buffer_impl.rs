@@ -2,6 +2,7 @@ use crate::vm::error::Result;
 use crate::vm::execution_engine::executor::Executor;
 use crate::vm::heap::heap::HEAP;
 use crate::vm::helper::vec_to_i64;
+use crate::vm::jni::handles;
 use crate::vm::jni::jni_invoke::jni_invoke_scalar;
 use crate::vm::method_area::instance_checker::InstanceChecker;
 use jni_sys::{jlong, jobject, JNIEnv};
@@ -13,6 +14,7 @@ pub(super) extern "system" fn new_direct_byte_buffer(
     address: *mut c_void,
     capacity: jlong,
 ) -> jobject {
+    let _managed = crate::vm::safepoint::ManagedAccess::enter();
     // The constructor rejects a negative or oversized capacity with an IllegalArgumentException,
     // which is left pending for the caller.
     let result = Executor::invoke_args_constructor(
@@ -30,6 +32,7 @@ pub(super) extern "system" fn get_direct_buffer_address(
     _env: *mut JNIEnv,
     buffer: jobject,
 ) -> *mut c_void {
+    let _managed = crate::vm::safepoint::ManagedAccess::enter();
     direct_buffer_field(buffer, "address")
         .map(|value| vec_to_i64(&value) as usize as *mut c_void)
         .unwrap_or(null_mut())
@@ -40,6 +43,7 @@ pub(super) extern "system" fn get_direct_buffer_capacity(
     _env: *mut JNIEnv,
     buffer: jobject,
 ) -> jlong {
+    let _managed = crate::vm::safepoint::ManagedAccess::enter();
     direct_buffer_field(buffer, "capacity")
         .and_then(|value| value.first().copied())
         .map(jlong::from)
@@ -47,7 +51,7 @@ pub(super) extern "system" fn get_direct_buffer_capacity(
 }
 
 fn direct_buffer_field(buffer: jobject, field_name: &str) -> Option<Vec<i32>> {
-    let buffer_ref = buffer as i32;
+    let buffer_ref = handles::resolve(buffer)?;
     is_direct_buffer(buffer_ref)
         .ok()?
         .then(|| HEAP.get_object_field_value(buffer_ref, "java/nio/Buffer", field_name))?

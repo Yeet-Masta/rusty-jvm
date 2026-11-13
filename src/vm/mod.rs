@@ -3,6 +3,7 @@ mod commons;
 mod error;
 mod exception;
 mod execution_engine;
+mod gc;
 mod heap;
 mod helper;
 mod jni;
@@ -25,13 +26,12 @@ use crate::vm::execution_engine::string_pool_helper::StringPoolHelper;
 use crate::vm::jni::java_thread::JavaThread;
 use crate::vm::launcher::resolve_and_execute_main_method;
 use crate::vm::launcher::LaunchMode::{LmClass, LmJar};
-use crate::vm::method_area::java_class::JavaClass;
 use crate::vm::method_area::loaded_classes::CLASSES;
 use crate::vm::method_area::method_area::{with_method_area, MethodArea};
 use crate::vm::perf_data::init_perf_file;
 use crate::vm::properties::resolve_classpath;
 use crate::vm::properties::system_properties::init_system_properties;
-use crate::vm::system_native::constant_pool::CONSTANT_POOL_OOP;
+use crate::vm::stack::stack_value::StackValueKind;
 use crate::vm::system_native::properties_provider::properties::is_bigendian;
 use crate::vm::validation::validate_class_name;
 use crate::Arguments;
@@ -53,6 +53,8 @@ pub(crate) static SYSTEM_CLASSLOADER_REF: OnceLock<i32> = OnceLock::new();
 /// * `arguments` - The arguments for the Java program.
 /// * `java_home` - The path to the Java home directory.
 pub fn run(arguments: &Arguments, java_home: &Path) -> Result<()> {
+    safepoint::attach();
+    gc::install(arguments)?;
     JAVA_HOME
         .set(java_home.to_path_buf())
         .map_err(|e| Error::new_execution(&format!("JAVA_HOME already set: {e:?}")))?;
@@ -89,7 +91,7 @@ pub fn run(arguments: &Arguments, java_home: &Path) -> Result<()> {
         Ok(())
     })();
 
-    match result {
+    let result = match result {
         Ok(()) => Ok(()),
         Err(e) if e.is_uncaught_exception() => {
             if let Some(throwable_ref) = e.throwable_ref() {
@@ -103,7 +105,9 @@ pub fn run(arguments: &Arguments, java_home: &Path) -> Result<()> {
             Err(e)
         }
         Err(e) => Err(e),
-    }
+    };
+    safepoint::retire();
+    result
 }
 
 pub(crate) fn invoke_uncaught_exception_handler(throwable_ref: i32) -> Result<()> {
@@ -120,7 +124,7 @@ pub(crate) fn invoke_uncaught_exception_handler(throwable_ref: i32) -> Result<()
         "java/lang/Thread",
         "dispatchUncaughtException:(Ljava/lang/Throwable;)V",
         thread_ref,
-        &[throwable_ref.into()],
+        &[StackValueKind::Ref(throwable_ref)],
     )?;
     Ok(())
 }
@@ -136,8 +140,23 @@ fn prelude() -> Result<()> {
     MethodArea::init()?;
 
     // preload essential classes including breaking circular dependencies
-    CLASSES.pre_construct()?;
-    CLASSES.post_construct()?;
+    let emergency_bootstrap = (|| -> Result<()> {
+        CLASSES.pre_construct()?;
+        CLASSES.post_construct()?;
+        jni::handles::initialize()
+    })();
+    emergency_bootstrap.map_err(|error| {
+        if matches!(
+            error.kind(),
+            crate::vm::error::ErrorKind::Allocation(crate::vm::gc::budget::AllocError::Capacity)
+        ) {
+            Error::new_execution(
+                "Configured managed heap is too small for emergency OutOfMemoryError bootstrap",
+            )
+        } else {
+            error
+        }
+    })?;
 
     for java_class in MethodArea::generate_synthetic_classes() {
         CLASSES.insert_klass(Arc::clone(&java_class), None)?;
@@ -149,36 +168,45 @@ fn prelude() -> Result<()> {
 }
 
 fn init_logger() -> Result<()> {
+    use tracing_subscriber::filter::filter_fn;
+    use tracing_subscriber::layer::Layer;
+
     let fmt_layer = fmt::layer()
         .with_target(false)
         .without_time()
-        .with_ansi(false);
+        .with_ansi(false)
+        .with_filter(filter_fn(|metadata| metadata.target() != "gc"));
+    let gc_fmt_layer = fmt::layer()
+        .with_writer(std::io::stderr)
+        .with_target(false)
+        .with_level(false)
+        .without_time()
+        .with_ansi(false)
+        .with_filter(filter_fn(|metadata| metadata.target() == "gc"));
     let filter_layer = EnvFilter::try_from_default_env()
-        .or_else(|_| EnvFilter::try_new("info"))
+        .or_else(|_| EnvFilter::try_new("info,gc=off"))
         .map_err(|e| Error::new_execution(&format!("Error creating EnvFilter: {e}")))?;
+    let filter_layer = if gc::logging_enabled() {
+        let directive = "gc=info"
+            .parse::<tracing_subscriber::filter::Directive>()
+            .map_err(|e| Error::new_execution(&format!("Error creating GC log directive: {e}")))?;
+        filter_layer.add_directive(directive)
+    } else {
+        filter_layer
+    };
     tracing_subscriber::registry()
         .with(filter_layer)
         .with(fmt_layer)
+        .with(gc_fmt_layer)
         .init();
 
     Ok(())
 }
 
 fn init() -> Result<()> {
-    put_synthetic_instance_field("java/lang/invoke/ResolvedMethodName", "vmtarget", "J", 0)?;
-    // JDK 26+ no longer declares the holder field of `ConstantPool`; like HotSpot, inject it.
-    if CLASSES
-        .get("jdk/internal/reflect/ConstantPool")?
-        .instance_field_descriptor(CONSTANT_POOL_OOP)
-        .is_none()
-    {
-        put_synthetic_instance_field(
-            "jdk/internal/reflect/ConstantPool",
-            CONSTANT_POOL_OOP,
-            "Ljava/lang/Object;",
-            0,
-        )?;
-    }
+    // Synthetic fields are installed during parsing, before immutable publication.
+    CLASSES.get("java/lang/invoke/ResolvedMethodName")?;
+    CLASSES.get("jdk/internal/reflect/ConstantPool")?;
     StaticInit::initialize("jdk/internal/misc/UnsafeConstants")?;
 
     let lc = CLASSES.get("jdk/internal/misc/UnsafeConstants")?;
@@ -195,17 +223,19 @@ fn init() -> Result<()> {
     // group, a "main" group as its child, and the primordial thread named "main" in that group.
     // The thread's name is what surfaces as `Exception in thread "main"` on an uncaught exception.
     let system_tg_ref = Executor::invoke_default_constructor("java/lang/ThreadGroup")?;
-    with_method_area(|area| area.set_system_thread_group_id(system_tg_ref))?;
+    with_method_area(|area| area.set_system_thread_group_id(system_tg_ref[0].value()))?;
     let main_name_ref = StringPoolHelper::get_string("main")?; // refactor candidate B: introduce and use here common string creator, not string pool one
     let main_tg_ref = Executor::invoke_args_constructor(
         "java/lang/ThreadGroup",
         "<init>:(Ljava/lang/ThreadGroup;Ljava/lang/String;)V",
-        &[system_tg_ref.into(), main_name_ref.into()],
+        &[system_tg_ref[0].into(), StackValueKind::Ref(main_name_ref)],
         Some("main thread group creation"),
     )?;
-    with_method_area(|area| area.set_main_thread_group_id(main_tg_ref))?;
-    let _thread_obj_ref =
-        Executor::create_primordial_thread(&[main_tg_ref.into(), main_name_ref.into()])?;
+    with_method_area(|area| area.set_main_thread_group_id(main_tg_ref[0].value()))?;
+    let _thread_obj_ref = Executor::create_primordial_thread(&[
+        main_tg_ref[0].into(),
+        StackValueKind::Ref(main_name_ref),
+    ])?;
 
     StaticInit::initialize("java/lang/reflect/Method")?;
     StaticInit::initialize("java/lang/ref/Finalizer")?;
@@ -214,7 +244,8 @@ fn init() -> Result<()> {
         "java/lang/System",
         "initPhase2:(ZZ)I",
         &[1.into(), 1.into()],
-    )?[0];
+    )?[0]
+        .value();
     if init_phase2_result != 0 {
         return Err(Error::new_execution(&format!(
             "System.initPhase2 returned error code {init_phase2_result}"
@@ -228,7 +259,8 @@ fn init() -> Result<()> {
                 "java/lang/ClassLoader",
                 "getPlatformClassLoader:()Ljava/lang/ClassLoader;",
                 &[],
-            )?[0],
+            )?[0]
+                .value(),
         )
         .map_err(|_e| Error::new_execution("value already set"))?;
     SYSTEM_CLASSLOADER_REF
@@ -237,7 +269,8 @@ fn init() -> Result<()> {
                 "java/lang/ClassLoader",
                 "getSystemClassLoader:()Ljava/lang/ClassLoader;",
                 &[],
-            )?[0],
+            )?[0]
+                .value(),
         )
         .map_err(|_e| Error::new_execution("value already set"))?;
 
@@ -248,41 +281,16 @@ fn init() -> Result<()> {
     let module_ref = Executor::invoke_args_constructor(
         "java/lang/Module",
         "<init>:(Ljava/lang/ClassLoader;)V",
-        &[system_classloader_ref.into()],
+        &[StackValueKind::Ref(system_classloader_ref)],
         Some("module for reflection class"),
     )?;
     UNNAMED_MODULE_REF
-        .set(module_ref)
+        .set(module_ref[0].value())
         .map_err(|e| Error::new_execution(&format!("MODULE_REF already set: {e:?}")))?;
 
     Ok(())
 }
 
 pub(crate) static UNNAMED_MODULE_REF: OnceLock<i32> = OnceLock::new();
-
-fn put_synthetic_instance_field(
-    class_name: &str,
-    field_name: &str,
-    type_descriptor: &str,
-    flags: u16,
-) -> Result<()> {
-    let lc = CLASSES.get(class_name)?;
-    let raw_java_class = Arc::into_raw(lc) as *mut JavaClass;
-    let result = unsafe {
-        (*raw_java_class).put_instance_field_descriptor(
-            field_name.to_string(),
-            str::parse(type_descriptor)?,
-            flags,
-            class_name,
-        )?
-    };
-    match result {
-        Some(field_property) => Err(Error::new_execution(&format!(
-            "field {field_name}:{} already exists in {class_name}",
-            field_property.type_descriptor()
-        ))),
-        None => Ok(()),
-    }
-}
 
 static JAVA_HOME: OnceLock<PathBuf> = OnceLock::new();

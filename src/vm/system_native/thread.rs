@@ -8,6 +8,8 @@ use crate::vm::helper::i64_to_vec;
 use crate::vm::jni::java_thread::JavaThread;
 use crate::vm::method_area::lookup;
 use crate::vm::method_area::method_area::with_method_area;
+use crate::vm::stack::rooted_slots::RootedSlots;
+use crate::vm::stack::slot::Slot;
 use crate::vm::stack::stack_frames_util::StackFramesUtil;
 use crate::vm::system_native::{stack_trace_element, throwable};
 use crate::vm::{monitor, safepoint, threads};
@@ -98,7 +100,10 @@ pub(crate) fn sleep_nanos0(nanos: i64) -> Result<()> {
         if remaining.is_zero() {
             break Ok(());
         }
-        std::thread::park_timeout(remaining);
+        {
+            let _blocked = safepoint::Blocking::enter(safepoint::Reason::Blocking);
+            std::thread::park_timeout(remaining);
+        }
     };
     threads::set_current_thread_status(threads::thread_status::RUNNABLE);
     result
@@ -129,10 +134,11 @@ pub(crate) fn interrupt0(this: i32) -> Result<()> {
 /// that never reaches one within the timeout (e.g. blocked in a native) yields null. The collected
 /// frames are turned into `StackTraceElement`s via the same backtrace path as `fillInStackTrace`.
 pub(crate) fn get_stack_trace0(this: i32) -> Result<i32> {
+    let mut dump_roots = RootedSlots::new();
     let frames = if JavaThread::current_thread() == Some(this) {
         StackFramesUtil::collect_current_stack(MAX_STACK_DEPTH)?
     } else {
-        match safepoint::dump_stack(this) {
+        match safepoint::dump_stack(this, &mut dump_roots) {
             Some(frames) => frames,
             None => return Ok(0), // null: the thread didn't reach a safepoint (or isn't registered)
         }
@@ -140,13 +146,17 @@ pub(crate) fn get_stack_trace0(this: i32) -> Result<i32> {
 
     let depth = frames.len() as i32;
     let backtrace_ref = throwable::build_backtrace(&frames)?;
+    let mut roots = JavaThread::hold_temp_roots(vec![Slot::Ref(backtrace_ref)]);
 
-    let elements_ref = HEAP.create_array("[Ljava/lang/StackTraceElement;", depth);
+    let mut destination = RootedSlots::new();
+    let elements_ref =
+        HEAP.create_array("[Ljava/lang/StackTraceElement;", depth, &mut destination)?;
+    roots.add_root(Slot::Ref(elements_ref));
     for index in 0..depth {
         let element = with_method_area(|method_area| {
             method_area.create_instance_with_default_fields("java/lang/StackTraceElement")
         })?;
-        let element_ref = HEAP.create_instance(element);
+        let element_ref = HEAP.create_instance(element, &mut destination)?;
         HEAP.set_array_value(elements_ref, index, vec![element_ref])?;
     }
     stack_trace_element::init_stack_trace_elements(elements_ref, backtrace_ref, depth)?;
@@ -180,7 +190,7 @@ pub(crate) fn start0(this: i32) -> Result<()> {
     let is_daemon =
         Executor::invoke_non_static_method("java/lang/Thread", "isDaemon:()Z", this, &[])?
             .first()
-            .is_some_and(|&v| v != 0);
+            .is_some_and(|v| v.value() != 0);
 
     set_eetop(this, threads::next_eetop())?;
     // Mark RUNNABLE synchronously, before spawning, so getState() is correct the moment start()
@@ -188,9 +198,18 @@ pub(crate) fn start0(this: i32) -> Result<()> {
     threads::set_thread_status(this, threads::thread_status::RUNNABLE);
 
     let thread_ref = this;
+    let startup = safepoint::COORDINATOR.startup(this);
+    // The child cannot claim managed access until the parent publishes its parker.
+    let (ready, claim) = std::sync::mpsc::sync_channel(1);
     let handle = std::thread::Builder::new()
-        .spawn(move || run_thread(thread_ref))
+        .spawn(move || {
+            if claim.recv().is_ok() {
+                safepoint::claim(startup);
+                run_thread(thread_ref);
+            }
+        })
         .map_err(|e| {
+            safepoint::COORDINATOR.cancel_startup(startup);
             // Roll back the "started" markers so a thread that never launched is left back in NEW:
             // eetop cleared so isAlive() is false, and threadStatus reset so getState() reads NEW and
             // Thread.start() can be retried (it rejects threadStatus != 0).
@@ -201,6 +220,9 @@ pub(crate) fn start0(this: i32) -> Result<()> {
 
     // Register the parker eagerly, from the parent, before the child can be unparked (race-free).
     threads::register_parker(this, handle.thread().clone());
+    if ready.send(()).is_err() {
+        error!("spawned thread vanished before claiming its startup record");
+    }
 
     if !is_daemon {
         threads::register_non_daemon(handle);
@@ -240,12 +262,12 @@ fn run_thread(this: i32) {
     // and isAlive() is now false (eetop cleared above), so a notify lets them observe termination.
     crate::vm::monitor::wake_all_on_exit(this);
     threads::unregister_parker(this);
-    safepoint::unregister(this);
+    safepoint::retire();
 }
 
 /// Resolves `run:()V` on the thread object's actual class (virtual dispatch, honoring subclass
 /// overrides) and invokes it.
-fn invoke_run(this: i32) -> Result<Vec<i32>> {
+fn invoke_run(this: i32) -> Result<RootedSlots> {
     let actual_class = HEAP.get_instance_name(this)?;
     let run_method =
         lookup::lookup_instance_method(&actual_class, "run:()V")?.ok_or_else(|| {

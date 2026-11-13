@@ -1,10 +1,15 @@
 use crate::vm::execution_engine::executor::Executor;
 use crate::vm::heap::heap::HEAP;
 use crate::vm::jni::array_operations_impl::{new_char_array, set_char_array_region};
+use crate::vm::jni::java_thread::JavaThread;
 use crate::vm::jni::jni_invoke::jni_invoke_scalar;
 use crate::vm::jni::utils::{
-    set_pending_null_pointer_exception, set_pending_string_index_out_of_bounds_exception,
+    set_pending_negative_array_size_exception, set_pending_null_pointer_exception,
+    set_pending_string_index_out_of_bounds_exception,
 };
+use crate::vm::jni::{buffer_leases, handles};
+use crate::vm::stack::slot::Slot;
+use crate::vm::stack::stack_value::StackValueKind;
 use crate::vm::system_native::string::get_raw_string_info;
 use jni_sys::{jboolean, jchar, jint, jlong, jsize, jstring, JNIEnv, JNI_TRUE};
 use std::ffi::{c_char, CStr};
@@ -129,18 +134,17 @@ fn encode_codepoint_to_mutf8(codepoint: u32, buf: &mut Vec<u8>) {
 }
 
 pub(super) extern "system" fn get_string_length(_env: *mut JNIEnv, input: jstring) -> jint {
-    let string_ref = input as i32;
+    let _managed = crate::vm::safepoint::ManagedAccess::enter();
+    let string_ref = handles::resolve_or_return!(input);
 
     if string_ref == 0 {
         set_pending_null_pointer_exception("String is null");
         return 0;
     }
 
-    let raw =
-        Executor::invoke_non_static_method("java/lang/String", "length:()I", string_ref, &[])
-            .unwrap_or(vec![0]); // OpenJDK returns 0 for non-strings
-
-    raw[0] as jint
+    Executor::invoke_non_static_method("java/lang/String", "length:()I", string_ref, &[])
+        .map(|result| result[0].value())
+        .unwrap_or(0) // OpenJDK returns 0 for non-strings
 }
 
 pub(super) extern "system" fn new_string(
@@ -148,19 +152,26 @@ pub(super) extern "system" fn new_string(
     unicode: *const jchar,
     len: jsize,
 ) -> jstring {
+    let _managed = crate::vm::safepoint::ManagedAccess::enter();
     if len < 0 {
-        panic!("negative array size"); // todo throw NegativeArraySizeException here
+        set_pending_negative_array_size_exception(len);
+        return ptr::null_mut();
     }
     if unicode.is_null() && len > 0 {
         set_pending_null_pointer_exception("Buffer is null");
         return ptr::null_mut();
     }
     let arr_ref = new_char_array(env, len);
+    if arr_ref.is_null() {
+        return ptr::null_mut();
+    }
+    let array_target = handles::resolve_or_return!(arr_ref);
+    let _array = JavaThread::hold_temp_roots(vec![Slot::Ref(array_target)]);
     set_char_array_region(env, arr_ref, 0, len, unicode);
     let result = Executor::invoke_args_constructor(
         "java/lang/String",
         "<init>:([C)V",
-        &[(arr_ref as i32).into()],
+        &[StackValueKind::Ref(array_target)],
         Some(""),
     );
     jni_invoke_scalar(result, "NewString")
@@ -171,15 +182,22 @@ pub(super) extern "system" fn get_string_chars(
     from: jstring,
     is_copy: *mut jboolean,
 ) -> *const jchar {
-    let string_ref = from as i32;
+    let _managed = crate::vm::safepoint::ManagedAccess::enter();
+    let string_ref = handles::resolve_or_return!(from);
     if string_ref == 0 {
         set_pending_null_pointer_exception("String is null");
         return ptr::null();
     }
 
     let raw_data = get_string_raw_data(string_ref);
-    let boxed_slice = raw_data.into_boxed_slice();
-    let raw_ptr = Box::into_raw(boxed_slice) as *const u8 as *const jchar;
+    // SAFETY: jchar is u16, whose complete initialized representation is native-endian bytes.
+    let bytes = unsafe {
+        std::slice::from_raw_parts(
+            raw_data.as_ptr().cast(),
+            raw_data.len() * size_of::<jchar>(),
+        )
+    };
+    let raw_ptr = buffer_leases::copy(string_ref, bytes, align_of::<jchar>()).cast();
 
     if !is_copy.is_null() {
         unsafe {
@@ -222,38 +240,22 @@ pub(super) extern "system" fn release_string_chars(
     str: jstring,
     chars: *const jchar,
 ) {
-    let string_ref = str as i32;
-    if string_ref == 0 {
-        panic!("Invalid string reference: null");
-    }
-
-    if chars.is_null() {
-        return;
-    }
-
-    let (is_latin, array_ref) = get_raw_string_info(string_ref)
-        .unwrap_or_else(|_| panic!("Failed to get raw string info for string_ref={string_ref}"));
-    let byte_len = HEAP
-        .get_entire_raw_data(array_ref)
-        .unwrap_or_else(|_| panic!("Failed to get string data for array_ref={array_ref}"))
-        .len();
-    let len = if is_latin { byte_len } else { byte_len / 2 };
-    unsafe {
-        let _boxed: Box<_> =
-            Box::from_raw(ptr::slice_from_raw_parts_mut(chars as *mut jchar, len));
-    }
+    let _managed = crate::vm::safepoint::ManagedAccess::enter();
+    let string_ref = handles::resolve_or_return!(str);
+    buffer_leases::release(chars.cast(), string_ref, None);
 }
 
 pub(super) extern "system" fn new_string_utf8(
     env: *mut JNIEnv,
     mutf8_bytes: *const c_char,
 ) -> jstring {
+    let _managed = crate::vm::safepoint::ManagedAccess::enter();
     if mutf8_bytes.is_null() {
         // HotSpot returns null without an exception here
         return ptr::null_mut();
     }
 
-    // Decode straight to UTF-16: a Rust String can't hold the isolated surrogates allowed here
+    // Decode straight to UTF-16: a Rust String cannot hold the isolated surrogates allowed here
     let bytes = unsafe { CStr::from_ptr(mutf8_bytes) }.to_bytes();
     let utf16 = decode_modified_utf8_to_utf16(bytes);
     new_string(env, utf16.as_ptr(), utf16.len() as jsize)
@@ -263,7 +265,8 @@ pub(super) extern "system" fn get_string_utf_length_as_long(
     _env: *mut JNIEnv,
     input: jstring,
 ) -> jlong {
-    let string_ref = input as i32;
+    let _managed = crate::vm::safepoint::ManagedAccess::enter();
+    let string_ref = handles::resolve_or_return!(input);
 
     if string_ref == 0 {
         set_pending_null_pointer_exception("String is null");
@@ -275,6 +278,7 @@ pub(super) extern "system" fn get_string_utf_length_as_long(
 }
 
 pub(super) extern "system" fn get_string_utf_length(_env: *mut JNIEnv, input: jstring) -> jint {
+    let _managed = crate::vm::safepoint::ManagedAccess::enter();
     get_string_utf_length_as_long(_env, input) as jint
 }
 
@@ -283,7 +287,8 @@ pub(super) extern "system" fn get_string_utf_chars(
     from: jstring,
     is_copy: *mut jboolean,
 ) -> *const c_char {
-    let string_ref = from as i32;
+    let _managed = crate::vm::safepoint::ManagedAccess::enter();
+    let string_ref = handles::resolve_or_return!(from);
     if string_ref == 0 {
         set_pending_null_pointer_exception("String is null");
         return ptr::null();
@@ -291,8 +296,7 @@ pub(super) extern "system" fn get_string_utf_chars(
 
     let mut mutf8_data = encode_utf16_to_modified_utf8(&get_string_raw_data(string_ref));
     mutf8_data.push(0); // null terminator
-    let boxed_slice = mutf8_data.into_boxed_slice();
-    let raw_ptr = Box::into_raw(boxed_slice) as *const u8 as *const c_char;
+    let raw_ptr = buffer_leases::copy(string_ref, &mutf8_data, align_of::<u8>()).cast();
 
     if !is_copy.is_null() {
         unsafe {
@@ -304,23 +308,13 @@ pub(super) extern "system" fn get_string_utf_chars(
 }
 
 pub(super) extern "system" fn release_string_utf_chars(
-    env: *mut JNIEnv,
+    _env: *mut JNIEnv,
     str: jstring,
     chars: *const c_char,
 ) {
-    let string_ref = str as i32;
-    if string_ref == 0 {
-        panic!("Invalid string reference: null");
-    }
-
-    if chars.is_null() {
-        return;
-    }
-
-    let len = get_string_utf_length_as_long(env, str) as usize + 1/*null terminator*/;
-    unsafe {
-        let _boxed: Box<_> = Box::from_raw(ptr::slice_from_raw_parts_mut(chars as *mut u8, len));
-    }
+    let _managed = crate::vm::safepoint::ManagedAccess::enter();
+    let string_ref = handles::resolve_or_return!(str);
+    buffer_leases::release(chars.cast(), string_ref, None);
 }
 
 /// GetStringRegion: Copies a region of the string into the provided buffer.
@@ -332,6 +326,7 @@ pub(super) extern "system" fn get_string_region(
     len: jsize,
     buf: *mut jchar,
 ) {
+    let _managed = crate::vm::safepoint::ManagedAccess::enter();
     let Some(region) = get_string_region_data(str, start, len) else {
         return;
     };
@@ -360,6 +355,7 @@ pub(super) extern "system" fn get_string_utf_region(
     len: jsize,
     buf: *mut c_char,
 ) {
+    let _managed = crate::vm::safepoint::ManagedAccess::enter();
     let Some(region) = get_string_region_data(str, start, len) else {
         return;
     };
@@ -389,12 +385,13 @@ pub(super) extern "system" fn get_string_utf_region(
 /// Returns the UTF-16 code units of the requested string region,
 /// or sets a pending exception and returns `None` if the string is null or the range is invalid.
 fn get_string_region_data(str: jstring, start: jsize, len: jsize) -> Option<Vec<jchar>> {
-    if str.is_null() {
+    let string_ref = handles::resolve_or_return!(str, None);
+    if string_ref == 0 {
         set_pending_null_pointer_exception("String is null");
         return None;
     }
 
-    let raw_data = get_string_raw_data(str as i32);
+    let raw_data = get_string_raw_data(string_ref);
     let string_len = raw_data.len() as jsize;
 
     // Check bounds (using overflow-safe comparison)
@@ -407,35 +404,24 @@ fn get_string_region_data(str: jstring, start: jsize, len: jsize) -> Option<Vec<
 }
 
 /// GetStringCritical: Returns a pointer to the string's characters.
-/// This is similar to GetStringChars but signals that a GC-critical section has started.
-/// Since there's no GC yet in rusty-jvm, this is just a wrapper around GetStringChars.
-/// TODO(GC): When GC is implemented, this must:
-///   1. Pin the string object to prevent it from being moved during collection
-///   2. Disable GC for the duration of the critical section
-///   3. Return a direct pointer to the string's internal char array (no copy) when possible
+/// Critical access remains copy-based and holds a root-bearing lease, not a GC lock: the
+/// collector never moves objects, and the lease keeps the string reachable until release.
 pub(super) extern "system" fn get_string_critical(
     env: *mut JNIEnv,
     str: jstring,
     is_copy: *mut jboolean,
 ) -> *const jchar {
-    // No GC yet, so this is equivalent to GetStringChars
-    // TODO(GC): Pin object and disable GC here
+    let _managed = crate::vm::safepoint::ManagedAccess::enter();
     get_string_chars(env, str, is_copy)
 }
 
 /// ReleaseStringCritical: Releases the pointer obtained from GetStringCritical.
-/// Since there's no GC yet in rusty-jvm, this is just a wrapper around ReleaseStringChars.
-/// TODO(GC): When GC is implemented, this must:
-///   1. Unpin the string object
-///   2. Re-enable GC
-///   3. Must NOT be called between GetStringCritical and ReleaseStringCritical:
-///      - NewString, NewCharArray, SetCharArrayRegion (any allocating JNI function)
+/// Releasing the lease never changes global collection eligibility.
 pub(super) extern "system" fn release_string_critical(
     env: *mut JNIEnv,
     str: jstring,
     carray: *const jchar,
 ) {
-    // No GC yet, so this is equivalent to ReleaseStringChars
-    // TODO(GC): Unpin object and re-enable GC here
+    let _managed = crate::vm::safepoint::ManagedAccess::enter();
     release_string_chars(env, str, carray);
 }

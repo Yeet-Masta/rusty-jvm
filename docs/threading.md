@@ -1,6 +1,7 @@
 # Threading and concurrency
 
 > Status: **implemented**. Platform threads spawn and run; `synchronized`,
+> interpreted `ACC_SYNCHRONIZED` methods,
 > `wait`/`notify`/`notifyAll`, `join`, `sleep`, `yield`, `interrupt`, `LockSupport`,
 > `ThreadLocal`, atomic `Unsafe` CAS, `Thread.getState()`, and stack traces (own
 > thread, and other running threads via cooperative safepoints) all work for real
@@ -79,7 +80,7 @@ semantics. If `start0` fails to spawn the OS thread, the "started" markers
 ## 4. Object monitors (`vm/monitor.rs`)
 
 Every object can be a monitor. One is inflated lazily on first use and keyed by
-the object's heap reference in a `DashMap` (objects never move — no GC — so the
+the object's heap reference in a `DashMap` (the collector is nonmoving, so the
 `i32` key is stable). A monitor is a **reentrant** lock (owner `ThreadId` +
 recursion count) plus a condition queue:
 
@@ -89,6 +90,11 @@ struct ObjectMonitor { state: Mutex<MonitorState>, cv: Condvar }   // parking_lo
 ```
 
 - **`monitorenter` / `monitorexit`** acquire/release reentrantly.
+- **`ACC_SYNCHRONIZED` interpreted methods** acquire the receiver monitor, or the declaring
+  class mirror for a static method, on first dispatch into the frame and release it when the
+  frame returns, unwinds for a Java exception, or is cleaned up after an internal VM error. The
+  monitor reference stays rooted until release, and internal errors retain their original result
+  after remaining frames are cleaned up.
 - **`Object.wait(timeout)`** fully releases the monitor (remembering the recursion
   depth), blocks on the condvar until notified/timed-out/interrupted, then
   re-acquires and restores the depth. `notify`/`notifyAll` hand out wake tokens via
@@ -176,7 +182,8 @@ absolute-millis deadline). Spurious wakeups are allowed, as the contract require
 
 `ThreadLocalMap.getEntry` matches a key with `Entry.refersTo(key)` →
 `Reference.refersTo0`, so working `ThreadLocal` depends on correct reference
-semantics. Those need no GC here:
+semantics. The collector also processes eligible soft, weak and phantom references and
+delivers them through the JDK reference-handler path:
 
 - `Reference.refersTo0(o)` returns `referent == o` (read the `referent` field);
 - `Reference.clear0()` nulls `referent`;
@@ -208,7 +215,7 @@ Reading another thread's call stack safely requires that thread to be paused at 
 consistent point, not mid-instruction mutating its frames. A **cooperative
 safepoint** provides this: each thread holds a `Safepoint` (in its `JavaThread`,
 also published in a global registry by thread ref), and the interpreter
-[`poll`](vm/safepoint.rs)s a flag periodically (every ~4096 bytecodes — a local
+[`poll`](../src/vm/safepoint.rs)s a flag periodically (every ~4096 bytecodes — a local
 counter test each iteration, so the hot loop pays only a register increment; the
 poll is measurably free). When a *dumper* raises the flag, the target reaches the
 poll, **collects its own stack** (safe — it walks its own thread-local frames),
@@ -219,8 +226,10 @@ frames.
 `Thread.getStackTrace()` on another thread uses this: `getStackTrace0` drives the
 target to a safepoint, then turns the collected frames into `StackTraceElement`s
 through the same backtrace path as `fillInStackTrace`. The current thread collects
-directly. The same registry + flag are the foundation a future stop-the-world GC
-would use to pause all threads for root scanning.
+directly. The garbage collector uses cooperative participation to stop mutators and
+read owner-published root snapshots. Unlike diagnostic stack dumps, collection has
+no partial-snapshot fallback: snapshot or trace failure skips the cycle before sweep.
+See [garbage_collection.md](garbage_collection.md) for the coordinator and root contracts.
 
 ## 12. Known boundaries
 
@@ -236,6 +245,10 @@ would use to pause all threads for root scanning.
 - **Priorities** (`setPriority0`) are advisory no-ops.
 - **`clearInterruptEvent`** is a no-op — the `interrupted` field is the sole
   interrupt source of truth.
+- A native synchronized method invoked from bytecode acquires its implicit monitor before the
+  native body and releases it on return or exception. Entry through `Executor` paths used by JNI
+  `Call*Method` and reflection fails before native execution because `Executor::exec_jc` requests
+  a bytecode stack frame and native methods have no code context; these paths do not run unlocked.
 
 [//]: # (links)
 [jls-12.8]: https://docs.oracle.com/javase/specs/jls/se25/html/jls-12.html#jls-12.8

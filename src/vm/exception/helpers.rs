@@ -38,11 +38,11 @@ pub fn check_array_access(
     if index < 0 || index >= length {
         // Same message as HotSpot, which the (int) constructor would not give
         let message = format!("Index {index} out of bounds for length {length}");
-        let message_ref = StringPoolHelper::create_string(&message)?;
+        let message = StringPoolHelper::create_string(&message)?;
         construct_exception_and_throw(
             "java/lang/ArrayIndexOutOfBoundsException",
             "<init>:(Ljava/lang/String;)V",
-            &[StackValueKind::from(message_ref)],
+            &[StackValueKind::Ref(message[0].value())],
             stack_frames,
         )?;
         return Ok(false);
@@ -71,11 +71,11 @@ pub fn check_array_store(
     }
 
     let value_class = HEAP.get_instance_name(value_ref)?;
-    let message_ref = StringPoolHelper::create_string(&value_class.replace('/', "."))?;
+    let message = StringPoolHelper::create_string(&value_class.replace('/', "."))?;
     construct_exception_and_throw(
         "java/lang/ArrayStoreException",
         "<init>:(Ljava/lang/String;)V",
-        &[StackValueKind::from(message_ref)],
+        &[StackValueKind::Ref(message[0].value())],
         stack_frames,
     )?;
     Ok(false)

@@ -30,11 +30,11 @@ pub fn throw_class_cast_exception(
             format!("class {from_name} cannot be cast to class {to_name}")
         }
     };
-    let message_ref = StringPoolHelper::create_string(&message)?;
+    let message = StringPoolHelper::create_string(&message)?;
     construct_exception_and_throw(
         "java/lang/ClassCastException",
         "<init>:(Ljava/lang/String;)V",
-        &[StackValueKind::from(message_ref)],
+        &[StackValueKind::Ref(message[0].value())],
         stack_frames,
     )
 }

@@ -608,8 +608,7 @@ pub(crate) fn ensure_class_initialized0(_this: i32, class_ref: i32) -> Result<()
 /// `jdk.internal.misc.Unsafe.shouldBeInitialized0(Ljava/lang/Class;)Z`
 pub(crate) fn should_be_initialized0(_this: i32, class_ref: i32) -> Result<bool> {
     let klass = klass(class_ref)?;
-    let guard = klass.static_fields_init_state().lock();
-    Ok(guard.get_inner_state() != Initialized)
+    Ok(klass.static_fields_init_state().get_inner_state() != Initialized)
 }
 
 /// `jdk.internal.misc.Unsafe.allocateMemory0(J)J`
@@ -678,7 +677,8 @@ pub(crate) fn copy_memory0(
         };
 
         if dest_base_ref == 0 {
-            // dest_offset is absolute address
+            // dest_offset is absolute address. A memcpy cannot block, so it needs no safepoint
+            // transition.
             unsafe {
                 let src = to_copy.as_ptr();
                 let dst = dest_offset as usize as *mut u8;
@@ -771,6 +771,7 @@ pub(crate) fn copy_swap_memory0(
 /// epoch. Backed by `std::thread` park, whose permit semantics match `LockSupport` (a prior
 /// `unpark` makes the next park return immediately). Spurious wakeups are allowed by the contract.
 pub(crate) fn park(_this: i32, is_absolute: bool, time: i64) -> Result<()> {
+    let _blocked = crate::vm::safepoint::Blocking::enter(crate::vm::safepoint::Reason::Blocking);
     if !is_absolute {
         if time == 0 {
             std::thread::park();

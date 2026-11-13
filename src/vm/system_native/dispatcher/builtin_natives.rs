@@ -1,4 +1,6 @@
 use crate::vm::error::{Error, Result};
+use crate::vm::jni::handles;
+use crate::vm::jni::java_thread::JavaThread;
 use crate::vm::jni::set_pending_internal_error;
 use crate::vm::method_area::lookup::lookup_method;
 use crate::vm::system_native as sn;
@@ -10,6 +12,24 @@ use jni_sys::{
 use std::collections::HashMap;
 use std::ffi::c_void;
 use std::sync::LazyLock;
+
+/// Preserve a callback's Java exception while the owning Error is still rooted.
+fn set_pending_native_error(error: &Error) {
+    if let Some(reference) = error.throwable_ref() {
+        if handles::emergency_oom_ref() == Some(reference) {
+            handles::install_emergency_oom();
+            return;
+        }
+    }
+    match error.throwable_ref() {
+        Some(throwable) => {
+            if let Err(pending) = JavaThread::try_set_pending_exception(throwable) {
+                tracing::warn!("Dropping native exception: {pending}");
+            }
+        }
+        None => set_pending_internal_error(&error.to_string()),
+    }
+}
 // ---------------------------------------------------------------------------
 // JNI type-token mapping
 //
@@ -31,8 +51,7 @@ use std::sync::LazyLock;
 // drifting apart.
 // ---------------------------------------------------------------------------
 
-/// Per-kind argument cast: reference types are carried as the VM's `i32`
-/// object ref; scalars are cast to their VM-side value type.
+/// Resolve opaque references to VM heap IDs; retain scalar widths.
 macro_rules! jni_arg_cast_impl {
     (bool, $rust:ty, $e:expr) => {
         $e as i32 != 0
@@ -44,15 +63,14 @@ macro_rules! jni_arg_cast_impl {
         $e as $rust
     };
     (ref, $rust:ty, $e:expr) => {
-        $e as i32
+        handles::resolve_or_return!($e)
     };
     (void, $rust:ty, $e:expr) => {
         compile_error!("`void` cannot be used as an argument")
     };
 }
 
-/// Per-kind return conversion: reference types are the VM's `i32` object ref
-/// and must be widened back into the JNI pointer handle; scalars map directly.
+/// Publish a new local record for object results; scalars map directly.
 macro_rules! jni_ret_conv_impl {
     (void, $ffi:ty, $e:expr) => {
         $e
@@ -67,7 +85,7 @@ macro_rules! jni_ret_conv_impl {
         $e as $ffi
     };
     (ref, $ffi:ty, $e:expr) => {
-        $e as usize as $ffi
+        handles::new_local($e)
     };
 }
 
@@ -146,6 +164,7 @@ jni_types! {
     class_loader              : ref   | i32  | jobject      | "Ljava/lang/ClassLoader;";
     module                    : ref   | i32  | jobject      | "Ljava/lang/Module;";
     object                    : ref   | i32  | jobject      | "Ljava/lang/Object;";
+    reference                 : ref   | i32  | jobject      | "Ljava/lang/ref/Reference;";
     string                    : ref   | i32  | jstring      | "Ljava/lang/String;";
     thread                    : ref   | i32  | jobject      | "Ljava/lang/Thread;";
     throwable                 : ref   | i32  | jobject      | "Ljava/lang/Throwable;";
@@ -195,10 +214,11 @@ macro_rules! builtin_wrapper {
             _class: jclass,
             $($pname: jni_ffi_ty!($pty),)*
         ) -> jni_ffi_ty!($ret) {
+            let _managed = crate::vm::safepoint::ManagedAccess::enter();
             match $inner($(jni_arg_cast!($pty, $pname)),*) {
                 Ok(__value) => jni_ret_conv!($ret, __value),
                 Err(__error) => {
-                    set_pending_internal_error(&__error.to_string());
+                    set_pending_native_error(&__error);
                     jni_ret_default!($ret)
                 }
             }
@@ -212,15 +232,90 @@ macro_rules! builtin_wrapper {
             this: jobject,
             $($pname: jni_ffi_ty!($pty),)*
         ) -> jni_ffi_ty!($ret) {
-            match $inner(this as i32 $(, jni_arg_cast!($pty, $pname))*) {
+            let _managed = crate::vm::safepoint::ManagedAccess::enter();
+            match $inner(handles::resolve_or_return!(this) $(, jni_arg_cast!($pty, $pname))*) {
                 Ok(__value) => jni_ret_conv!($ret, __value),
                 Err(__error) => {
-                    set_pending_internal_error(&__error.to_string());
+                    set_pending_native_error(&__error);
                     jni_ret_default!($ret)
                 }
             }
         }
     };
+}
+
+#[cfg(test)]
+mod ref_transfer_tests {
+    use super::*;
+    use crate::vm::heap::heap::HEAP;
+    use crate::vm::stack::slot::Slot;
+
+    fn fail(throwable: i32) -> Result<i32> {
+        Err(Error::uncaught_exception(Slot::Ref(throwable)))
+    }
+
+    builtin_wrapper!(static callback_static(throwable: object) -> object => fail);
+    builtin_wrapper!(instance callback_instance() -> object => fail);
+
+    fn fail_budget() -> Result<i32> {
+        Err(crate::vm::gc::budget::AllocError::Capacity.into())
+    }
+    builtin_wrapper!(static budget_failure() -> object => fail_budget);
+
+    #[test]
+    fn gc_budget_builtin_wrapper_preserves_emergency_without_allocation() {
+        use crate::vm::gc::test_allocations::{bootstrap_oom, measure};
+        let emergency = bootstrap_oom();
+        crate::vm::safepoint::attach();
+        let (result, allocations) = measure(usize::MAX, || {
+            budget_failure(std::ptr::null_mut(), std::ptr::null_mut())
+        });
+        assert!(result.is_null());
+        assert_eq!(allocations, 0);
+        assert_eq!(JavaThread::take_pending_exception(), Some(emergency));
+        crate::vm::safepoint::retire();
+        println!("builtin OOM wrapper: allocations={allocations}, sentinel=null");
+    }
+
+    #[test]
+    fn ref_transfer_static_native_wrapper_preserves_callback_exception() {
+        let throwable = HEAP
+            .create_array(
+                "[I",
+                0,
+                &mut crate::vm::stack::rooted_slots::RootedSlots::new(),
+            )
+            .unwrap();
+        let frame = crate::vm::jni::local_frames::NativeFrame::enter().unwrap();
+        let argument = handles::new_local(throwable);
+
+        let result = callback_static(std::ptr::null_mut(), std::ptr::null_mut(), argument);
+
+        assert!(result.is_null());
+        assert_eq!(JavaThread::take_pending_exception(), Some(throwable));
+        drop(frame);
+        assert!(JavaThread::temp_root_refs().is_empty());
+    }
+
+    #[test]
+    fn ref_transfer_instance_native_wrapper_preserves_callback_exception() {
+        let throwable = HEAP
+            .create_array(
+                "[I",
+                0,
+                &mut crate::vm::stack::rooted_slots::RootedSlots::new(),
+            )
+            .unwrap();
+        let frame = crate::vm::jni::local_frames::NativeFrame::enter().unwrap();
+        let argument = handles::new_local(throwable);
+
+        let result = callback_instance(std::ptr::null_mut(), argument);
+
+        assert!(result.is_null());
+        assert_eq!(JavaThread::take_pending_exception(), Some(throwable));
+        drop(frame);
+        assert!(JavaThread::temp_root_refs().is_empty());
+    }
 }
 
 /// Declaratively defines the built-in native registry from a single source of
@@ -375,8 +470,9 @@ builtin_natives! {
 
     "java/lang/Runtime": instance fn maxMemory() -> long => sn::runtime::max_memory;
     "java/lang/Runtime": instance fn availableProcessors() -> int => sn::runtime::available_processors;
-    "java/lang/Runtime": instance fn totalMemory() -> long => sn::runtime::total_memory; // todo: implement me with GC
-    "java/lang/Runtime": instance fn freeMemory() -> long => sn::runtime::free_memory; // todo: implement me with GC
+    "java/lang/Runtime": instance fn totalMemory() -> long => sn::runtime::total_memory;
+    "java/lang/Runtime": instance fn freeMemory() -> long => sn::runtime::free_memory;
+    "java/lang/Runtime": instance fn gc() -> void => sn::runtime::gc;
 
     "java/lang/Shutdown": static fn beforeHalt() -> void => sn::shutdown::before_halt; // todo: implement me
     "java/lang/Shutdown": static fn halt0(status: int) -> void => sn::shutdown::halt0; // fixme: by doing this we skip destructors and other shutdown hooks, later it might be an issue
@@ -427,20 +523,29 @@ builtin_natives! {
 
     "java/lang/ref/Finalizer": static fn isFinalizationEnabled() -> boolean => sn::finalizer::is_finalization_enabled; // todo: this should be implemented with GC
 
-    "java/lang/ref/PhantomReference": instance fn clear0() -> void => sn::phantom_reference::clear0; // todo: this should be implemented with GC
+    "java/lang/ref/PhantomReference": instance fn clear0() -> void => sn::phantom_reference::clear0;
+    "java/lang/ref/PhantomReference": instance fn refersTo0(o: object) -> boolean => sn::phantom_reference::refers_to0;
 
     "java/lang/ref/Reference": instance fn get0() -> object => sn::reference::get0; // JDK 26+
-    "java/lang/ref/Reference": instance fn clear0() -> void => sn::reference::clear0; // todo: this should be implemented with GC
-    "java/lang/ref/Reference": instance fn refersTo0(o: object) -> boolean => sn::reference::refers_to0; // todo: this should be implemented with GC
-    "java/lang/ref/Reference": static fn waitForReferencePendingList() -> void => sn::reference::wait_for_reference_pending_list; // no GC: the Reference Handler daemon parks here forever
+    "java/lang/ref/Reference": instance fn clear0() -> void => sn::reference::clear0;
+    "java/lang/ref/Reference": instance fn refersTo0(o: object) -> boolean => sn::reference::refers_to0;
+    "java/lang/ref/Reference": static fn waitForReferencePendingList() -> void => sn::reference::wait_for_reference_pending_list;
+    "java/lang/ref/Reference": static fn getAndClearReferencePendingList() -> reference => sn::reference::get_and_clear_reference_pending_list;
+    "java/lang/ref/Reference": static fn hasReferencePendingList() -> boolean => sn::reference::has_reference_pending_list;
 
     "java/lang/reflect/Array": static fn newArray(component_type: class, length: int) -> object => sn::reflect_array::new_array;
+    "java/lang/reflect/Array": static fn getLength(array: object) -> int => sn::reflect_array::get_length;
+    "java/lang/reflect/Array": static fn get(array: object, index: int) -> object => sn::reflect_array::get;
+    "java/lang/reflect/Array": static fn getInt(array: object, index: int) -> int => sn::reflect_array::get_int;
+    "java/lang/reflect/Array": static fn set(array: object, index: int, value: object) -> void => sn::reflect_array::set;
+    "java/lang/reflect/Array": static fn setInt(array: object, index: int, value: int) -> void => sn::reflect_array::set_int;
 
     "java/io/FileDescriptor": static fn initIDs() -> void => sn::file_descriptor::init_ids; // todo: implement me
     "java/io/FileDescriptor": static fn getHandle(fd: int) -> long => sn::file_descriptor::get_handle;
     "java/io/FileDescriptor": static fn getAppend(fd: int) -> boolean => sn::file_descriptor::get_append;
     "java/io/FileDescriptor": instance fn close0() -> void => sn::file_descriptor::close0;
     "java/io/FileDescriptor": instance fn sync0() -> void => sn::file_descriptor::sync0;
+    "java/io/FileCleanable": static fn cleanupClose0(fd: int, handle: long) -> void => sn::file_descriptor::cleanup_close0;
 
     "java/io/FileInputStream": static fn initIDs() -> void => sn::file_input_stream::init_ids;
     "java/io/FileInputStream": instance fn open0(name: string) -> void => sn::file_input_stream::open0;
@@ -808,4 +913,14 @@ pub(crate) fn validate_builtin_natives() -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::find_builtin_native;
+
+    #[test]
+    fn file_cleanable_cleanup_close_is_registered_for_dispatch() {
+        assert!(find_builtin_native("java/io/FileCleanable:cleanupClose0:(IJ)V").is_some());
+    }
 }

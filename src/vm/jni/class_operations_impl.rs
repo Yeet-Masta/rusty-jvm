@@ -1,10 +1,13 @@
 use crate::from_mutf8_ptr;
+use crate::vm::error::Error;
 use crate::vm::heap::heap::HEAP;
 use crate::vm::helper::{clazz_ref, klass};
+use crate::vm::jni::handles;
 use crate::vm::jni::java_thread::JavaThread;
 use crate::vm::jni::utils::{
     set_pending_class_format_error, set_pending_internal_error, set_pending_linkage_error,
     set_pending_no_class_def_found_error, set_pending_null_pointer_exception,
+    set_pending_vm_error,
 };
 use crate::vm::method_area::instance_checker::InstanceChecker;
 use crate::vm::method_area::loaded_classes::CLASSES;
@@ -18,6 +21,7 @@ use std::ptr::null_mut;
 use tracing::warn;
 
 pub(super) extern "system" fn find_class(_env: *mut JNIEnv, name_mutf8: *const c_char) -> jclass {
+    let _managed = crate::vm::safepoint::ManagedAccess::enter();
     if name_mutf8.is_null() {
         set_pending_no_class_def_found_error("Failed to find class: null pointer for class name");
         return null_mut();
@@ -40,12 +44,40 @@ pub(super) extern "system" fn find_class(_env: *mut JNIEnv, name_mutf8: *const c
     }
 
     match clazz_ref(&name) {
-        Ok(clazz) => clazz as jclass,
-        Err(_) => {
-            set_pending_no_class_def_found_error(&name);
+        Ok(clazz) => handles::new_local(clazz),
+        Err(error) => {
+            set_find_class_error(&name, &error);
             null_mut()
         }
     }
+}
+
+fn set_find_class_error(name: &str, error: &Error) {
+    let Some(throwable) = error.throwable_ref() else {
+        set_pending_no_class_def_found_error(name);
+        return;
+    };
+    // Emergency delivery must not allocate even a class-name String.
+    if handles::emergency_oom_ref() != Some(throwable) {
+        let mut class = HEAP
+            .get_instance_name(throwable)
+            .ok()
+            .and_then(|name| CLASSES.get_loaded(&name));
+        // Throwable construction already materialized its superclass hierarchy.
+        // Inspect only published metadata, without loading classes on an error path.
+        while let Some(current) = class {
+            if current.this_class_name() == "java/lang/ClassNotFoundException" {
+                // FindClass uses the caller's internal name, not the loader's dotted message.
+                set_pending_no_class_def_found_error(name);
+                return;
+            }
+            class = current
+                .parent()
+                .as_deref()
+                .and_then(|parent| CLASSES.get_loaded(parent));
+        }
+    }
+    set_pending_vm_error(error);
 }
 
 /// Defines a class from raw classfile bytes, like HotSpot's `jni_DefineClass`: the class name is
@@ -57,6 +89,7 @@ pub(super) extern "system" fn define_class(
     buffer: *const jbyte,
     length: jsize,
 ) -> jclass {
+    let _managed = crate::vm::safepoint::ManagedAccess::enter();
     if buffer.is_null() || length < 0 {
         set_pending_class_format_error("Invalid class definition input");
         return null_mut();
@@ -97,12 +130,13 @@ pub(super) extern "system" fn define_class(
         return null_mut();
     }
 
+    let loader = handles::resolve_or_return!(loader);
     let result = with_method_area(|method_area| {
-        method_area.create_metaclass(&class_name, bytecode, loader as i32)
+        method_area.create_metaclass(&class_name, bytecode, loader)
     })
     .and_then(|(class_name, _)| clazz_ref(&class_name));
     match result {
-        Ok(class_ref) => class_ref as jclass,
+        Ok(class_ref) => handles::new_local(class_ref),
         Err(error) => {
             match error.throwable_ref() {
                 Some(throwable_ref) => {
@@ -146,20 +180,26 @@ fn is_valid_internal_class_name(name: &str) -> bool {
 }
 
 pub(super) extern "system" fn get_superclass(_env: *mut JNIEnv, sub: jclass) -> jclass {
-    if sub.is_null() {
+    let _managed = crate::vm::safepoint::ManagedAccess::enter();
+    let sub_ref = handles::resolve_or_return!(sub);
+    if sub_ref == 0 {
         set_pending_null_pointer_exception("Class is null");
         return null_mut();
     }
-    let klass = klass(sub as i32).expect("Failed to get class from reference");
+    let klass = klass(sub_ref).expect("Failed to get class from reference");
     let parent = if !klass.is_interface() {
         klass.parent().clone()
     } else {
         None
     };
 
-    parent
-        .map(|parent_name| clazz_ref(&parent_name).expect("Failed to get class from reference"))
-        .unwrap_or(0) as jclass
+    match parent.map(|name| clazz_ref(&name)).transpose() {
+        Ok(parent) => handles::new_local(parent.unwrap_or(0)),
+        Err(error) => {
+            set_pending_vm_error(&error);
+            null_mut()
+        }
+    }
 }
 
 pub(super) extern "system" fn is_assignable_from(
@@ -167,16 +207,23 @@ pub(super) extern "system" fn is_assignable_from(
     sub: jclass,
     sup: jclass,
 ) -> jboolean {
-    if sub.is_null() || sup.is_null() {
+    let _managed = crate::vm::safepoint::ManagedAccess::enter();
+    let sub_ref = handles::resolve_or_return!(sub);
+    let sup_ref = handles::resolve_or_return!(sup);
+    if sub_ref == 0 || sup_ref == 0 {
         set_pending_null_pointer_exception("Class is null");
         return false;
     }
-    let sub_klass = klass(sub as i32).expect("Failed to get class from reference");
-    let sup_klass = klass(sup as i32).expect("Failed to get class from reference");
+    let sub_klass = klass(sub_ref).expect("Failed to get class from reference");
+    let sup_klass = klass(sup_ref).expect("Failed to get class from reference");
 
     match InstanceChecker::checkcast(sub_klass.this_class_name(), sup_klass.this_class_name()) {
         Ok(result) => result as jboolean,
         Err(e) => {
+            if e.throwable_ref().is_some() {
+                set_pending_vm_error(&e);
+                return false;
+            }
             set_pending_internal_error(&format!(
                 "Failed to check assignability from {} to {}: {e}",
                 sub_klass.this_class_name(),
@@ -188,9 +235,58 @@ pub(super) extern "system" fn is_assignable_from(
 }
 
 pub(super) extern "system" fn get_module(_env: *mut JNIEnv, clazz: jclass) -> jobject {
-    HEAP.get_object_field_value(clazz as i32, "java/lang/Class", "module")
+    let _managed = crate::vm::safepoint::ManagedAccess::enter();
+    handles::new_local(
+        HEAP.get_object_field_value(
+            handles::resolve_or_return!(clazz),
+            "java/lang/Class",
+            "module",
+        )
         .expect("Failed to get module from class")
         .first()
         .copied()
-        .expect("Class module field has no value") as jobject
+        .expect("Class module field has no value"),
+    )
+}
+
+#[cfg(test)]
+mod budget_tests {
+    use super::*;
+    use crate::vm::gc::budget::AllocError;
+    use crate::vm::gc::test_allocations::{bootstrap_oom, measure};
+    use crate::vm::stack::rooted_slots::RootedSlots;
+    use crate::vm::stack::slot::Slot;
+
+    #[test]
+    fn gc_budget_find_class_preserves_non_lookup_throwables() {
+        bootstrap_oom();
+        for name in [
+            "java/lang/ExceptionInInitializerError",
+            "java/lang/ClassFormatError",
+            "java/lang/LinkageError",
+        ] {
+            let plan =
+                with_method_area(|area| area.create_instance_with_default_fields(name)).unwrap();
+            let mut root = RootedSlots::new();
+            let reference = HEAP.create_instance(plan, &mut root).unwrap();
+            let error = Error::uncaught_exception(Slot::Ref(reference));
+
+            set_find_class_error("requested/Name", &error);
+
+            assert_eq!(JavaThread::take_pending_exception(), Some(reference));
+        }
+    }
+
+    #[test]
+    fn gc_budget_find_class_preserves_emergency_without_allocation() {
+        let emergency = bootstrap_oom();
+        assert_eq!(JavaThread::get_pending_exception(), None);
+
+        let (_, allocations) = measure(usize::MAX, || {
+            set_find_class_error("requested/Name", &AllocError::Capacity.into());
+        });
+
+        assert_eq!(allocations, 0);
+        assert_eq!(JavaThread::take_pending_exception(), Some(emergency));
+    }
 }

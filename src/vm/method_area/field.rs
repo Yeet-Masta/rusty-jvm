@@ -1,9 +1,15 @@
 use crate::vm::error::Result;
 use crate::vm::execution_engine::executor::Executor;
 use crate::vm::execution_engine::string_pool_helper::StringPoolHelper;
+use crate::vm::gc::budget::{copy_slice, AllocError, AllocResult};
 use crate::vm::heap::heap::HEAP;
 use crate::vm::helper::{clazz_ref, default_value};
+use crate::vm::jni::java_thread::JavaThread;
+use crate::vm::stack::rooted_slots::RootedSlots;
+use crate::vm::stack::slot::Slot;
+use crate::vm::stack::stack_value::StackValueKind;
 use getset::{CopyGetters, Getters};
+use jclassmodel::modifiers::FieldModifier;
 use jdescriptor::TypeDescriptor;
 use once_cell::sync::OnceCell;
 use serde::Serialize;
@@ -29,6 +35,50 @@ pub(crate) struct FieldValue {
 }
 
 impl FieldValue {
+    pub(crate) fn storage_capacity(&self, planned: bool) -> AllocResult<usize> {
+        let value = self.value.read().map_err(|_| AllocError::InvalidLayout)?;
+        Ok(if planned {
+            value.len()
+        } else {
+            value.capacity()
+        })
+    }
+
+    pub(crate) fn try_clone(&self) -> AllocResult<Self> {
+        let value = self.value.read().map_err(|_| AllocError::InvalidLayout)?;
+        Ok(Self {
+            value: RwLock::new(copy_slice(&value)?),
+        })
+    }
+
+    /// Read one typed reference during a quiescent scan. Contention or malformed
+    /// storage aborts the scan; it must never wait for a stopped mutator.
+    pub(crate) fn reference_snapshot(&self) -> Result<i32> {
+        let value = self
+            .value
+            .try_read()
+            .map_err(|_| AllocError::InvalidLayout)?;
+        match value.as_slice() {
+            [reference] => Ok(*reference),
+            _ => Err(AllocError::InvalidLayout.into()),
+        }
+    }
+
+    /// Fixed-width collector write; the complete trace validates these slots first.
+    pub(crate) fn set_reference(&self, reference: i32) -> Result<()> {
+        let mut value = self
+            .value
+            .try_write()
+            .map_err(|_| AllocError::InvalidLayout)?;
+        match value.as_mut_slice() {
+            [slot] => {
+                *slot = reference;
+                Ok(())
+            }
+            _ => Err(AllocError::InvalidLayout.into()),
+        }
+    }
+
     pub fn new(type_descriptor: TypeDescriptor) -> Result<Self> {
         let value = default_value(&type_descriptor)?;
         Ok(Self {
@@ -38,7 +88,10 @@ impl FieldValue {
 
     pub fn set_raw_value(&self, value: Vec<i32>) -> Result<()> {
         let mut guard = self.value.write()?;
-        *guard = value;
+        if guard.len() != value.len() {
+            return Err(AllocError::InvalidLayout.into());
+        }
+        guard.copy_from_slice(&value);
         Ok(())
     }
 
@@ -57,9 +110,17 @@ impl FieldValue {
         let swapped = guard.as_slice() == expected;
         let old = guard.clone();
         if swapped {
-            *guard = new.to_vec();
+            if guard.len() != new.len() {
+                return Err(AllocError::InvalidLayout.into());
+            }
+            guard.copy_from_slice(new);
         }
         Ok((old, swapped))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn corrupt_width_for_test(&self, value: Vec<i32>) {
+        *self.value.write().unwrap() = value;
     }
 }
 
@@ -72,6 +133,22 @@ impl Clone for FieldValue {
 }
 
 impl FieldInfo {
+    pub(crate) fn is_static(&self) -> bool {
+        self.flags & FieldModifier::Static.bits() != 0
+    }
+
+    pub(crate) fn declaring_class(&self) -> &str {
+        &self.class_name
+    }
+
+    pub(crate) fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub(crate) fn reflection_ref_if_present(&self) -> Option<i32> {
+        self.reflection_ref.get().copied()
+    }
+
     pub fn new(
         type_descriptor: TypeDescriptor,
         flags: u16,
@@ -100,9 +177,14 @@ impl FieldInfo {
     }
 
     pub fn reflection_ref(&self) -> Result<i32> {
-        self.reflection_ref
-            .get_or_try_init(|| self.init_reflection_ref())
-            .copied()
+        if self.reflection_ref.get().is_none() {
+            let reference = self.init_reflection_ref()?;
+            let _ = self.reflection_ref.set(reference);
+        }
+        Ok(*self
+            .reflection_ref
+            .get()
+            .expect("published reflection field"))
     }
 
     fn init_reflection_ref(&self) -> Result<i32> {
@@ -121,39 +203,39 @@ impl FieldInfo {
     ///     byte[] annotations);
     /// ```
     fn construct_field(&self) -> Result<i32> {
+        let mut roots = JavaThread::hold_temp_roots(vec![]);
         let declaring_class_ref = clazz_ref(&self.class_name)?;
+        roots.add_root(Slot::Ref(declaring_class_ref));
 
         let name_ref = StringPoolHelper::get_string(&self.name)?;
+        roots.add_root(Slot::Ref(name_ref));
         let descr = self.type_descriptor.to_string();
         let type_ref = clazz_ref(&descr)?;
+        roots.add_root(Slot::Ref(type_ref));
 
         let modifiers = self.flags as i32;
         let trusted_final = 0; // we don't support this yet
         let slot = 0; // we don't support this yet
-        let signature_ref = self
-            .signature
-            .as_deref()
-            .map(StringPoolHelper::get_string)
-            .transpose()?
-            .unwrap_or(0);
-        let annotations = self
-            .annotations_raw
-            .as_ref()
-            .map(|raw| {
-                let values: Vec<i32> = raw.iter().map(|byte| *byte as i32).collect();
-                HEAP.create_array_with_values("[B", &values)
-            })
-            .unwrap_or(0);
+        let signature_ref = match self.signature.as_deref() {
+            Some(signature) => StringPoolHelper::get_string(signature)?,
+            None => 0,
+        };
+        roots.add_root(Slot::Ref(signature_ref));
+        let mut annotations_root = RootedSlots::new();
+        let annotations = match self.annotations_raw.as_deref() {
+            Some(raw) => HEAP.create_byte_array(raw, &mut annotations_root)?,
+            None => 0,
+        };
 
         let args = &[
-            declaring_class_ref.into(),
-            name_ref.into(),
-            type_ref.into(),
+            StackValueKind::Ref(declaring_class_ref),
+            StackValueKind::Ref(name_ref),
+            StackValueKind::Ref(type_ref),
             modifiers.into(),
             trusted_final.into(),
             slot.into(),
-            signature_ref.into(),
-            annotations.into(),
+            StackValueKind::Ref(signature_ref),
+            StackValueKind::Ref(annotations),
         ];
 
         let method_ref = Executor::invoke_args_constructor(
@@ -163,6 +245,33 @@ impl FieldInfo {
             None
         )?;
 
-        Ok(method_ref)
+        Ok(method_ref[0].value())
+    }
+}
+
+#[cfg(test)]
+mod gc_tests {
+    use super::*;
+
+    #[test]
+    fn gc_roots_field_reflection_cache_is_non_initializing() {
+        let field = FieldInfo::new(
+            TypeDescriptor::Integer,
+            0,
+            "Unloaded".into(),
+            "field".into(),
+        );
+        assert_eq!(field.reflection_ref_if_present(), None);
+        field.reflection_ref.set(71).unwrap();
+        assert_eq!(field.reflection_ref_if_present(), Some(71));
+    }
+
+    #[test]
+    fn gc_roots_reference_field_snapshot_rejects_lock_contention() {
+        let value = FieldValue::new(TypeDescriptor::Object("Test".into())).unwrap();
+        let guard = value.value.write().unwrap();
+        assert!(value.reference_snapshot().is_err());
+        drop(guard);
+        assert_eq!(value.reference_snapshot().unwrap(), 0);
     }
 }

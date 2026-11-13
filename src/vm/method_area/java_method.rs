@@ -2,9 +2,11 @@ use crate::vm::error::{Error, Result};
 use crate::vm::execution_engine::executor::Executor;
 use crate::vm::execution_engine::string_pool_helper::StringPoolHelper;
 use crate::vm::heap::heap::HEAP;
-use crate::vm::helper::{clazz_ref, receiver_only_chunks, ref_arg_chunks, undecorate};
+use crate::vm::helper::{clazz_ref, ref_arg_chunks, undecorate};
+use crate::vm::jni::java_thread::JavaThread;
 use crate::vm::stack::slot::Slot;
 use crate::vm::stack::stack_frame::{ExceptionTable, StackFrame};
+use crate::vm::stack::stack_value::StackValueKind;
 use derive_new::new;
 use getset::{CopyGetters, Getters};
 use jclassmodel::attributes::LocalVariableInfo;
@@ -86,7 +88,7 @@ impl JavaMethod {
     }
 
     pub fn new_stack_frame(&self) -> Result<StackFrame> {
-        match &self.code_context {
+        let mut frame = match &self.code_context {
             Some(context) => Ok(StackFrame::new(
                 Arc::clone(&self.name_signature),
                 context.max_locals() as usize,
@@ -100,7 +102,9 @@ impl JavaMethod {
                 "Code context is missing for {}.{}",
                 self.class_name, self.name_signature
             ))),
-        }
+        }?;
+        frame.set_synchronized_method(self.is_synchronized(), self.is_static());
+        Ok(frame)
     }
 
     /// Builds a synthetic stack frame for this native method so it appears on the thread's stack
@@ -132,9 +136,18 @@ impl JavaMethod {
     }
 
     pub fn reflection_ref(&self) -> Result<i32> {
-        self.reflection_ref
-            .get_or_try_init(|| self.init_reflection_ref())
-            .copied()
+        if self.reflection_ref.get().is_none() {
+            let reference = self.init_reflection_ref()?;
+            let _ = self.reflection_ref.set(reference);
+        }
+        Ok(*self
+            .reflection_ref
+            .get()
+            .expect("published reflection method"))
+    }
+
+    pub(crate) fn reflection_ref_if_present(&self) -> Option<i32> {
+        self.reflection_ref.get().copied()
     }
 
     fn init_reflection_ref(&self) -> Result<i32> {
@@ -160,74 +173,86 @@ impl JavaMethod {
     ///     byte[] annotationDefault);
     /// ```
     fn construct_method(&self) -> Result<i32> {
+        let mut roots = JavaThread::hold_temp_roots(vec![]);
+        let mut destination = crate::vm::stack::rooted_slots::RootedSlots::new();
         let declaring_class_ref = clazz_ref(self.class_name())?;
+        roots.add_root(Slot::Ref(declaring_class_ref));
 
         let mut name_signature_split = self.name_signature.split(':'); //fixme: crete separate field with name of get it from here
         let name = name_signature_split.next().unwrap();
         let name_ref = StringPoolHelper::get_string(name)?;
+        roots.add_root(Slot::Ref(name_ref));
 
         let parameter_type_clazz_refs = self
             .method_descriptor
             .parameter_types()
             .iter()
             .map(|t| t.to_string())
-            .map(|t| clazz_ref(undecorate(&t)))
+            .map(|t| {
+                let reference = clazz_ref(undecorate(&t))?;
+                roots.add_root(Slot::Ref(reference));
+                Ok(reference)
+            })
             .collect::<Result<Vec<_>>>()?;
-        let parameter_type_refs =
-            HEAP.create_array_with_values("[Ljava/lang/Class;", &parameter_type_clazz_refs);
+        let parameter_type_refs = HEAP.create_array_with_values(
+            "[Ljava/lang/Class;",
+            &parameter_type_clazz_refs,
+            &mut destination,
+        )?;
+        roots.add_root(Slot::Ref(parameter_type_refs));
 
         let return_type = self.method_descriptor.return_type().to_string();
         let return_type_ref = clazz_ref(&return_type)?;
+        roots.add_root(Slot::Ref(return_type_ref));
 
         let exception_type_clazz_refs = self
             .exceptions
             .iter()
-            .map(|exception_type| clazz_ref(exception_type))
+            .map(|exception_type| {
+                let reference = clazz_ref(exception_type)?;
+                roots.add_root(Slot::Ref(reference));
+                Ok(reference)
+            })
             .collect::<Result<Vec<_>>>()?;
-        let exception_type_refs =
-            HEAP.create_array_with_values("[Ljava/lang/Class;", &exception_type_clazz_refs);
+        let exception_type_refs = HEAP.create_array_with_values(
+            "[Ljava/lang/Class;",
+            &exception_type_clazz_refs,
+            &mut destination,
+        )?;
+        roots.add_root(Slot::Ref(exception_type_refs));
 
         let modifiers = self.access_flags;
 
         let slot = self.slot;
 
         let signature_ref = StringPoolHelper::get_string(name_signature_split.next().unwrap())?;
+        roots.add_root(Slot::Ref(signature_ref));
 
-        let annotations = self
-            .annotations_raw
-            .clone()
-            .map(|annotations_raw| {
-                let vec = annotations_raw
-                    .iter()
-                    .map(|x| *x as i32)
-                    .collect::<Vec<_>>();
-                let annotations = HEAP.create_array_with_values("[B", &vec);
-                annotations
-            })
-            .unwrap_or(0);
+        let annotations = match self.annotations_raw.as_deref() {
+            Some(raw) => HEAP.create_byte_array(raw, &mut destination)?,
+            None => 0,
+        };
+        roots.add_root(Slot::Ref(annotations));
 
         let parameter_annotations = 0; // todo: implement me
-        let annotation_default = self
-            .annotation_default_raw
-            .as_ref()
-            .map(|raw| {
-                let values: Vec<i32> = raw.iter().map(|byte| *byte as i32).collect();
-                HEAP.create_array_with_values("[B", &values)
-            })
-            .unwrap_or(0);
+        let annotation_default = match self.annotation_default_raw.as_deref() {
+            Some(raw) => HEAP.create_byte_array(raw, &mut destination)?,
+            None => 0,
+        };
+        roots.add_root(Slot::Ref(annotation_default));
 
         let args = &[
-            declaring_class_ref.into(),
-            name_ref.into(),
-            parameter_type_refs.into(),
-            return_type_ref.into(),
-            exception_type_refs.into(),
+            StackValueKind::Ref(declaring_class_ref),
+            StackValueKind::Ref(name_ref),
+            StackValueKind::Ref(parameter_type_refs),
+            StackValueKind::Ref(return_type_ref),
+            StackValueKind::Ref(exception_type_refs),
             modifiers.into(),
             slot.into(),
-            signature_ref.into(),
-            annotations.into(),
-            parameter_annotations.into(),
-            annotation_default.into(),
+            StackValueKind::Ref(signature_ref),
+            StackValueKind::Ref(annotations),
+            StackValueKind::Ref(parameter_annotations),
+            StackValueKind::Ref(annotation_default),
         ];
 
         let method_ref = Executor::invoke_args_constructor(
@@ -237,7 +262,7 @@ impl JavaMethod {
             None
         )?;
 
-        Ok(method_ref)
+        Ok(method_ref[0].value())
     }
 
     /// Invokes
@@ -252,7 +277,10 @@ impl JavaMethod {
     ///     byte[] parameterAnnotations);
     /// ```
     fn construct_constructor(&self) -> Result<i32> {
+        let mut roots = JavaThread::hold_temp_roots(vec![]);
+        let mut destination = crate::vm::stack::rooted_slots::RootedSlots::new();
         let declaring_class_ref = clazz_ref(self.class_name())?;
+        roots.add_root(Slot::Ref(declaring_class_ref));
 
         let mut name_signature_split = self.name_signature.split(':'); //fixme: crete separate field with name of get it from here
 
@@ -261,49 +289,59 @@ impl JavaMethod {
             .parameter_types()
             .iter()
             .map(|t| t.to_string())
-            .map(|t| clazz_ref(undecorate(&t)))
+            .map(|t| {
+                let reference = clazz_ref(undecorate(&t))?;
+                roots.add_root(Slot::Ref(reference));
+                Ok(reference)
+            })
             .collect::<Result<Vec<_>>>()?;
-        let parameter_type_refs =
-            HEAP.create_array_with_values("[Ljava/lang/Class;", &parameter_type_clazz_refs);
+        let parameter_type_refs = HEAP.create_array_with_values(
+            "[Ljava/lang/Class;",
+            &parameter_type_clazz_refs,
+            &mut destination,
+        )?;
+        roots.add_root(Slot::Ref(parameter_type_refs));
 
         let exception_type_clazz_refs = self
             .exceptions
             .iter()
-            .map(|exception_type| clazz_ref(exception_type))
+            .map(|exception_type| {
+                let reference = clazz_ref(exception_type)?;
+                roots.add_root(Slot::Ref(reference));
+                Ok(reference)
+            })
             .collect::<Result<Vec<_>>>()?;
-        let checked_exception_type_refs =
-            HEAP.create_array_with_values("[Ljava/lang/Class;", &exception_type_clazz_refs);
+        let checked_exception_type_refs = HEAP.create_array_with_values(
+            "[Ljava/lang/Class;",
+            &exception_type_clazz_refs,
+            &mut destination,
+        )?;
+        roots.add_root(Slot::Ref(checked_exception_type_refs));
 
         let modifiers = self.access_flags;
 
         let slot = self.slot;
 
         let signature_ref = StringPoolHelper::get_string(name_signature_split.next().unwrap())?;
+        roots.add_root(Slot::Ref(signature_ref));
 
-        let annotations = self
-            .annotations_raw
-            .clone()
-            .map(|annotations_raw| {
-                let vec = annotations_raw
-                    .iter()
-                    .map(|x| *x as i32)
-                    .collect::<Vec<_>>();
-                let annotations = HEAP.create_array_with_values("[B", &vec);
-                annotations
-            })
-            .unwrap_or(0);
+        let annotations = match self.annotations_raw.as_deref() {
+            Some(raw) => HEAP.create_byte_array(raw, &mut destination)?,
+            None => 0,
+        };
+        roots.add_root(Slot::Ref(annotations));
 
         let parameter_annotations = 0; // todo: implement me
 
         let args = &[
-            declaring_class_ref.into(),
-            parameter_type_refs.into(),
-            checked_exception_type_refs.into(),
+            StackValueKind::Ref(declaring_class_ref),
+            StackValueKind::Ref(parameter_type_refs),
+            StackValueKind::Ref(checked_exception_type_refs),
             modifiers.into(),
             slot.into(),
-            signature_ref.into(),
-            annotations.into(),
-            parameter_annotations.into(),
+            StackValueKind::Ref(signature_ref),
+            StackValueKind::Ref(annotations),
+            StackValueKind::Ref(parameter_annotations),
         ];
 
         let method_ref = Executor::invoke_args_constructor(
@@ -313,7 +351,7 @@ impl JavaMethod {
             None
         )?;
 
-        Ok(method_ref)
+        Ok(method_ref[0].value())
     }
 
     pub fn name(&self) -> &str {
@@ -335,14 +373,15 @@ impl JavaMethod {
     /// Cached because it is a fixed property of the descriptor, and every call would otherwise walk
     /// the parameter list again to rediscover it.
     ///
-    /// A `@PolymorphicSignature` method reports only its receiver: its declared descriptor is a
-    /// placeholder that says nothing about the parameters, so the rest stay untagged unless a caller
-    /// has the call site's own descriptor to work from.
+    /// Polymorphic declarations are erased placeholders. Their callers must supply an effective
+    /// MethodType to the invoker rather than asking the declaration to classify arguments.
     pub fn arg_ref_chunks(&self) -> Result<&[bool]> {
         self.arg_ref_chunks
             .get_or_try_init(|| {
                 if self.is_polymorphic_signature() {
-                    Ok(receiver_only_chunks(!self.is_static()))
+                    Err(Error::new_execution(
+                        "polymorphic arguments require an effective MethodType",
+                    ))
                 } else {
                     ref_arg_chunks(&self.method_descriptor, !self.is_static())
                 }
@@ -353,6 +392,11 @@ impl JavaMethod {
     pub fn is_static(&self) -> bool {
         MethodModifier::from_bits_truncate(self.access_flags as u16)
             .contains(MethodModifier::Static)
+    }
+
+    pub fn is_synchronized(&self) -> bool {
+        MethodModifier::from_bits_truncate(self.access_flags as u16)
+            .contains(MethodModifier::Synchronized)
     }
 
     /// Whether this is a `@PolymorphicSignature` intrinsic (`MethodHandle.invoke*`, `VarHandle`
@@ -369,5 +413,33 @@ impl JavaMethod {
     /// (`Ljdk/internal/reflect/CallerSensitive;`).
     pub fn has_annotation(&self, descriptor: &str) -> bool {
         self.runtime_visible_annotations.contains(descriptor)
+    }
+}
+
+#[cfg(test)]
+mod gc_tests {
+    use super::*;
+
+    #[test]
+    fn gc_roots_method_and_constructor_reflection_caches_are_non_initializing() {
+        for name in ["method", "<init>"] {
+            let method = JavaMethod::new(
+                "()V".parse().unwrap(),
+                "Unloaded",
+                &format!("{name}:()V"),
+                None,
+                false,
+                vec![],
+                0,
+                name,
+                None,
+                None,
+                HashSet::new(),
+                0,
+            );
+            assert_eq!(method.reflection_ref_if_present(), None);
+            method.reflection_ref.set(83).unwrap();
+            assert_eq!(method.reflection_ref_if_present(), Some(83));
+        }
     }
 }

@@ -1,8 +1,9 @@
-use crate::vm::error::Result;
+use crate::vm::error::{Error, Result};
 use crate::vm::execution_engine::executor::Executor;
 use crate::vm::execution_engine::static_init::StaticInit;
 use crate::vm::execution_engine::string_pool_helper::StringPoolHelper;
 use crate::vm::helper::{clazz_ref, klass};
+use crate::vm::jni::handles;
 use crate::vm::jni::java_thread::JavaThread;
 use crate::vm::method_area::java_method::JavaMethod;
 use crate::vm::method_area::lookup;
@@ -50,27 +51,38 @@ fn get_method_id_impl(
 ) -> jmethodID {
     let name_str = from_mutf8_ptr!(name).expect("Failed to convert method name from CESU-8");
     let sig_str = from_mutf8_ptr!(sig).expect("Failed to convert method signature from CESU-8");
-    let declaring_klass = klass(clazz as i32).expect("Failed to get class from reference");
-    StaticInit::initialize_java_class(&declaring_klass)
-        .expect("Failed to initialize class before getting method ID"); // todo: throw ExceptionInInitializerError here
+    let declaring_klass =
+        klass(handles::resolve_or_return!(clazz)).expect("Failed to get class from reference");
+    if let Err(error) = StaticInit::initialize_java_class(&declaring_klass) {
+        set_pending_vm_error(&error);
+        return null_mut();
+    }
     let full_signature = format!("{}:{}", name_str, sig_str);
 
     // Look up the method implementation in the class/interface hierarchy.
     let klass_name = declaring_klass.this_class_name().clone();
-    let method_id = lookup_method(&klass_name, &full_signature)
-        .unwrap_or_else(|e| panic!("Failed to find implementation of {full_signature}: {e}"))
-        .and_then(|method| {
-            let found_class_name = method.class_name();
-            let found_clazz_ref = clazz_ref(found_class_name).ok()?;
-            let found_klass = klass(found_clazz_ref).ok()?;
-            let (idx, _) = found_klass.get_method_full(&full_signature)?;
-            Some(encode_method_id(found_clazz_ref, idx) as jmethodID)
-        });
+    let method_id = lookup_method(&klass_name, &full_signature).and_then(|method| {
+        method
+            .map(|method| -> Result<_> {
+                let found_class_name = method.class_name();
+                let found_clazz_ref = clazz_ref(found_class_name)?;
+                let found_klass = klass(found_clazz_ref)?;
+                Ok(found_klass
+                    .get_method_full(&full_signature)
+                    .map(|(idx, _)| encode_method_id(found_clazz_ref, idx) as jmethodID))
+            })
+            .transpose()
+            .map(Option::flatten)
+    });
 
     match method_id {
-        Some(id) => id,
-        None => {
+        Ok(Some(id)) => id,
+        Ok(None) => {
             set_pending_no_such_method_error(&full_signature);
+            null_mut()
+        }
+        Err(error) => {
+            set_pending_vm_error(&error);
             null_mut()
         }
     }
@@ -168,6 +180,16 @@ pub(super) fn set_pending_string_index_out_of_bounds_exception() {
     set_pending_throwable("java/lang/StringIndexOutOfBoundsException", None);
 }
 
+/// Allocation errors already carry the permanent emergency throwable. Inspect it
+/// before formatting a diagnostic or trying to construct another Java exception.
+pub(super) fn set_pending_vm_error(error: &Error) {
+    if let Some(reference) = error.throwable_ref() {
+        JavaThread::set_pending_if_empty(reference);
+    } else if JavaThread::get_pending_exception().is_none() {
+        set_pending_internal_error(&error.to_string());
+    }
+}
+
 fn set_pending_error(exception_class: &str, message: &str) {
     set_pending_throwable(exception_class, Some(message));
 }
@@ -191,25 +213,36 @@ fn set_pending_throwable(exception_class: &str, message: Option<&str>) {
     }
 
     let result = match message {
-        Some(message) => StringPoolHelper::get_string(message).and_then(|msg_ref| {
+        // Not interned: interned strings are permanent roots, and messages vary with input.
+        // `msg` roots the string until the constructor has stored it.
+        Some(message) => StringPoolHelper::create_string(message).and_then(|msg| {
             Executor::invoke_args_constructor(
                 exception_class,
                 "<init>:(Ljava/lang/String;)V",
-                &[StackValueKind::from(msg_ref)],
+                &[StackValueKind::Ref(msg[0].value())],
                 None,
             )
         }),
         None => Executor::invoke_default_constructor(exception_class),
     };
     match result {
-        Ok(throwable_ref) => match JavaThread::try_set_pending_exception(throwable_ref) {
+        Ok(throwable_ref) => match JavaThread::try_set_pending_exception(throwable_ref[0].value())
+        {
             Ok(()) => (),
             // Constructing the throwable ran Java code, which may itself have
             // raised (and left pending) an exception in the meantime. Honor
             // first-wins and drop this one rather than panicking across FFI.
             Err(e) => warn!("Dropping {exception_class} ('{log_message}'): {e}"),
         },
-        Err(e) => panic!("Failed to construct {exception_class} for '{log_message}': {e}"),
+        Err(e) => {
+            if let Some(throwable) = e.throwable_ref() {
+                JavaThread::set_pending_if_empty(throwable);
+            } else {
+                // Never unwind across FFI. The emergency throwable needs no allocation or Java.
+                warn!("Failed to construct {exception_class} for '{log_message}': {e}");
+                handles::HandleError::OutOfMemory.set_pending();
+            }
+        }
     }
 }
 
@@ -242,28 +275,32 @@ pub(super) fn decode_method_id(method_id: usize) -> (i32, i64) {
 pub(super) fn transform_args_to_vec(
     method: &Arc<JavaMethod>,
     args: *const jvalue,
-) -> Vec<StackValueKind> {
+) -> Option<Vec<StackValueKind>> {
     let md = method.get_method_descriptor();
     let pt = md.parameter_types();
     let args_count = pt.len();
 
     if args_count == 0 {
-        return vec![];
+        return Some(vec![]);
     }
 
     if args.is_null() {
-        panic!("Null pointer passed as arguments for method that expects {args_count} arguments");
+        set_pending_null_pointer_exception("JNI method arguments are null");
+        return None;
     }
 
     let args = unsafe { std::slice::from_raw_parts(args, args_count) };
     args.iter()
         .zip(pt.iter())
         .map(|(arg, pt)| resolve_stack_kind_value(*arg, pt))
-        .collect::<Vec<_>>()
+        .collect()
 }
 
-fn resolve_stack_kind_value(value: jvalue, type_descriptor: &TypeDescriptor) -> StackValueKind {
-    match type_descriptor {
+fn resolve_stack_kind_value(
+    value: jvalue,
+    type_descriptor: &TypeDescriptor,
+) -> Option<StackValueKind> {
+    Some(match type_descriptor {
         TypeDescriptor::Boolean => (if unsafe { value.z } { 1 } else { 0 }).into(),
         TypeDescriptor::Byte => (unsafe { value.b } as i32).into(),
         TypeDescriptor::Char => (unsafe { value.c } as i32).into(),
@@ -273,8 +310,8 @@ fn resolve_stack_kind_value(value: jvalue, type_descriptor: &TypeDescriptor) -> 
         TypeDescriptor::Float => unsafe { value.f }.into(),
         TypeDescriptor::Double => unsafe { value.d }.into(),
         TypeDescriptor::Object(_) | TypeDescriptor::Array(_, _) => {
-            (unsafe { value.l } as i32).into()
+            StackValueKind::Ref(handles::resolve(unsafe { value.l })?)
         }
-        TypeDescriptor::Void => panic!("Void type cannot be used as argument"),
-    }
+        TypeDescriptor::Void => return None,
+    })
 }

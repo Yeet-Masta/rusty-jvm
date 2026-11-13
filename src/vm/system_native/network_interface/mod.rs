@@ -20,6 +20,9 @@ use crate::vm::exception::pending_helpers::{
 use crate::vm::execution_engine::executor::Executor;
 use crate::vm::execution_engine::string_pool_helper::StringPoolHelper;
 use crate::vm::heap::heap::HEAP;
+use crate::vm::jni::java_thread::{JavaThread, TempRootsGuard};
+use crate::vm::stack::rooted_slots::RootedSlots;
+use crate::vm::stack::slot::Slot;
 use crate::vm::system_native::inet_address::ipv6_available;
 use crate::vm::system_native::string::get_utf8_string_by_ref;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
@@ -94,11 +97,12 @@ pub(crate) fn get_all() -> Result<i32> {
     let Some(interfaces) = or_throw(platform::all(ipv6_available()?))? else {
         return Ok(0);
     };
+    let mut objects = Objects::new();
     let interface_refs = interfaces
         .iter()
-        .map(create_network_interface)
+        .map(|interface| create_network_interface(&mut objects, interface))
         .collect::<Result<Vec<_>>>()?;
-    Ok(HEAP.create_array_with_values("[Ljava/net/NetworkInterface;", &interface_refs))
+    objects.new_array("[Ljava/net/NetworkInterface;", &interface_refs)
 }
 
 /// `java.net.NetworkInterface.getByName0(Ljava/lang/String;)Ljava/net/NetworkInterface;`
@@ -162,11 +166,7 @@ pub(crate) fn get_mac_addr0(_address_ref: i32, name_ref: i32, index: i32) -> Res
     let Some(Some(mac_address)) = or_throw(platform::mac_address(&name, index))? else {
         return Ok(0);
     };
-    let bytes = mac_address
-        .iter()
-        .map(|&b| b as i8 as i32)
-        .collect::<Vec<_>>();
-    Ok(HEAP.create_array_with_values("[B", &bytes))
+    HEAP.create_byte_array(&mac_address, &mut RootedSlots::new())
 }
 
 /// `java.net.NetworkInterface.getMTU0(Ljava/lang/String;I)I`
@@ -231,18 +231,57 @@ fn java_inet_address(address_ref: i32) -> Result<Option<JavaInetAddress>> {
     Ok(Some(address))
 }
 
+/// Roots every object a native creates, from its allocation until the native returns: building
+/// one object allocates the next, and any allocation can collect.
+struct Objects {
+    roots: TempRootsGuard,
+}
+
+impl Objects {
+    fn new() -> Self {
+        Self {
+            roots: JavaThread::hold_temp_roots(vec![]),
+        }
+    }
+
+    fn root(&mut self, reference: i32) -> i32 {
+        self.roots.add_root(Slot::Ref(reference));
+        reference
+    }
+
+    fn new_instance(&mut self, class_name: &str) -> Result<i32> {
+        let instance = Executor::invoke_default_constructor(class_name)?;
+        Ok(self.root(instance[0].value()))
+    }
+
+    fn new_string(&mut self, value: &str) -> Result<i32> {
+        let string = StringPoolHelper::create_string(value)?;
+        Ok(self.root(string[0].value()))
+    }
+
+    fn new_array(&mut self, type_name: &str, values: &[i32]) -> Result<i32> {
+        let array = HEAP.create_array_with_values(type_name, values, &mut RootedSlots::new())?;
+        Ok(self.root(array))
+    }
+
+    fn new_byte_array(&mut self, bytes: &[u8]) -> Result<i32> {
+        let array = HEAP.create_byte_array(bytes, &mut RootedSlots::new())?;
+        Ok(self.root(array))
+    }
+}
+
 fn create_optional_network_interface(interface: Option<NetIf>) -> Result<i32> {
     match interface {
-        Some(interface) => create_network_interface(&interface),
+        Some(interface) => create_network_interface(&mut Objects::new(), &interface),
         None => Ok(0),
     }
 }
 
-fn create_network_interface(interface: &NetIf) -> Result<i32> {
-    let interface_ref = Executor::invoke_default_constructor(NETWORK_INTERFACE)?;
-    let name_ref = StringPoolHelper::create_string(&interface.name)?;
+fn create_network_interface(objects: &mut Objects, interface: &NetIf) -> Result<i32> {
+    let interface_ref = objects.new_instance(NETWORK_INTERFACE)?;
+    let name_ref = objects.new_string(&interface.name)?;
     let display_name_ref = match &interface.display_name {
-        Some(display_name) => StringPoolHelper::create_string(display_name)?,
+        Some(display_name) => objects.new_string(display_name)?,
         None => name_ref,
     };
     set_field(interface_ref, NETWORK_INTERFACE, "name", name_ref)?;
@@ -263,41 +302,39 @@ fn create_network_interface(interface: &NetIf) -> Result<i32> {
     let mut address_refs = Vec::with_capacity(interface.addresses.len());
     let mut binding_refs = Vec::with_capacity(interface.addresses.len());
     for address in &interface.addresses {
-        let address_ref = create_inet_address(address, interface_ref)?;
-        binding_refs.push(create_interface_address(address, address_ref)?);
+        let address_ref = create_inet_address(objects, address, interface_ref)?;
+        binding_refs.push(create_interface_address(objects, address, address_ref)?);
         address_refs.push(address_ref);
     }
 
     let mut child_refs = Vec::with_capacity(interface.children.len());
     for child in &interface.children {
-        let child_ref = create_network_interface(child)?;
+        let child_ref = create_network_interface(objects, child)?;
         set_field(child_ref, NETWORK_INTERFACE, "parent", interface_ref)?;
         child_refs.push(child_ref);
     }
 
-    let addrs_ref = HEAP.create_array_with_values("[Ljava/net/InetAddress;", &address_refs);
-    let bindings_ref =
-        HEAP.create_array_with_values("[Ljava/net/InterfaceAddress;", &binding_refs);
-    let childs_ref = HEAP.create_array_with_values("[Ljava/net/NetworkInterface;", &child_refs);
+    let addrs_ref = objects.new_array("[Ljava/net/InetAddress;", &address_refs)?;
+    let bindings_ref = objects.new_array("[Ljava/net/InterfaceAddress;", &binding_refs)?;
+    let childs_ref = objects.new_array("[Ljava/net/NetworkInterface;", &child_refs)?;
     set_field(interface_ref, NETWORK_INTERFACE, "addrs", addrs_ref)?;
     set_field(interface_ref, NETWORK_INTERFACE, "bindings", bindings_ref)?;
     set_field(interface_ref, NETWORK_INTERFACE, "childs", childs_ref)?;
     Ok(interface_ref)
 }
 
-fn create_inet_address(address: &NetAddr, interface_ref: i32) -> Result<i32> {
+fn create_inet_address(
+    objects: &mut Objects,
+    address: &NetAddr,
+    interface_ref: i32,
+) -> Result<i32> {
     match address.ip {
-        IpAddr::V4(ip) => create_inet4_address(ip),
+        IpAddr::V4(ip) => create_inet4_address(objects, ip),
         IpAddr::V6(ip) => {
-            let address_ref = Executor::invoke_default_constructor(INET6_ADDRESS)?;
+            let address_ref = objects.new_instance(INET6_ADDRESS)?;
             let holder6_ref =
                 HEAP.get_object_field_value(address_ref, INET6_ADDRESS, "holder6")?[0];
-            let octets = ip
-                .octets()
-                .iter()
-                .map(|&b| b as i8 as i32)
-                .collect::<Vec<_>>();
-            let ipaddress_ref = HEAP.create_array_with_values("[B", &octets);
+            let ipaddress_ref = objects.new_byte_array(&ip.octets())?;
             set_field(
                 holder6_ref,
                 INET6_ADDRESS_HOLDER,
@@ -326,8 +363,8 @@ fn create_inet_address(address: &NetAddr, interface_ref: i32) -> Result<i32> {
     }
 }
 
-fn create_inet4_address(ip: Ipv4Addr) -> Result<i32> {
-    let address_ref = Executor::invoke_default_constructor(INET4_ADDRESS)?;
+fn create_inet4_address(objects: &mut Objects, ip: Ipv4Addr) -> Result<i32> {
+    let address_ref = objects.new_instance(INET4_ADDRESS)?;
     let holder_ref = HEAP.get_object_field_value(address_ref, INET_ADDRESS, "holder")?[0];
     set_field(
         holder_ref,
@@ -338,11 +375,15 @@ fn create_inet4_address(ip: Ipv4Addr) -> Result<i32> {
     Ok(address_ref)
 }
 
-fn create_interface_address(address: &NetAddr, address_ref: i32) -> Result<i32> {
-    let binding_ref = Executor::invoke_default_constructor(INTERFACE_ADDRESS)?;
+fn create_interface_address(
+    objects: &mut Objects,
+    address: &NetAddr,
+    address_ref: i32,
+) -> Result<i32> {
+    let binding_ref = objects.new_instance(INTERFACE_ADDRESS)?;
     set_field(binding_ref, INTERFACE_ADDRESS, "address", address_ref)?;
     if let Some(broadcast) = address.broadcast {
-        let broadcast_ref = create_inet4_address(broadcast)?;
+        let broadcast_ref = create_inet4_address(objects, broadcast)?;
         set_field(binding_ref, INTERFACE_ADDRESS, "broadcast", broadcast_ref)?;
     }
     if let Some(prefix) = address.prefix {

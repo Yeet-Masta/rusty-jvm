@@ -3,8 +3,10 @@ use crate::vm::execution_engine::executor::Executor;
 use crate::vm::execution_engine::static_init::StaticInit;
 use crate::vm::execution_engine::string_pool_helper::StringPoolHelper;
 use crate::vm::helper::{clazz_ref, i64_to_vec, vec_to_i64};
+use crate::vm::jni::java_thread::JavaThread;
 use crate::vm::method_area::loaded_classes::CLASSES;
 use crate::vm::stack::slot::Slot;
+use crate::vm::stack::stack_value::StackValueKind;
 use crate::vm::system_native::method_handle_natives::types::ReferenceKind;
 use jclassmodel::constant_pool::ConstantPoolLookup;
 use std::collections::HashMap;
@@ -55,6 +57,21 @@ pub struct LdcResolutionManager {
 }
 
 impl LdcResolutionManager {
+    pub(crate) fn cached_refs(&self) -> Result<Vec<i32>> {
+        let cache = self.cache.try_read().map_err(|error| {
+            Error::new_execution(&format!("Cannot snapshot LDC cache: {error}"))
+        })?;
+        Ok(cache
+            .values()
+            .flat_map(|entries| entries.values())
+            .flatten()
+            .filter_map(|constant| match constant {
+                LdcConstant::Reference(reference) => Some(*reference),
+                LdcConstant::Int(_) | LdcConstant::Float(_) => None,
+            })
+            .collect())
+    }
+
     pub fn resolve_ldc(&self, current_class_name: &str, cpoolindex: u16) -> Result<LdcConstant> {
         if let Some(Some(value)) = self
             .cache
@@ -156,6 +173,29 @@ impl LdcResolutionManager {
     }
 }
 
+#[cfg(test)]
+mod gc_tests {
+    use super::*;
+
+    #[test]
+    fn gc_roots_ldc_cache_traces_only_tagged_references_without_resolution() {
+        let manager = LdcResolutionManager::default();
+        manager.cache.write().unwrap().insert(
+            "Unloaded".into(),
+            HashMap::from([
+                (1, vec![LdcConstant::Reference(41)]),
+                (2, vec![LdcConstant::Int(42), LdcConstant::Int(43)]),
+                (3, vec![LdcConstant::Float(f32::from_bits(44))]),
+            ]),
+        );
+
+        assert_eq!(manager.cached_refs().unwrap(), vec![41]);
+        let held = manager.cache.write().unwrap();
+        assert!(manager.cached_refs().is_err());
+        drop(held);
+    }
+}
+
 /// Builds a reference to a `java.lang.invoke.MethodType` object from a method descriptor string.
 ///
 /// # Arguments
@@ -169,12 +209,13 @@ impl LdcResolutionManager {
 // todo: consider separate cache for method type references
 pub fn build_methodtype_ref(descriptor: &str) -> Result<i32> {
     let string_ref = StringPoolHelper::get_string(descriptor)?;
+    let _string = JavaThread::hold_temp_roots(vec![Slot::Ref(string_ref)]);
     let method_type_ref = Executor::invoke_static_method(
         "java/lang/invoke/MethodType",
         "fromMethodDescriptorString:(Ljava/lang/String;Ljava/lang/ClassLoader;)Ljava/lang/invoke/MethodType;",
-        &[string_ref.into()],
-    )?[0];
-    Ok(method_type_ref)
+        &[StackValueKind::Ref(string_ref), StackValueKind::Ref(0)],
+    )?;
+    Ok(method_type_ref[0].value())
 }
 
 /// Resolves a method handle for a given method or field in the JVM.
@@ -198,6 +239,7 @@ pub fn resolve_method_handle(
 ) -> Result<i32> {
     let (lookup_class_name, method_name_lookup_for) = reference_kind.to_findmethod_signature()?;
     let new_lookup = build_lookup_for_class(current_class_name)?;
+    let _lookup = JavaThread::hold_temp_roots(vec![Slot::Ref(new_lookup)]);
     let refc = clazz_ref(class_name_to_lookup_in)?;
     let method_name_ref = StringPoolHelper::get_string(method_or_field_to_lookup_for)?;
 
@@ -206,15 +248,26 @@ pub fn resolve_method_handle(
         | ReferenceKind::REF_invokeInterface
         | ReferenceKind::REF_invokeVirtual => {
             let method_type_ref = build_methodtype_ref(method_or_field_descriptor)?;
-            vec![refc.into(), method_name_ref.into(), method_type_ref.into()]
+            vec![
+                StackValueKind::Ref(refc),
+                StackValueKind::Ref(method_name_ref),
+                StackValueKind::Ref(method_type_ref),
+            ]
         }
         ReferenceKind::REF_newInvokeSpecial => {
             let method_type_ref = build_methodtype_ref(method_or_field_descriptor)?;
-            vec![refc.into(), method_type_ref.into()]
+            vec![
+                StackValueKind::Ref(refc),
+                StackValueKind::Ref(method_type_ref),
+            ]
         }
         ReferenceKind::REF_getField => {
             let field_type_ref = clazz_ref(method_or_field_descriptor)?;
-            vec![refc.into(), method_name_ref.into(), field_type_ref.into()]
+            vec![
+                StackValueKind::Ref(refc),
+                StackValueKind::Ref(method_name_ref),
+                StackValueKind::Ref(field_type_ref),
+            ]
         }
         ReferenceKind::REF_getStatic
         | ReferenceKind::REF_putField
@@ -230,8 +283,8 @@ pub fn resolve_method_handle(
         method_name_lookup_for,
         new_lookup,
         &args,
-    )?[0];
-    Ok(method_handle_ref)
+    )?;
+    Ok(method_handle_ref[0].value())
 }
 
 /// Constructs a new `java/lang/invoke/MethodHandles$Lookup` object for the specified class.
@@ -263,9 +316,9 @@ fn build_lookup_for_class(current_class_name: &str) -> Result<i32> {
         "java/lang/invoke/MethodHandles$Lookup",
         "in:(Ljava/lang/Class;)Ljava/lang/invoke/MethodHandles$Lookup;",
         impl_lookup_ref,
-        &[current_clazz.into()],
-    )?[0];
-    Ok(new_lookup)
+        &[StackValueKind::Ref(current_clazz)],
+    )?;
+    Ok(new_lookup[0].value())
 }
 
 #[cfg(test)]

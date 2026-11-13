@@ -42,6 +42,8 @@ fn main() -> anyhow::Result<()> {
     }
 
     println!("cargo:rerun-if-changed=tests/test_data");
+    println!("cargo:rerun-if-changed=tests/test_data/GcRootsDemo.java");
+    println!("cargo:rerun-if-changed=tests/test_data/GcThreadsDemo.java");
     // the test classes are compiled by, and must match, the JDK under `JAVA_HOME`
     let dest_dir = PathBuf::from(env::var("CARGO_TARGET_DIR").unwrap_or(String::from("target")))
         .join("java_classes_for_tests");
@@ -117,6 +119,7 @@ fn compile(dest_dir: &Path) -> anyhow::Result<()> {
         "UserPerfCounterExample.java",
         "ClasspathDemo.java",
         "HelpfulNpeDebugInfo.java",
+        "GcReferencesDemo.java",
     ];
 
     let mut normal_files = Vec::new();
@@ -312,6 +315,14 @@ fn compile(dest_dir: &Path) -> anyhow::Result<()> {
             "UserPerfCounterExample.java",
         ),
         (&["-cp", jar_path.as_str(), "-d"], "ClasspathDemo.java"),
+        (
+            &[
+                "--add-exports",
+                "java.base/jdk.internal.ref=ALL-UNNAMED",
+                "-d",
+            ],
+            "GcReferencesDemo.java",
+        ),
     ];
 
     for (args_prefix, file) in special_cmds {

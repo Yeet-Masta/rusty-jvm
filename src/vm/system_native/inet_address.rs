@@ -3,6 +3,7 @@
 use crate::vm::error::Result;
 use crate::vm::execution_engine::executor::Executor;
 use crate::vm::execution_engine::string_pool_helper::StringPoolHelper;
+use crate::vm::stack::stack_value::StackValueKind;
 use once_cell::sync::OnceCell;
 
 /// `java.net.InetAddress.init()V`, `java.net.Inet4Address.init()V` and `java.net.Inet6Address.init()V`
@@ -36,11 +37,13 @@ fn availability() -> Result<&'static Availability> {
     static AVAILABILITY: OnceCell<Availability> = OnceCell::new();
     AVAILABILITY.get_or_try_init(|| {
         let property_ref = StringPoolHelper::get_string("java.net.preferIPv4Stack")?;
+        // interned, so permanently rooted
         let prefer_ipv4_stack = Executor::invoke_static_method(
             "java/lang/Boolean",
             "getBoolean:(Ljava/lang/String;)Z",
-            &[property_ref.into()],
+            &[StackValueKind::Ref(property_ref)],
         )?[0]
+            .value()
             != 0;
         Ok(Availability {
             ipv4: ipv4_supported(),

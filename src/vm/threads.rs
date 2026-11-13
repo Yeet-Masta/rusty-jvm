@@ -1,5 +1,6 @@
 use crate::vm::heap::heap::HEAP;
 use crate::vm::jni::java_thread::JavaThread;
+use crate::vm::safepoint::{Blocking, Reason};
 use dashmap::DashMap;
 use parking_lot::Mutex;
 use std::sync::atomic::{AtomicI64, Ordering};
@@ -41,6 +42,11 @@ static NON_DAEMON_THREADS: LazyLock<Mutex<Vec<JoinHandle<()>>>> =
 /// directly. Every thread registers itself once it is attached (identity is set) and unregisters on
 /// termination.
 static PARKERS: LazyLock<DashMap<i32, std::thread::Thread>> = LazyLock::new(DashMap::new);
+
+/// Keys are retained until exit; no parker guard spans a Safe transition.
+pub(crate) fn parker_refs() -> Vec<i32> {
+    PARKERS.iter().map(|entry| *entry.key()).collect()
+}
 
 /// Returns the next non-zero `eetop` token for a starting thread.
 pub(crate) fn next_eetop() -> i64 {
@@ -116,6 +122,7 @@ pub(crate) fn join_all_non_daemon() {
             break;
         }
         for handle in handles {
+            let _blocked = Blocking::enter(Reason::Blocking);
             if let Err(panic) = handle.join() {
                 error!("a non-daemon thread terminated by panicking: {panic:?}");
             }

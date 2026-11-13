@@ -1,6 +1,8 @@
 use crate::vm::error::{Error, Result};
 use crate::vm::execution_engine::invoke_dynamic_runner::InvokeDynamicRunner;
+use crate::vm::gc::layout::InstanceLayout;
 use crate::vm::heap::java_instance::{ClassName, FieldNameType};
+use crate::vm::helper::is_reference;
 use crate::vm::method_area::field::{FieldInfo, FieldValue};
 use crate::vm::method_area::java_method::{CodeContext, JavaMethod};
 use crate::vm::method_area::lookup;
@@ -13,9 +15,9 @@ use jclassmodel::modifiers::{ClassModifier, NestedClassModifier};
 use jclassmodel::{ClassModel, EnclosingMethodInfo, FieldModel, MethodModel};
 use jdescriptor::TypeDescriptor;
 use once_cell::sync::OnceCell;
-use parking_lot::ReentrantMutex;
-use std::cell::RefCell;
+use parking_lot::{Condvar, Mutex};
 use std::sync::{Arc, OnceLock};
+use std::thread::ThreadId;
 
 pub const STATIC_FIELDS_START: i64 = i32::MAX as i64;
 
@@ -28,11 +30,15 @@ const FIELD_OFFSET_SCALE: i64 = 4;
 
 type FullyQualifiedFieldName = String; // format: com/example/models/Person.name
 
+#[path = "java_class_gc.rs"]
+mod gc;
+
 /// A class's fields, split the three ways [`JavaClass`] stores them: metadata for every field,
 /// values for the static ones, and the template instances are created from.
 struct BuiltFields {
     info: IndexMap<String, Arc<FieldInfo>>,
     static_values: IndexMap<String, Arc<FieldValue>>,
+    static_references: Box<[String]>,
     instance_template: IndexMap<String, FieldValue>,
 }
 
@@ -41,6 +47,7 @@ pub(crate) struct JavaClass {
     methods: IndexMap<String, Arc<JavaMethod>>,
     fields_info: IndexMap<String, Arc<FieldInfo>>,
     static_fields: IndexMap<String, Arc<FieldValue>>,
+    static_references: Box<[String]>,
     instance_fields_template: IndexMap<String, FieldValue>,
     #[get = "pub"]
     constant_pool: ConstantPool,
@@ -63,9 +70,11 @@ pub(crate) struct JavaClass {
     nested_class_modifiers: Option<NestedClassModifier>,
 
     #[get = "pub"]
-    static_fields_init_state: Arc<ReentrantMutex<InitState>>,
+    static_fields_init_state: InitState,
 
-    instance_fields_hierarchy: OnceCell<IndexMap<ClassName, IndexMap<FieldNameType, FieldValue>>>,
+    instance_fields_hierarchy:
+        OnceCell<Arc<IndexMap<ClassName, IndexMap<FieldNameType, FieldValue>>>>,
+    instance_layout: OnceCell<Arc<InstanceLayout>>,
     fields_offset_mapping: OnceCell<IndexSet<FullyQualifiedFieldName>>,
     vtable: OnceCell<IndexMap<String, Arc<JavaMethod>>>,
     #[get = "pub"]
@@ -83,25 +92,67 @@ pub(crate) struct JavaClass {
 
 #[derive(Debug, Default)]
 pub struct InitState {
-    inner_state: RefCell<InnerState>,
+    state: Mutex<InnerState>,
+    cv: Condvar,
 }
 
 impl InitState {
-    pub fn set_inner_state(&self, new_state: InnerState) {
-        *self.inner_state.borrow_mut() = new_state;
+    /// Returns true only to the elected initializer. Ownership is logical; no
+    /// mutex guard survives this call or spans the initializer's Java execution.
+    pub(crate) fn begin(&self) -> std::result::Result<bool, i32> {
+        let owner = std::thread::current().id();
+        let mut state = crate::vm::safepoint::lock(&self.state);
+        loop {
+            match *state {
+                InnerState::Uninitialized => {
+                    *state = InnerState::Initializing { owner };
+                    return Ok(true);
+                }
+                InnerState::Initializing { owner: current } if owner == current => {
+                    return Ok(false)
+                }
+                InnerState::Initializing { .. } => {
+                    state = crate::vm::safepoint::wait(&self.cv, &self.state, state);
+                }
+                InnerState::Initialized => return Ok(false),
+                InnerState::Failed { cause_root } => return Err(cause_root),
+            }
+        }
     }
 
-    pub fn get_inner_state(&self) -> InnerState {
-        *self.inner_state.borrow()
+    pub(crate) fn finish(&self, cause: Option<i32>) {
+        let mut state = crate::vm::safepoint::lock(&self.state);
+        assert_eq!(
+            *state,
+            InnerState::Initializing {
+                owner: std::thread::current().id()
+            }
+        );
+        *state = match cause {
+            Some(cause_root) => InnerState::Failed { cause_root },
+            None => InnerState::Initialized,
+        };
+        self.cv.notify_all();
+    }
+
+    /// The failed cause is owned by permanent class metadata and is a global GC
+    /// root. Enumeration uses this value without class loading or Java execution.
+    pub(crate) fn get_inner_state(&self) -> InnerState {
+        *crate::vm::safepoint::lock(&self.state)
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub enum InnerState {
     #[default]
-    NotInitialized,
-    Initializing,
+    Uninitialized,
+    Initializing {
+        owner: ThreadId,
+    },
     Initialized,
+    Failed {
+        cause_root: i32,
+    },
 }
 
 impl JavaClass {
@@ -130,10 +181,11 @@ impl JavaClass {
 
         let built_fields = Self::build_fields(fields, &name)?;
 
-        Ok(Self::assemble(
+        let mut class = Self::assemble(
             Self::build_methods(methods, &name),
             built_fields.info,
             built_fields.static_values,
+            built_fields.static_references,
             built_fields.instance_template,
             constant_pool,
             attributes,
@@ -147,7 +199,9 @@ impl JavaClass {
             annotations_raw,
             enclosing_method,
             source_file,
-        ))
+        );
+        class.add_vm_fields()?;
+        Ok(class)
     }
 
     /// Builds a class the VM invents rather than loads: primitives (`int`, `void`, …) and array
@@ -163,6 +217,7 @@ impl JavaClass {
             IndexMap::new(),
             IndexMap::new(),
             IndexMap::new(),
+            Box::new([]),
             IndexMap::new(),
             ConstantPool::empty(),
             Attributes::empty(),
@@ -233,7 +288,16 @@ impl JavaClass {
         let mut info = IndexMap::new();
         let mut instance_template = IndexMap::new();
         let mut static_values = IndexMap::new();
+        let mut static_references = Vec::new();
         for field in fields {
+            // This storage is keyed by bare name. Do not publish an incomplete
+            // layout when a class file declares same-name/different-type fields.
+            if info.contains_key(&field.name) {
+                return Err(Error::new_execution(&format!(
+                    "Cannot represent duplicate field name {class_name}.{}",
+                    field.name
+                )));
+            }
             let is_static = field.is_static();
             info.insert(
                 field.name.clone(),
@@ -248,6 +312,9 @@ impl JavaClass {
                 ),
             );
             if is_static {
+                if is_reference(&field.descriptor) {
+                    static_references.push(field.name.clone());
+                }
                 static_values.insert(field.name, Arc::new(FieldValue::new(field.descriptor)?));
             } else {
                 instance_template.insert(field.name, FieldValue::new(field.descriptor)?);
@@ -257,6 +324,7 @@ impl JavaClass {
         Ok(BuiltFields {
             info,
             static_values,
+            static_references: static_references.into_boxed_slice(),
             instance_template,
         })
     }
@@ -266,6 +334,7 @@ impl JavaClass {
         methods: IndexMap<String, Arc<JavaMethod>>,
         fields_info: IndexMap<String, Arc<FieldInfo>>,
         static_fields: IndexMap<String, Arc<FieldValue>>,
+        static_references: Box<[String]>,
         instance_fields_template: IndexMap<String, FieldValue>,
         constant_pool: ConstantPool,
         attributes: Attributes,
@@ -284,6 +353,7 @@ impl JavaClass {
             methods,
             fields_info,
             static_fields,
+            static_references,
             instance_fields_template,
             constant_pool,
             attributes,
@@ -293,8 +363,9 @@ impl JavaClass {
             interfaces,
             class_modifiers,
             nested_class_modifiers,
-            static_fields_init_state: Arc::default(),
+            static_fields_init_state: InitState::default(),
             instance_fields_hierarchy: OnceCell::new(),
+            instance_layout: OnceCell::new(),
             fields_offset_mapping: OnceCell::new(),
             vtable: OnceCell::new(),
             declaring_class,
@@ -350,27 +421,6 @@ impl JavaClass {
         let field_info = self.fields_info.get(instance_field_name_type)?;
 
         Some(field_info.type_descriptor())
-    }
-
-    pub fn put_instance_field_descriptor(
-        &mut self,
-        name: String,
-        type_descriptor: TypeDescriptor,
-        flags: u16,
-        class_name: &str,
-    ) -> Result<Option<Arc<FieldInfo>>> {
-        self.instance_fields_template
-            .insert(name.clone(), FieldValue::new(type_descriptor.clone())?);
-
-        Ok(self.fields_info.insert(
-            name.clone(),
-            Arc::new(FieldInfo::new(
-                type_descriptor,
-                flags,
-                class_name.to_string(),
-                name,
-            )),
-        ))
     }
 
     pub fn default_value_instance_fields(&self) -> IndexMap<FieldNameType, FieldValue> {
@@ -525,19 +575,26 @@ impl JavaClass {
 
     pub fn instance_fields_hierarchy(
         &self,
-    ) -> Result<&IndexMap<ClassName, IndexMap<FieldNameType, FieldValue>>> {
-        self.instance_fields_hierarchy.get_or_try_init(|| {
+    ) -> Result<&Arc<IndexMap<ClassName, IndexMap<FieldNameType, FieldValue>>>> {
+        if self.instance_fields_hierarchy.get().is_none() {
             let mut instance_fields_hierarchy = IndexMap::new();
             lookup::lookup_and_fill_instance_fields_hierarchy(
                 &self.this_class_name,
                 &mut instance_fields_hierarchy,
             )?;
-            Ok(instance_fields_hierarchy)
-        })
+            // Construction may load classes. Only publication occurs under the cell lock.
+            let _ = self
+                .instance_fields_hierarchy
+                .set(Arc::new(instance_fields_hierarchy));
+        }
+        Ok(self
+            .instance_fields_hierarchy
+            .get()
+            .expect("published field hierarchy"))
     }
 
     fn fields_offset_mapping(&self) -> Result<&IndexSet<FullyQualifiedFieldName>> {
-        self.fields_offset_mapping.get_or_try_init(|| {
+        if self.fields_offset_mapping.get().is_none() {
             let mut fields_offset_mapping = IndexSet::new();
             let hierarchy = self.instance_fields_hierarchy()?;
 
@@ -547,13 +604,20 @@ impl JavaClass {
                 });
             });
 
-            Ok(fields_offset_mapping)
-        })
+            let _ = self.fields_offset_mapping.set(fields_offset_mapping);
+        }
+        Ok(self
+            .fields_offset_mapping
+            .get()
+            .expect("published field offsets"))
     }
 
     pub fn vtable(&self) -> Result<&IndexMap<String, Arc<JavaMethod>>> {
-        self.vtable
-            .get_or_try_init(|| lookup::build_vtable(self.this_class_name()))
+        if self.vtable.get().is_none() {
+            let vtable = lookup::build_vtable(self.this_class_name())?;
+            let _ = self.vtable.set(vtable);
+        }
+        Ok(self.vtable.get().expect("published vtable"))
     }
 
     pub fn inject_mirror_clazz_ref(&self, mirror_class_ref: i32) -> Result<()> {

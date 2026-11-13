@@ -3,6 +3,7 @@ use crate::vm::exception::helpers::{check_array_access, check_array_store};
 use crate::vm::execution_engine::common::last_frame_mut;
 use crate::vm::execution_engine::opcode::*;
 use crate::vm::heap::heap::HEAP;
+use crate::vm::jni::java_thread::JavaThread;
 use crate::vm::stack::slot::Slot;
 use crate::vm::stack::stack_frame::{StackFrame, StackFrames};
 use crate::vm::stack::stack_value::StackValue;
@@ -105,6 +106,9 @@ fn handle_object_array_store(stack_frames: &mut StackFrames) -> Result<()> {
         let arrayref: i32 = stack_frame.pop();
         (arrayref, index, value)
     };
+    // The type check below can load classes, and so allocate and collect, after both references
+    // have left the operand stack.
+    let _operands = JavaThread::hold_temp_roots(vec![Slot::Ref(arrayref), value]);
     if !check_array_access(arrayref, index, stack_frames)? {
         return Ok(());
     }

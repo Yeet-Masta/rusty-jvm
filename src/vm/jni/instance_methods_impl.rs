@@ -1,6 +1,7 @@
 use crate::vm::execution_engine::executor::Executor;
 use crate::vm::heap::heap::HEAP;
 use crate::vm::helper::klass;
+use crate::vm::jni::handles;
 use crate::vm::jni::jni_invoke::jni_invoke;
 use crate::vm::jni::jni_value::JNIValue;
 use crate::vm::jni::utils::{
@@ -19,6 +20,7 @@ pub(super) extern "system" fn get_method_id(
     name: *const c_char,
     sig: *const c_char,
 ) -> jmethodID {
+    let _managed = crate::vm::safepoint::ManagedAccess::enter();
     get_instance_method_id_impl(clazz, name, sig)
 }
 
@@ -30,6 +32,7 @@ macro_rules! call_method_a_impl {
             method_id: jmethodID,
             args: *const jvalue,
         ) -> $jni_ty {
+            let _managed = crate::vm::safepoint::ManagedAccess::enter();
             call_method_a::<$jni_ty>(env, this, method_id, args)
         }
     };
@@ -59,21 +62,26 @@ fn call_method_a<T: JNIValue>(
         .expect("Failed to get method from declaring class by index");
 
     let name_signature = method.name_signature().to_owned();
-    let args_values = transform_args_to_vec(&method, args);
+    let Some(args_values) = transform_args_to_vec(&method, args) else {
+        return T::default();
+    };
 
     // Perform virtual dispatch: find the concrete implementation in the actual instance's
     // class hierarchy (handles interface methods, abstract methods, and overridden methods).
-    let this_ref = this as i32;
+    let this_ref = handles::resolve_or_return!(this);
     let instance_name = HEAP
         .get_instance_name(this_ref)
         .expect("Failed to get instance name from reference");
-    let implementation = lookup::lookup_instance_method(&instance_name, &name_signature)
-        .unwrap_or_else(|e| {
-            panic!("Failed to find implementation of {name_signature} for {instance_name}: {e}")
-        })
-        .unwrap_or_else(|| {
-            panic!("Failed to find implementation of {name_signature} for {instance_name}")
-        });
+    let implementation = match lookup::lookup_instance_method(&instance_name, &name_signature) {
+        Ok(method) => method,
+        Err(error) => {
+            crate::vm::jni::utils::set_pending_vm_error(&error);
+            return T::default();
+        }
+    }
+    .unwrap_or_else(|| {
+        panic!("Failed to find implementation of {name_signature} for {instance_name}")
+    });
 
     let implementation_klass_name = implementation.class_name().to_owned();
 
@@ -96,6 +104,7 @@ macro_rules! call_non_virtual_method_a_impl {
             method_id: jmethodID,
             args: *const jvalue,
         ) -> $jni_ty {
+            let _managed = crate::vm::safepoint::ManagedAccess::enter();
             call_non_virtual_method_a::<$jni_ty>(env, this, target, method_id, args)
         }
     };
@@ -119,7 +128,7 @@ fn call_non_virtual_method_a<T: JNIValue>(
 ) -> T {
     let (declaring_class_ref, method_index) = decode_method_id(method_id as usize);
 
-    let target_klass_name = klass(target as i32)
+    let target_klass_name = klass(handles::resolve_or_return!(target))
         .expect("Failed to get target class")
         .this_class_name()
         .to_owned();
@@ -130,13 +139,15 @@ fn call_non_virtual_method_a<T: JNIValue>(
         .get_method_by_index(method_index)
         .expect("Failed to get method from declaring class by index");
     let name_signature = method.name_signature().to_owned();
-    let args_values = transform_args_to_vec(&method, args);
+    let Some(args_values) = transform_args_to_vec(&method, args) else {
+        return T::default();
+    };
 
     let context = format!("{target_klass_name}.{name_signature}");
     let result = Executor::invoke_non_static_method(
         &target_klass_name,
         &name_signature,
-        this as i32,
+        handles::resolve_or_return!(this),
         &args_values,
     );
     jni_invoke(result, &context)
