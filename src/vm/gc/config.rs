@@ -49,7 +49,7 @@ impl GcConfig {
                     parse_positive_integer(value, "-XX:GCAllocThreshold")
                         .map_err(|error| format!("Invalid VM option `{option}`: {error}"))?,
                 );
-            } else if option == "-XX:+GcStressAtSafepoints" {
+            } else if option == "-XX:+GCStressAtSafepoints" {
                 stress_at_safepoints = true;
             }
         }
@@ -191,7 +191,7 @@ mod tests {
             &["-Xmx64m", "-Xlog:gc", "-Xms32m"],
             &[
                 "-XX:GCAllocThreshold=128",
-                "-XX:+GcStressAtSafepoints",
+                "-XX:+GCStressAtSafepoints",
                 "-XX:+UseG1GC",
             ],
         )

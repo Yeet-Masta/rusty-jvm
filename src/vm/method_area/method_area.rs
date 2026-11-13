@@ -35,6 +35,11 @@ pub(crate) fn global_root_refs() -> Result<Vec<i32>> {
     }
 }
 
+/// [`with_method_area`], or `None` before the method area exists (VM bootstrap has not begun).
+pub(crate) fn try_with_method_area<R>(f: impl FnOnce(&MethodArea) -> R) -> Option<R> {
+    METHOD_AREA.get().map(f)
+}
+
 pub(crate) fn with_method_area<F, R>(f: F) -> R
 where
     F: FnOnce(&MethodArea) -> R,
@@ -249,6 +254,11 @@ impl MethodArea {
             .map_err(|_| {
                 Error::new_execution("system_thread_group_id was already set, cannot be set again")
             })
+    }
+
+    /// The "main" thread group, once bootstrap has created it.
+    pub(crate) fn main_thread_group_id(&self) -> Option<i32> {
+        self.main_thread_group_id.get().copied()
     }
 
     pub fn set_main_thread_group_id(&self, thread_group_id: i32) -> Result<()> {

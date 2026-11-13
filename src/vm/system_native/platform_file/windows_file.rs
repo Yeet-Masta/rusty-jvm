@@ -23,7 +23,8 @@ impl PlatformFile {
             return Ok(false); // closed
         }
         let file = ManuallyDrop::new(unsafe { File::from_raw_handle(raw_handle as RawHandle) });
-        match file.sync_all() {
+        // Waits for the storage device
+        match crate::vm::safepoint::blocking(|| file.sync_all()) {
             Ok(()) => Ok(true),
             // Like HotSpot, a read-only handle cannot be flushed but that is not a failure
             Err(e) => Ok(e.raw_os_error() == Some(ERROR_ACCESS_DENIED as i32)),

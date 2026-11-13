@@ -201,8 +201,9 @@ pub(super) fn finish(result: HandleResult<usize>) -> jobject {
 }
 
 pub(super) fn new_reference(object: jobject, kind: ReferenceKind) -> jobject {
-    // Resolve and publish under the same lock, with no Java call or safepoint in between.
-    // TODO(GC): the coordinator's mutator permit will enclose this operation in task 4.
+    // Resolve and publish under the same lock, with no Java call or safepoint in between. Every
+    // JNI entry point holds ManagedAccess, so no collection can run while the target is held only
+    // in this Rust local.
     let result = JavaThread::with_jni_frames(|frames| {
         let mut table = table();
         let target = table.resolve(object as usize)?;

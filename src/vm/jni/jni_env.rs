@@ -38,7 +38,10 @@ use crate::vm::jni::instance_methods_impl::{
     call_non_virtual_void_method_a, call_object_method_a, call_short_method_a, call_void_method_a,
     get_method_id,
 };
-use crate::vm::jni::java_vm_interface_impl::get_java_vm;
+use crate::vm::jni::java_vm_interface_impl::{
+    attach_current_thread, attach_current_thread_as_daemon, destroy_java_vm,
+    detach_current_thread, get_env, get_java_vm,
+};
 use crate::vm::jni::monitor_impl::{monitor_enter, monitor_exit};
 use crate::vm::jni::native_registration_impl::{register_natives, unregister_natives};
 use crate::vm::jni::object_fields_impl::{
@@ -74,10 +77,37 @@ use crate::vm::jni::string_operations_impl::{
     get_string_utf_region, new_string, new_string_utf8, release_string_chars,
     release_string_critical, release_string_utf_chars,
 };
-use crate::vm::jni::variadic::*;
+use crate::vm::jni::variadic::{
+    rusty_jvm_CallBooleanMethod, rusty_jvm_CallBooleanMethodV, rusty_jvm_CallByteMethod,
+    rusty_jvm_CallByteMethodV, rusty_jvm_CallCharMethod, rusty_jvm_CallCharMethodV,
+    rusty_jvm_CallDoubleMethod, rusty_jvm_CallDoubleMethodV, rusty_jvm_CallFloatMethod,
+    rusty_jvm_CallFloatMethodV, rusty_jvm_CallIntMethod, rusty_jvm_CallIntMethodV,
+    rusty_jvm_CallLongMethod, rusty_jvm_CallLongMethodV, rusty_jvm_CallNonvirtualBooleanMethod,
+    rusty_jvm_CallNonvirtualBooleanMethodV, rusty_jvm_CallNonvirtualByteMethod,
+    rusty_jvm_CallNonvirtualByteMethodV, rusty_jvm_CallNonvirtualCharMethod,
+    rusty_jvm_CallNonvirtualCharMethodV, rusty_jvm_CallNonvirtualDoubleMethod,
+    rusty_jvm_CallNonvirtualDoubleMethodV, rusty_jvm_CallNonvirtualFloatMethod,
+    rusty_jvm_CallNonvirtualFloatMethodV, rusty_jvm_CallNonvirtualIntMethod,
+    rusty_jvm_CallNonvirtualIntMethodV, rusty_jvm_CallNonvirtualLongMethod,
+    rusty_jvm_CallNonvirtualLongMethodV, rusty_jvm_CallNonvirtualObjectMethod,
+    rusty_jvm_CallNonvirtualObjectMethodV, rusty_jvm_CallNonvirtualShortMethod,
+    rusty_jvm_CallNonvirtualShortMethodV, rusty_jvm_CallNonvirtualVoidMethod,
+    rusty_jvm_CallNonvirtualVoidMethodV, rusty_jvm_CallObjectMethod, rusty_jvm_CallObjectMethodV,
+    rusty_jvm_CallShortMethod, rusty_jvm_CallShortMethodV, rusty_jvm_CallStaticBooleanMethod,
+    rusty_jvm_CallStaticBooleanMethodV, rusty_jvm_CallStaticByteMethod,
+    rusty_jvm_CallStaticByteMethodV, rusty_jvm_CallStaticCharMethod,
+    rusty_jvm_CallStaticCharMethodV, rusty_jvm_CallStaticDoubleMethod,
+    rusty_jvm_CallStaticDoubleMethodV, rusty_jvm_CallStaticFloatMethod,
+    rusty_jvm_CallStaticFloatMethodV, rusty_jvm_CallStaticIntMethod,
+    rusty_jvm_CallStaticIntMethodV, rusty_jvm_CallStaticLongMethod,
+    rusty_jvm_CallStaticLongMethodV, rusty_jvm_CallStaticObjectMethod,
+    rusty_jvm_CallStaticObjectMethodV, rusty_jvm_CallStaticShortMethod,
+    rusty_jvm_CallStaticShortMethodV, rusty_jvm_CallStaticVoidMethod,
+    rusty_jvm_CallStaticVoidMethodV, rusty_jvm_CallVoidMethod, rusty_jvm_CallVoidMethodV,
+    rusty_jvm_NewObject, rusty_jvm_NewObjectV,
+};
 use crate::vm::jni::version_information_impl::get_version;
-use jni_sys::{jint, JNIEnv, JNIInvokeInterface_, JNINativeInterface_, JavaVM};
-use std::ffi::c_void;
+use jni_sys::{JNIEnv, JNIInvokeInterface_, JNINativeInterface_, JavaVM};
 
 /// Returns a pointer to the global JNI function table.
 ///
@@ -95,31 +125,6 @@ pub(crate) fn get_jni_vm() -> *mut JavaVM {
     static mut ENV: *const JNIInvokeInterface_ = &VTABLE.1;
     std::ptr::addr_of_mut!(ENV).cast()
 }
-
-macro_rules! jni_vm_stub {
-    ($name:ident ( $($arg:ty),*) -> $ret:ty) => {
-        #[allow(non_snake_case)]
-        unsafe extern "system" fn $name(
-            _vm: *mut JavaVM,
-            $(_: $arg),*
-        ) -> $ret {
-            unimplemented!(concat!(
-                "JNI ",
-                stringify!($name),
-                "(",
-                stringify!($($arg),*),
-                ") -> ",
-                stringify!($ret)
-            ));
-        }
-    };
-}
-
-jni_vm_stub!(DestroyJavaVM() -> jint);
-jni_vm_stub!(AttachCurrentThread(*mut *mut c_void, *mut c_void) -> jint);
-jni_vm_stub!(DetachCurrentThread() -> jint);
-jni_vm_stub!(GetEnv(*mut *mut c_void, jint) -> jint);
-jni_vm_stub!(AttachCurrentThreadAsDaemon(*mut *mut c_void, *mut c_void) -> jint);
 
 struct Wrapper(JNINativeInterface_, JNIInvokeInterface_);
 unsafe impl Sync for Wrapper {}
@@ -359,11 +364,11 @@ static VTABLE: Wrapper = {
     ni.v24.GetStringUTFLengthAsLong = get_string_utf_length_as_long;
 
     let mut ii: JNIInvokeInterface_ = unsafe { std::mem::zeroed() };
-    ii.v1_4.DestroyJavaVM = DestroyJavaVM;
-    ii.v1_4.AttachCurrentThread = AttachCurrentThread;
-    ii.v1_4.DetachCurrentThread = DetachCurrentThread;
-    ii.v1_4.GetEnv = GetEnv;
-    ii.v1_4.AttachCurrentThreadAsDaemon = AttachCurrentThreadAsDaemon;
+    ii.v1_4.DestroyJavaVM = destroy_java_vm;
+    ii.v1_4.AttachCurrentThread = attach_current_thread;
+    ii.v1_4.DetachCurrentThread = detach_current_thread;
+    ii.v1_4.GetEnv = get_env;
+    ii.v1_4.AttachCurrentThreadAsDaemon = attach_current_thread_as_daemon;
 
     Wrapper(ni, ii)
 };

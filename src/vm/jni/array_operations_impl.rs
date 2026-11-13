@@ -4,6 +4,7 @@ use crate::vm::jni::utils::{
     set_pending_array_index_out_of_bounds_exception,
     set_pending_array_region_out_of_bounds_exception, set_pending_array_store_exception,
     set_pending_negative_array_size_exception, set_pending_null_pointer_exception,
+    set_pending_vm_error,
 };
 use crate::vm::jni::{buffer_leases, handles};
 use crate::vm::method_area::instance_checker::InstanceChecker;
@@ -113,11 +114,7 @@ pub(super) extern "system" fn new_object_array(
     match result {
         Ok(reference) => handles::new_local(reference),
         Err(error) => {
-            if let Some(throwable) = error.throwable_ref() {
-                crate::vm::jni::java_thread::JavaThread::set_pending_if_empty(throwable);
-            } else {
-                handles::install_emergency_oom();
-            }
+            set_pending_vm_error(&error);
             std::ptr::null_mut()
         }
     }
@@ -238,8 +235,8 @@ fn new_primitive_type_array_impl(len: jsize, type_name: &str) -> jarray {
     let mut destination = RootedSlots::new();
     match HEAP.create_array(type_name, len, &mut destination) {
         Ok(reference) => handles::new_local(reference),
-        Err(_) => {
-            handles::install_emergency_oom();
+        Err(error) => {
+            set_pending_vm_error(&error);
             std::ptr::null_mut()
         }
     }

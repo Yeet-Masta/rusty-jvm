@@ -1,6 +1,8 @@
 use crate::vm::error::{Error, Result};
 use crate::vm::gc::budget::{copy_slice, copy_string, AllocError, AllocResult};
-use crate::vm::gc::layout::{InstanceFields, InstanceLayout, References};
+#[cfg(test)]
+use crate::vm::gc::layout::References;
+use crate::vm::gc::layout::{InstanceFields, InstanceLayout};
 use crate::vm::gc::references::{Reference, REFERENCE};
 use crate::vm::heap::charge;
 use crate::vm::heap::construction::{copy_fields, ArrayLayout};
@@ -60,6 +62,7 @@ pub(crate) struct Array {
 }
 
 impl Array {
+    #[cfg(test)]
     pub(crate) fn references(&self) -> Result<References> {
         let mut references = References::default();
         self.visit_references(|reference| {
@@ -248,14 +251,6 @@ impl Array {
         Ok(())
     }
 
-    pub fn set_entire_value(&mut self, value: Array) -> Result<()> {
-        if self.type_name != value.type_name || self.data.len() != value.data.len() {
-            return Err(AllocError::InvalidLayout.into());
-        }
-        self.data.copy_from_slice(&value.data);
-        Ok(())
-    }
-
     pub fn get_entire_value(&self) -> Vec<Vec<i32>> {
         let size = Self::bytes_size(&self.type_name);
         let mut result = Vec::new();
@@ -355,6 +350,15 @@ impl JavaInstance {
             .reference_snapshot()
     }
 
+    pub(crate) fn check_reference_field(&self, name: &str) -> Result<()> {
+        self.get_instance()
+            .fields
+            .get(REFERENCE)
+            .and_then(|fields| fields.get(name))
+            .ok_or(AllocError::InvalidLayout)?
+            .check_reference_writable()
+    }
+
     pub(crate) fn set_reference_field(&self, name: &str, value: i32) -> Result<()> {
         self.get_instance()
             .fields
@@ -374,6 +378,7 @@ impl JavaInstance {
             .unwrap()
             .corrupt_width_for_test(value);
     }
+    #[cfg(test)]
     pub(crate) fn references(&self) -> Result<References> {
         let instance = self.get_instance();
         instance.layout.references(&instance.fields)

@@ -19,11 +19,8 @@ pub(crate) fn enabled() -> bool {
 }
 
 pub(crate) fn allocated() {
-    ALLOCATIONS
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
-            Some(count.saturating_add(1))
-        })
-        .ok();
+    // Reset at every collection; 2^64 allocations without one cannot happen, so no saturation.
+    ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
 }
 
 pub(crate) fn before_allocation() {

@@ -60,6 +60,19 @@ impl Heap {
         }
     }
 
+    /// Checks that [`Self::set_reference_link`] can write both links the collector updates when it
+    /// discovers `reference`, without writing either.
+    pub(crate) fn check_reference_links(&self, reference: i32) -> Result<()> {
+        let entry = self.data.get(reference).ok_or(AllocError::InvalidLayout)?;
+        match entry.value() {
+            HeapValue::Object(instance) => {
+                instance.check_reference_field("referent")?;
+                instance.check_reference_field("discovered")
+            }
+            HeapValue::Arr(_) => Err(AllocError::InvalidLayout.into()),
+        }
+    }
+
     pub(crate) fn set_reference_link(&self, reference: i32, name: &str, value: i32) -> Result<()> {
         let entry = self.data.get(reference).ok_or(AllocError::InvalidLayout)?;
         match entry.value() {

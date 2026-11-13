@@ -123,7 +123,7 @@ pub(crate) fn collect(cause: Cause) -> Option<Stats> {
     } else {
         cause
     };
-    let result = roots::snapshot(&operation)
+    let result = roots::snapshot_retrying(&operation)
         .and_then(|snapshot| collect_snapshot(&HEAP, &snapshot, &PENDING, cause, &operation));
     match result {
         Ok(stats) => {
@@ -165,24 +165,39 @@ pub(crate) fn collect_snapshot(
         }
     }
 
-    // All roots, strong edges, referents and accounting have now been validated.
-    // Nothing below allocates scratch or takes admission while a heap guard lives.
     trace.references.retain(|reference| {
         reference.active()
             && !trace.marked.contains(&reference.referent)
             && matches!(reference.kind, Kind::Soft | Kind::Weak | Kind::Phantom)
     });
+    // The trace read both links of every discovered reference; check that both can be written.
+    for reference in &trace.references {
+        heap.check_reference_links(reference.object)?;
+    }
+
+    // All roots, strong edges, referents, links and accounting have now been validated, and
+    // the collector fails closed from here on: nothing below can be skipped half-done.
+    // Nothing below allocates scratch or takes admission while a heap guard lives.
     // Weak JNI identities survive; only their target is cleared.
     handles::clear_weak_references(|reference| trace.marked.contains(&reference));
     for reference in &trace.references {
-        heap.set_reference_link(reference.object, "referent", 0)?;
-        heap.set_reference_link(reference.object, "discovered", *pending_head)?;
+        validated(
+            heap.set_reference_link(reference.object, "referent", 0),
+            "clearing a referent",
+        );
+        validated(
+            heap.set_reference_link(reference.object, "discovered", *pending_head),
+            "publishing a pending reference",
+        );
         *pending_head = reference.object;
     }
     let mut reclaimed = 0;
     for &(reference, _) in &entries {
         if !trace.marked.contains(&reference) {
-            reclaimed += heap.remove_recorded(reference)?;
+            reclaimed += validated(
+                heap.remove_recorded(reference).map_err(Into::into),
+                "sweeping",
+            );
         }
     }
     crate::vm::monitor::prune_idle(|reference| trace.marked.contains(&reference));
@@ -196,6 +211,23 @@ pub(crate) fn collect_snapshot(
         discovered: trace.references.len(),
         scratch_bytes: trace.scratch_bytes() + entries.capacity() * size_of::<(i32, u64)>(),
     })
+}
+
+/// Unwraps a mutation whose preconditions the collector has already validated.
+///
+/// Failing here means the heap changed under a stopped world, a VM bug. Resuming the mutators over
+/// a partially processed heap (some referents cleared, some objects freed) could only spread the
+/// corruption, so the VM stops instead of reporting a skipped cycle.
+fn validated<T>(result: Result<T>, step: &str) -> T {
+    match result {
+        Ok(value) => value,
+        Err(error) => {
+            eprintln!(
+                "rusty-jvm: fatal: garbage collection invariant violated while {step}: {error}"
+            );
+            std::process::abort();
+        }
+    }
 }
 
 #[cfg(test)]

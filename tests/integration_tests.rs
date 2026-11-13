@@ -5,7 +5,7 @@ use std::env;
 use std::fs::File;
 use std::io::Write;
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Stdio};
 use utils::assert_success;
 
 #[ctor::ctor(unsafe)]
@@ -183,7 +183,7 @@ fn should_convert_long_to_double_and_back() {
 
 #[test]
 fn should_convert_to_string_and_back_slowtest() {
-    assert_success(
+    utils::assert_success_utf8(
         "samples.javacore.strings.trivial.ToStringAndBack",
         r#"true
 127
@@ -580,7 +580,7 @@ fn should_support_strings_concat_inline() {
 
 #[test]
 fn should_support_advanced_strings_concat() {
-    assert_success(
+    utils::assert_success_utf8(
         "samples.javacore.strings.concat.advanced.StringConcatTest",
         r#"Compile-time constant folding: Hello, World!
 Concatenation with primitives: Value: 42, Pi: 3.14, Flag: true, Letter: ☺
@@ -922,7 +922,7 @@ fn should_support_trivial_unsafe_things() {
     let char_bytes = get_ne_bytes_as_string(&('ї' as u16).to_ne_bytes());
     let int_bytes = get_ne_bytes_as_string(&1611079230i32.to_ne_bytes());
     let long_bytes = get_ne_bytes_as_string(&6919532605457772126i64.to_ne_bytes());
-    assert_success(
+    utils::assert_success_utf8(
         "samples.jdkinternal.unsafe.trivial.UnsafeUsage",
         &format!(
             r#"isBigEndian: {big_endian}
@@ -1617,6 +1617,137 @@ WARNING: Restricted methods will be blocked in a future release unless native ac
         utils::ExecutionResult::Success,
         0,
         HashMap::default(),
+    );
+}
+
+/// JNI_OnLoad with GetEnv and RegisterNatives, native threads attaching (as daemons, with and
+/// without a name), calling into Java and detaching, and the invocation interface's error codes.
+#[test]
+fn should_support_jni_on_load_and_native_thread_attachment() {
+    let lib_dir_path = format!("-Djava.library.path={}", env!("JNI_TEST_LIB_PATH"));
+    utils::assert_with_all_args(
+        &[&lib_dir_path],
+        "samples.jni.invocation.JniInvocationDemo",
+        &[],
+        // the same as the reference JVM prints
+        "JNI_OnLoad: GetEnv=0 env=true RegisterNatives=0\n\
+        registered: 42\n\
+        Java thread: GetEnv=0 same=true unsupported=-3 cleared=true attach=0 same=true detach=-1\n\
+        native thread: GetEnv=-2 cleared=true attach=0 again=0 same=true GetEnv=0 same=true threw=false detach=0 GetEnv=-2 cleared=true detach=0\n\
+        hello from a native thread on native-worker daemon=false group=main alive=true virtual=false\n\
+        native thread: GetEnv=-2 cleared=true attach=0 again=0 same=true GetEnv=0 same=true threw=false detach=0 GetEnv=-2 cleared=true detach=0\n\
+        hello from a native thread on Thread-0 daemon=true group=main alive=true virtual=false\n",
+        r#"WARNING: A restricted method in java.lang.System has been called
+WARNING: java.lang.System::loadLibrary has been called by samples.jni.invocation.JniInvocationDemo in an unnamed module
+WARNING: Use --enable-native-access=ALL-UNNAMED to avoid a warning for callers in this module
+WARNING: Restricted methods will be blocked in a future release unless native access is enabled
+
+"#,
+        utils::ExecutionResult::Success,
+        0,
+        HashMap::default(),
+    );
+}
+
+#[test]
+fn should_call_jni_variadic_methods_with_every_return_type() {
+    let lib_dir_path = format!("-Djava.library.path={}", env!("JNI_TEST_LIB_PATH"));
+    utils::assert_with_all_args(
+        &[&lib_dir_path],
+        "samples.jni.variadic.JniVariadicDemo",
+        &[],
+        "variadic-ok\n",
+        r#"WARNING: A restricted method in java.lang.System has been called
+WARNING: java.lang.System::loadLibrary has been called by samples.jni.variadic.JniVariadicDemo in an unnamed module
+WARNING: Use --enable-native-access=ALL-UNNAMED to avoid a warning for callers in this module
+WARNING: Restricted methods will be blocked in a future release unless native access is enabled
+
+"#,
+        utils::ExecutionResult::Success,
+        0,
+        HashMap::default(),
+    );
+}
+
+#[test]
+fn should_convert_jni_reflected_fields_to_ids_and_back() {
+    let lib_dir_path = format!("-Djava.library.path={}", env!("JNI_TEST_LIB_PATH"));
+    utils::assert_with_all_args(
+        &[&lib_dir_path],
+        "samples.jni.reflectedfields.JniReflectedFieldsDemo",
+        &[],
+        "reflected-fields-ok\n",
+        r#"WARNING: A restricted method in java.lang.System has been called
+WARNING: java.lang.System::loadLibrary has been called by samples.jni.reflectedfields.JniReflectedFieldsDemo in an unnamed module
+WARNING: Use --enable-native-access=ALL-UNNAMED to avoid a warning for callers in this module
+WARNING: Restricted methods will be blocked in a future release unless native access is enabled
+
+"#,
+        utils::ExecutionResult::Success,
+        0,
+        HashMap::default(),
+    );
+}
+
+#[test]
+fn should_reflect_field_generic_signatures_and_annotations() {
+    utils::assert_same_as_reference_jvm(
+        &[],
+        "samples.reflection.fields.FieldMetadataDemo",
+        utils::ExecutionResult::Success,
+    );
+}
+
+#[test]
+fn should_report_encoding_properties_like_hotspot_with_redirected_streams() {
+    utils::assert_same_as_reference_jvm_with_stdin(
+        &[],
+        "samples.properties.EncodingPropertiesDemo",
+        HashMap::default(),
+        Stdio::null,
+    );
+}
+
+#[test]
+fn should_report_encoding_properties_like_hotspot_with_piped_input() {
+    utils::assert_same_as_reference_jvm_with_stdin(
+        &[],
+        "samples.properties.EncodingPropertiesDemo",
+        HashMap::default(),
+        Stdio::piped,
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn should_report_encoding_properties_like_hotspot_in_the_c_locale() {
+    utils::assert_same_as_reference_jvm_with_stdin(
+        &[],
+        "samples.properties.EncodingPropertiesDemo",
+        HashMap::from([("LC_ALL".to_string(), "C".to_string())]),
+        Stdio::null,
+    );
+}
+
+/// Bootstrap must not depend on a charset initialization incidentally initializing
+/// `java.lang.ref.Reference` before `System.initPhase1` starts the reference handler.
+#[test]
+fn should_bootstrap_with_utf8_encodings() {
+    // HotSpot ignores -Dnative.encoding, so a UTF-8 locale selects it where the platform allows
+    let envs = if cfg!(unix) {
+        HashMap::from([("LC_ALL".to_string(), "C.UTF-8".to_string())])
+    } else {
+        HashMap::default()
+    };
+    utils::assert_same_as_reference_jvm_with_stdin(
+        &[
+            "-Dsun.jnu.encoding=UTF-8",
+            "-Dstdout.encoding=UTF-8",
+            "-Dstderr.encoding=UTF-8",
+        ],
+        "samples.properties.EncodingPropertiesDemo",
+        envs,
+        Stdio::null,
     );
 }
 
@@ -3377,6 +3508,14 @@ Options:
     -<option>         Java standard options
     -h, --help        Show this help message
     -V, --version     Show version information
+
+Memory and garbage collection:
+    -Xmx<size>                    Set the maximum managed heap size, in bytes or with a
+                                  k, m or g suffix (default: a quarter of physical memory)
+    -Xlog:gc                      Log each garbage collection to stderr
+    -XX:GCAllocThreshold=<count>  Collect after this many allocations (default: 65536,
+                                  adapted to the number of live objects)
+    -XX:+GCStressAtSafepoints     Collect at every safepoint, for testing the VM (slow)
 "#;
     utils::assert_with_all_args(
         &["--help"],
@@ -3780,7 +3919,7 @@ Level 9, Compressed size: 76, Compression ratio: 0.21714285714285714%, Decompres
 
 #[test]
 fn should_invoke_constructor_via_reflection() {
-    assert_success(
+    utils::assert_success_utf8(
         "samples.reflection.directconstructorhandleaccessor.DirectConstructorHandleAccessorExample",
         r#"Target{byteField=-128, booleanField=true, shortField=-32768, charField=ї, intField=2000000000, floatField=3.14, longField=-9223372036854775808, doubleField=3.141592653589793, stringField='seven', objectField=[1, 2, 3], mapField={8=eight}}
 Target{byteField=127, booleanField=true, shortField=32767, charField=є, intField=2147483647, floatField=1.337, longField=9223372036854775807, doubleField=3.141592653589793, stringField='seventy', objectField=[10, 20, 30], mapField={80=eighty}}
@@ -3816,7 +3955,7 @@ instanceLong -> 8589934607
 
 #[test]
 fn should_invoke_method_via_reflection() {
-    assert_success(
+    utils::assert_success_utf8(
         "samples.reflection.directmethodhandleaccessor.DirectMethodHandleAccessorExample",
         "TargetInstance - secretMethod invoked with: byte=-128, boolean=true, short=-32768, char=ї, int=2000000000, float=3.14, long=-9223372036854775808, double=3.141592653589793, string=seven, object=[1, 2, 3], map={8=eight}\n",
     );
@@ -3967,7 +4106,7 @@ fn should_return_info_about_modules() {
 
 #[test]
 fn should_support_locales() {
-    assert_success(
+    utils::assert_success_utf8(
         "samples.locale.localemonthsexample.LocaleMonthsExample",
         "[січня, лютого, березня, квітня, травня, червня, липня, серпня, вересня, жовтня, листопада, грудня, ]\n",
     );
@@ -4013,7 +4152,12 @@ stringValue = Water boils at 100 °C
 "#;
     // printf formats the doubles in the default locale
     utils::assert_with_all_args(
-        &utils::US_LOCALE,
+        &[
+            utils::US_LOCALE[0],
+            utils::US_LOCALE[1],
+            utils::UTF8_STREAMS[0],
+            utils::UTF8_STREAMS[1],
+        ],
         "samples.io.randomaccessfilevsmmapexample.RandomAccessFileVsMMapExample",
         &[&file.path().display().to_string()],
         expected_out,
@@ -4026,7 +4170,7 @@ stringValue = Water boils at 100 °C
 
 #[test]
 fn should_support_arrays_to_string() {
-    assert_success(
+    utils::assert_success_utf8(
         "samples.arrays.tostringexample.ArrayToStringExample",
         r#"[-128, -1, 0, 1, 127]
 [true, false, true, true, false]
@@ -4047,7 +4191,12 @@ fn should_support_arrays_to_string() {
 fn should_support_locales_advanced_slowtest() {
     // display names are in the language of the default locale
     utils::assert_with_all_args(
-        &utils::US_LOCALE,
+        &[
+            utils::US_LOCALE[0],
+            utils::US_LOCALE[1],
+            utils::UTF8_STREAMS[0],
+            utils::UTF8_STREAMS[1],
+        ],
         "samples.locale.showlocale.ShowLocale",
         &[],
         r#"--- Locale: ja_JP ---
@@ -4194,7 +4343,7 @@ fn should_exit_with_given_code_impl(
 
 #[test]
 fn should_handle_non_valid_cesu8() {
-    assert_success(
+    utils::assert_success_utf8(
         "samples.javacore.strings.nonvalidcesu8.NonValidCESU8",
         "value: a??💔?b\n",
     );
@@ -4253,6 +4402,9 @@ fn should_load_native_library_and_call_native_method_slowtest() {
             // printf formats the doubles in the default locale
             utils::US_LOCALE[0],
             utils::US_LOCALE[1],
+            // it prints non-ASCII text
+            utils::UTF8_STREAMS[0],
+            utils::UTF8_STREAMS[1],
             // "--enable-native-access=ALL-UNNAMED", /* suppress warning */ todo implement and uncomment
         ],
         "samples.javacore.loadlibrary.example.LoadLibraryExample",

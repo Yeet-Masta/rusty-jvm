@@ -39,6 +39,9 @@ pub(crate) struct InstanceLayout {
 }
 
 /// The collector must process the distinguished referent separately from strong closure.
+///
+/// An owned edge set for tests; the collector visits edges in place instead.
+#[cfg(test)]
 #[derive(Debug, Default, PartialEq, Eq)]
 pub(crate) struct References {
     pub(crate) strong: Vec<i32>,
@@ -120,6 +123,7 @@ impl InstanceLayout {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(crate) fn references(&self, fields: &InstanceFields) -> Result<References> {
         let mut references = References::default();
         references.referent = self.visit_references(fields, |reference| {

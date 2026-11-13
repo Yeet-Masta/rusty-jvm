@@ -75,6 +75,25 @@ pub(crate) fn retire() {
     }
 }
 
+/// Retires the calling participant from the Safe state, for a native thread detaching from the
+/// VM: it has already published its final snapshot on its way back to native code.
+pub(crate) fn retire_from_native() {
+    if let Some(id) = current() {
+        COORDINATOR.retire(id);
+        PARTICIPANT.with(|participant| participant.set(None));
+    }
+}
+
+/// Hands the calling thread back to native code, which runs in the Safe state.
+///
+/// For a native thread that has just attached through the JNI invocation interface: from here
+/// on it is in managed code only inside JNI functions, which enter it with `ManagedAccess`.
+pub(crate) fn enter_native() {
+    if let Some(id) = current() {
+        COORDINATOR.park(id, JavaThread::snapshot_roots(), Reason::Native);
+    }
+}
+
 /// Run only host work here: copy managed inputs before entry and apply outputs
 /// after return. All guards acquired by the closure must die inside the closure.
 pub(crate) fn blocking<T>(work: impl FnOnce() -> T) -> T {

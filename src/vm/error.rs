@@ -99,7 +99,9 @@ impl Error {
     pub fn throwable_ref(&self) -> Option<i32> {
         match &self.0 {
             UncaughtException(throwable) => Some(throwable.reference()),
-            Allocation(_) => crate::vm::jni::handles::emergency_oom_ref(),
+            Allocation(error) if error.is_out_of_memory() => {
+                crate::vm::jni::handles::emergency_oom_ref()
+            }
             _ => None,
         }
     }

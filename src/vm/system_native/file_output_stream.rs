@@ -1,8 +1,11 @@
 use crate::vm::error::Result;
 use crate::vm::exception::pending_helpers::{
-    set_pending_file_not_found_exception, set_pending_io_exception,
+    set_pending_file_not_found_exception, set_pending_index_out_of_bounds_exception,
+    set_pending_io_exception, set_pending_null_pointer_exception,
 };
 use crate::vm::heap::heap::HEAP;
+use crate::vm::safepoint;
+use crate::vm::system_native::file_input_stream::region_in_bounds;
 use crate::vm::system_native::platform_file::Mode::FileOutputStream;
 use crate::vm::system_native::platform_file::{get_by_raw_id, PlatformFile};
 use crate::vm::system_native::string::get_utf8_string_by_ref;
@@ -43,7 +46,8 @@ pub(crate) fn write(obj_ref: i32, byte: i32, _append: bool) -> Result<()> {
         return Ok(());
     };
 
-    if let Err(e) = file.write_all(&[byte as u8]) {
+    // A write to a full pipe or a stopped terminal can block indefinitely
+    if let Err(e) = safepoint::blocking(|| file.write_all(&[byte as u8])) {
         set_pending_io_exception(&e.to_string())?;
     }
 
@@ -58,17 +62,27 @@ pub(crate) fn write_bytes(
     len: i32,
     _append: bool,
 ) -> Result<()> {
+    // Same checks and order as HotSpot's writeBytes in io_util.c
+    if bytes_ref == 0 {
+        set_pending_null_pointer_exception()?;
+        return Ok(());
+    }
+    if !region_in_bounds(bytes_ref, off, len)? {
+        set_pending_index_out_of_bounds_exception()?;
+        return Ok(());
+    }
+    if len == 0 {
+        return Ok(());
+    }
     let Some(mut file) = get_by_raw_id(obj_ref, FileOutputStream)? else {
         return Ok(());
     };
-    let array = HEAP.get_entire_array(bytes_ref)?;
-    let raw = array.get_entire_value();
-    let mut vec = Vec::with_capacity(raw.len());
-    for i in off..off + len {
-        vec.push(raw[i as usize][0] as i8 as u8);
-    }
+    let off = off as usize;
+    let bytes = HEAP.get_entire_raw_data(bytes_ref)?[off..off + len as usize].to_vec();
 
-    if let Err(e) = file.write_all(&vec) {
+    // A write to a full pipe or a stopped terminal can block indefinitely, so it runs in the
+    // Safe state, from the host copy made above
+    if let Err(e) = safepoint::blocking(|| file.write_all(&bytes)) {
         set_pending_io_exception(&e.to_string())?;
     };
 

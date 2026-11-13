@@ -249,6 +249,21 @@ fn run_thread(this: i32) {
         Err(e) => error!("thread terminated with internal error: {e}"),
     }
 
+    terminate(this);
+    safepoint::retire();
+}
+
+/// Marks `this`, the calling thread's `java.lang.Thread`, alive: the state a started thread has
+/// before running `Thread.run()`, which a native thread attaching to the VM also needs.
+pub(crate) fn mark_alive(this: i32) -> Result<()> {
+    set_eetop(this, threads::next_eetop())?;
+    threads::set_thread_status(this, threads::thread_status::RUNNABLE);
+    Ok(())
+}
+
+/// Terminates `this`, the calling thread's `java.lang.Thread`: what happens when `Thread.run()`
+/// returns, or when a thread attached through the JNI invocation interface detaches.
+pub(crate) fn terminate(this: i32) {
     // Java-level cleanup while the thread is still nominally alive, then clear `eetop` so that
     // `isAlive()`/`join()` observe termination.
     if let Err(e) = Executor::invoke_non_static_method("java/lang/Thread", "exit:()V", this, &[]) {
@@ -262,7 +277,6 @@ fn run_thread(this: i32) {
     // and isAlive() is now false (eetop cleared above), so a notify lets them observe termination.
     crate::vm::monitor::wake_all_on_exit(this);
     threads::unregister_parker(this);
-    safepoint::retire();
 }
 
 /// Resolves `run:()V` on the thread object's actual class (virtual dispatch, honoring subclass

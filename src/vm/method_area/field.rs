@@ -64,6 +64,18 @@ impl FieldValue {
         }
     }
 
+    /// Whether [`Self::set_reference`] would succeed now, without writing.
+    pub(crate) fn check_reference_writable(&self) -> Result<()> {
+        let value = self
+            .value
+            .try_write()
+            .map_err(|_| AllocError::InvalidLayout)?;
+        match value.as_slice() {
+            [_] => Ok(()),
+            _ => Err(AllocError::InvalidLayout.into()),
+        }
+    }
+
     /// Fixed-width collector write; the complete trace validates these slots first.
     pub(crate) fn set_reference(&self, reference: i32) -> Result<()> {
         let mut value = self

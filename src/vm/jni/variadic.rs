@@ -10,12 +10,27 @@ use jni_sys::{
 };
 use std::ffi::{c_char, c_void};
 
+/// Crosses from `variadic.c` as a `jint`; the values must match its `enum InvocationKind`.
 #[derive(Clone, Copy)]
+#[repr(i32)]
 enum InvocationKind {
-    Virtual,
-    Nonvirtual,
-    Static,
-    Constructor,
+    Virtual = 0,
+    Nonvirtual = 1,
+    Static = 2,
+    Constructor = 3,
+}
+
+impl InvocationKind {
+    fn from_jint(kind: jint) -> Option<Self> {
+        [
+            Self::Virtual,
+            Self::Nonvirtual,
+            Self::Static,
+            Self::Constructor,
+        ]
+        .into_iter()
+        .find(|candidate| *candidate as jint == kind)
+    }
 }
 
 extern "C" {
@@ -31,15 +46,11 @@ unsafe extern "C" fn rusty_jvm_invoke_variadic(
     arguments: *mut c_void,
     kind: jint,
 ) -> jvalue {
-    let kind = match kind {
-        0 => InvocationKind::Virtual,
-        1 => InvocationKind::Nonvirtual,
-        2 => InvocationKind::Static,
-        3 => InvocationKind::Constructor,
-        _ => {
-            set_pending_internal_error("Unknown JNI invocation kind");
-            return jvalue { j: 0 };
-        }
+    // A native-to-managed boundary: method lookup reads class metadata from the heap
+    let _managed = crate::vm::safepoint::ManagedAccess::enter();
+    let Some(kind) = InvocationKind::from_jint(kind) else {
+        set_pending_internal_error("Unknown JNI invocation kind");
+        return jvalue { j: 0 };
     };
     let (class_ref, index) = decode_method_id(method_id as usize);
     let method = match klass(class_ref).and_then(|class| class.get_method_by_index(index)) {

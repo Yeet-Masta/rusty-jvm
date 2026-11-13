@@ -301,9 +301,9 @@ impl Coordinator {
         result
     }
 
-    /// Stop machinery only; task 7 supplies the scanner. No timeout or diagnostic
+    /// An ordinary (non-pressure) [`Self::request_collection_for`]. No timeout or diagnostic
     /// frame limit can satisfy this all-participant predicate.
-    #[allow(dead_code)] // Runtime caller arrives with the collector; exercised by real thread tests.
+    #[cfg(test)]
     pub(crate) fn request_collection(
         self: &Arc<Self>,
         owner: u64,
@@ -414,7 +414,8 @@ impl Operation {
         )
     }
 
-    #[allow(dead_code)] // Activated by task 7 after a successful scan.
+    /// Reports a successful collection epoch; dropping an Operation without this releases the
+    /// participants without one.
     pub(crate) fn complete(mut self) {
         self.completed = true;
     }

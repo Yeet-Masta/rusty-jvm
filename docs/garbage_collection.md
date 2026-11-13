@@ -92,7 +92,7 @@ the permanently rooted emergency `OutOfMemoryError` fails VM startup.
   accepted, case-insensitively; arithmetic overflow and zero are rejected.
 - `-XX:GCAllocThreshold=<count>` sets a positive fixed allocation-count trigger. The default is
   65,536 allocations and adapts to the live-object count after collection.
-- `-XX:+GcStressAtSafepoints` requests collection at interpreter safepoints and rooted native
+- `-XX:+GCStressAtSafepoints` requests collection at interpreter safepoints and rooted native
   boundaries.
 - `-Xlog:gc` enables collection and skipped-cycle messages on stderr, each marked with `[gc]`.
   Without that option, GC output is suppressed and stderr remains empty in the default logging

@@ -19,8 +19,6 @@ pub(crate) enum Slot {
     /// Non-reference bits: an `int`, a `float`'s bit pattern, or half of a `long`/`double`.
     Value(i32),
     /// A heap reference (`0` for `null`), and so a root for a collector.
-    // Constructed by the reference-typed opcodes converted in a later step.
-    #[allow(dead_code)]
     Ref(i32),
 }
 

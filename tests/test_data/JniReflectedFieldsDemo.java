@@ -1,4 +1,4 @@
-package samples.jni;
+package samples.jni.reflectedfields;
 
 import java.lang.reflect.Field;
 import java.lang.reflect.Modifier;

@@ -24,9 +24,12 @@ impl PendingList {
         Ok(*self.for_collection()?)
     }
 
+    /// A Safe thread can hold the head for a moment while resuming (see `Blocking::resume_with`),
+    /// so the collector waits for it briefly instead of skipping the cycle. Only a holder that can
+    /// never release it (the collecting thread itself) makes the cycle fail.
     pub(crate) fn for_collection(&self) -> Result<MutexGuard<'_, i32>> {
         self.head
-            .try_lock()
+            .try_lock_for(super::roots::CONTENDED_LOCK_WAIT)
             .ok_or_else(|| Error::new_execution("Reference pending list locked during collection"))
     }
 

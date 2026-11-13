@@ -94,7 +94,7 @@ Runtime reports fixed logical `totalMemory = maxMemory = max` and
 reservations are not used bytes. Java's signed `long` reporting saturates at
 `Long.MAX_VALUE` for configured unsigned limits above that representable range.
 The default allocation threshold adapts to the live object count; an explicit
-`-XX:GCAllocThreshold=N` remains fixed. `-XX:+GcStressAtSafepoints` collects at
+`-XX:GCAllocThreshold=N` remains fixed. `-XX:+GCStressAtSafepoints` collects at
 engine polls and rooted native call boundaries. Collector logging uses the `gc`
 target and literal `[gc]` text; without opt-in logging, collection is quiet.
 

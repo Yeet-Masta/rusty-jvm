@@ -1,6 +1,7 @@
 use crate::vm::error::Result;
 use crate::vm::exception::pending_helpers::set_pending_io_exception;
 use crate::vm::helper::get_handle;
+use crate::vm::safepoint;
 use crate::vm::system_native::platform_file::PlatformFile;
 use nix::sys::stat::fstat;
 use nix::sys::uio::pread;
@@ -19,7 +20,8 @@ pub(crate) fn write0(fd_ref: i32, address: i64, len: i32) -> Result<i32> {
 
     let fd = get_handle(fd_ref)?;
     let fd = unsafe { BorrowedFd::borrow_raw(fd) };
-    let result = match write(fd, buf) {
+    // Can block on a pipe, socket or terminal; only native memory is touched while Safe
+    let result = match safepoint::blocking(|| write(fd, buf)) {
         Ok(written) => written as i32,
         Err(errno) => match errno {
             nix::errno::Errno::EAGAIN => IOS_UNAVAILABLE,
@@ -41,7 +43,8 @@ pub(crate) fn read0(fd_ref: i32, address: i64, len: i32) -> Result<i32> {
 
     let fd = (get_handle(fd_ref))?;
     let fd = unsafe { BorrowedFd::borrow_raw(fd) };
-    let result = match read(fd, buf) {
+    // Can block on a pipe, socket or terminal; only native memory is touched while Safe
+    let result = match safepoint::blocking(|| read(fd, buf)) {
         Ok(read) => {
             if read == 0 {
                 IOS_EOF // EOF is -1 in javaland
@@ -69,7 +72,7 @@ pub(crate) fn pread0(fd_ref: i32, address: i64, len: i32, position: i64) -> Resu
 
     let fd = (get_handle(fd_ref))?;
     let fd = unsafe { BorrowedFd::borrow_raw(fd) };
-    let result = match pread(fd, buf, position) {
+    let result = match safepoint::blocking(|| pread(fd, buf, position)) {
         Ok(read) => {
             if read == 0 {
                 IOS_EOF // EOF is -1 in javaland

@@ -1,22 +1,8 @@
 use jni::sys::{jboolean, jclass, jint, jobject, jstring, JNIEnv};
 use std::ptr::null_mut;
 
-extern "C" {
-    fn jni_completion_variadic(env: *mut JNIEnv, receiver: jobject, base: jclass) -> jint;
-}
-
 #[no_mangle]
-unsafe extern "system" fn Java_samples_jni_JniVariadicDemo_verify(
-    env: *mut JNIEnv,
-    _class: jclass,
-    receiver: jobject,
-    base: jclass,
-) -> jint {
-    jni_completion_variadic(env, receiver, base)
-}
-
-#[no_mangle]
-unsafe extern "system" fn Java_samples_jni_JniReflectedFieldsDemo_roundTrip(
+unsafe extern "system" fn Java_samples_jni_reflectedfields_JniReflectedFieldsDemo_roundTrip(
     env: *mut JNIEnv,
     _class: jclass,
     field: jobject,
@@ -31,7 +17,7 @@ unsafe extern "system" fn Java_samples_jni_JniReflectedFieldsDemo_roundTrip(
 }
 
 #[no_mangle]
-unsafe extern "system" fn Java_samples_jni_JniReflectedFieldsDemo_sameId(
+unsafe extern "system" fn Java_samples_jni_reflectedfields_JniReflectedFieldsDemo_sameId(
     env: *mut JNIEnv,
     _class: jclass,
     field: jobject,
@@ -54,7 +40,7 @@ unsafe extern "system" fn Java_samples_jni_JniReflectedFieldsDemo_sameId(
 }
 
 #[no_mangle]
-unsafe extern "system" fn Java_samples_jni_JniReflectedFieldsDemo_update(
+unsafe extern "system" fn Java_samples_jni_reflectedfields_JniReflectedFieldsDemo_update(
     env: *mut JNIEnv,
     _class: jclass,
     field: jobject,

@@ -3,6 +3,7 @@ use assert_cmd::{cargo_bin_cmd, Command};
 use once_cell::sync::Lazy;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::process::Stdio;
 use std::{env, fs, iter};
 use tempfile::TempDir;
 
@@ -24,6 +25,11 @@ pub(crate) static TEST_PATH: Lazy<PathBuf> = Lazy::new(|| {
 /// JVM arguments that make the default locale en_US, for programs that format numbers or show
 /// names of the default locale, which otherwise follow the host locale.
 pub const US_LOCALE: [&str; 2] = ["-Duser.language=en", "-Duser.country=US"];
+
+/// JVM arguments that make `System.out` and `System.err` encode in UTF-8, for programs that print
+/// characters the platform's default stream encoding (a Windows code page, say) may not have.
+/// Without them the VM, like HotSpot, uses the encoding of the terminal or the platform.
+pub const UTF8_STREAMS: [&str; 2] = ["-Dstdout.encoding=UTF-8", "-Dstderr.encoding=UTF-8"];
 
 pub fn is_bigendian() -> bool {
     cfg!(target_endian = "big")
@@ -79,6 +85,20 @@ pub fn get_os_name() -> &'static str {
 
 pub fn assert_success(entry: &str, expected_stdout: &str) {
     assert_success_with_args(entry, &vec![], expected_stdout)
+}
+
+/// [`assert_success`] for a program that prints non-ASCII text, see [`UTF8_STREAMS`].
+pub fn assert_success_utf8(entry: &str, expected_stdout: &str) {
+    assert_with_all_args(
+        &UTF8_STREAMS,
+        entry,
+        &[],
+        expected_stdout,
+        "",
+        ExecutionResult::Success,
+        0,
+        HashMap::default(),
+    )
 }
 
 pub fn assert_success_with_stderr(entry: &str, expected_stdout: &str, expected_stderr: &str) {
@@ -201,6 +221,18 @@ pub fn run_reference_jvm_with_all_args(
     program_args: &[&str],
     envs: &HashMap<String, String>,
 ) -> ReferenceOutput {
+    run_reference_jvm_with_stdin(jvm_args, entry, program_args, envs, Stdio::null())
+}
+
+/// [`run_reference_jvm_with_all_args`] with the given standard input, which (being a terminal, a
+/// pipe or a file) decides some defaults, like `stdin.encoding`.
+pub fn run_reference_jvm_with_stdin(
+    jvm_args: &[&str],
+    entry: &str,
+    program_args: &[&str],
+    envs: &HashMap<String, String>,
+    stdin: Stdio,
+) -> ReferenceOutput {
     let java_home = env::var("JAVA_HOME").expect("JAVA_HOME is not set");
     let mut java = PathBuf::from(java_home).join("bin").join("java");
     if cfg!(windows) {
@@ -208,13 +240,13 @@ pub fn run_reference_jvm_with_all_args(
     }
     let output = std::process::Command::new(&java)
         .current_dir(TEST_PATH.as_path())
-        .args(["-Dstdout.encoding=UTF-8", "-Dstderr.encoding=UTF-8"])
         // options the VM under test doesn't read, which would also make the launcher print
         // "Picked up ..." notices to stderr
         .env_remove("JAVA_TOOL_OPTIONS")
         .env_remove("_JAVA_OPTIONS")
         .env_remove("JDK_JAVA_OPTIONS")
         .envs(envs)
+        .stdin(stdin)
         .args(jvm_args)
         .arg(entry)
         .args(program_args)
@@ -367,15 +399,42 @@ pub fn assert_file_with_args(
 
 fn get_command(arguments: &[&str], envs: HashMap<String, String>) -> Command {
     let mut cmd = cargo_bin_cmd!("rusty-jvm");
-    cmd.current_dir(TEST_PATH.as_path()).envs(&envs);
-    if !matches!(
-        arguments.first(),
-        Some(&"-h" | &"--help" | &"-V" | &"--version")
-    ) {
-        cmd.args(["-Dstdout.encoding=UTF-8", "-Dstderr.encoding=UTF-8"]);
-    }
-    cmd.args(arguments);
+    cmd.current_dir(TEST_PATH.as_path())
+        .args(arguments)
+        .envs(&envs);
     cmd
+}
+
+/// Asserts that the VM runs `entry` exactly like the reference `java` of `JAVA_HOME` (same stdout,
+/// stderr and exit code) when both get `jvm_args`, the extra environment variables `envs`, and a
+/// standard input made by `stdin`.
+pub fn assert_same_as_reference_jvm_with_stdin(
+    jvm_args: &[&str],
+    entry: &str,
+    envs: HashMap<String, String>,
+    stdin: impl Fn() -> Stdio,
+) {
+    let reference = run_reference_jvm_with_stdin(jvm_args, entry, &[], &envs, stdin());
+    let args = jvm_args
+        .iter()
+        .copied()
+        .chain(iter::once(entry))
+        .collect::<Vec<_>>();
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_rusty-jvm"))
+        .current_dir(TEST_PATH.as_path())
+        .args(&args)
+        .envs(&envs)
+        .stdin(stdin())
+        .output()
+        .expect("Failed to run rusty-jvm");
+    let to_string = |bytes: Vec<u8>| {
+        String::from_utf8(bytes)
+            .expect("Failed to convert output to string")
+            .replace("\r\n", "\n")
+    };
+    assert_eq!(to_string(output.stdout), reference.stdout);
+    assert_eq!(to_string(output.stderr), reference.stderr);
+    assert_eq!(output.status.code(), Some(reference.exit_code));
 }
 
 pub fn get_command_with_vm_options(

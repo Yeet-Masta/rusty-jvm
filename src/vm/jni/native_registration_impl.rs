@@ -3,6 +3,7 @@
 
 use crate::vm::exception::pending_helpers::set_pending_null_pointer_exception;
 use crate::vm::helper::klass;
+use crate::vm::jni::handles;
 use crate::vm::jni::utils::{set_pending_internal_error, set_pending_no_such_method_error};
 use crate::vm::method_area::java_class::JavaClass;
 use crate::vm::method_area::java_method::JavaMethod;
@@ -37,12 +38,14 @@ pub(crate) unsafe extern "system" fn register_natives(
     methods: *const JNINativeMethod,
     method_count: jint,
 ) -> jint {
+    let _managed = crate::vm::safepoint::ManagedAccess::enter();
+    let clazz = handles::resolve_or_return!(clazz, JNI_ERR);
     // HotSpot crashes on these
-    if clazz.is_null() || (method_count > 0 && methods.is_null()) {
+    if clazz == 0 || (method_count > 0 && methods.is_null()) {
         let _ = set_pending_null_pointer_exception();
         return JNI_ERR;
     }
-    let class = match klass(clazz as i32) {
+    let class = match klass(clazz) {
         Ok(class) => class,
         Err(error) => {
             let _ = set_pending_internal_error(&error.to_string());
@@ -171,12 +174,14 @@ fn external_type(descriptor: &str) -> Option<(String, &str)> {
 /// `UnregisterNatives`. Like HotSpot, unbinds the native methods declared in the class, not those
 /// of its superclasses, which are then linked by their JNI symbol names again.
 pub(crate) unsafe extern "system" fn unregister_natives(_env: *mut JNIEnv, clazz: jclass) -> jint {
+    let _managed = crate::vm::safepoint::ManagedAccess::enter();
+    let clazz = handles::resolve_or_return!(clazz, JNI_ERR);
     // HotSpot crashes on this
-    if clazz.is_null() {
+    if clazz == 0 {
         let _ = set_pending_null_pointer_exception();
         return JNI_ERR;
     }
-    let class_name = match klass(clazz as i32) {
+    let class_name = match klass(clazz) {
         Ok(class) => class.this_class_name().to_owned(),
         Err(error) => {
             let _ = set_pending_internal_error(&error.to_string());

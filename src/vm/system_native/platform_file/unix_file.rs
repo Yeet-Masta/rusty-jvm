@@ -21,7 +21,8 @@ impl PlatformFile {
         }
         // Plain fsync like HotSpot: `File::sync_all` uses F_FULLFSYNC on macOS
         let fd = unsafe { BorrowedFd::borrow_raw(raw_fd) };
-        Ok(unistd::fsync(fd).is_ok())
+        // Waits for the storage device
+        Ok(crate::vm::safepoint::blocking(|| unistd::fsync(fd)).is_ok())
     }
 
     pub(crate) fn cleanup_close0(fd: i32, _handle: i64) -> Result<()> {

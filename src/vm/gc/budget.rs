@@ -28,6 +28,24 @@ impl fmt::Display for AllocError {
     }
 }
 
+impl AllocError {
+    /// Whether this is memory exhaustion that Java code may observe, and recover from, as an
+    /// `OutOfMemoryError`.
+    ///
+    /// `InvalidLayout` reports a VM invariant failure (a corrupted heap entry, a layout mismatch),
+    /// which must stay an internal error: a `catch (Throwable t)` in user code must never swallow
+    /// heap corruption as if it were memory pressure. `NegativeLength` is converted into a
+    /// `NegativeArraySizeException` before it reaches Java.
+    pub(crate) fn is_out_of_memory(self) -> bool {
+        match self {
+            Self::Capacity | Self::Arithmetic | Self::IdentityExhausted | Self::HostAllocation => {
+                true
+            }
+            Self::NegativeLength(_) | Self::InvalidLayout => false,
+        }
+    }
+}
+
 pub(crate) type AllocResult<T> = Result<T, AllocError>;
 
 #[derive(Debug)]

@@ -49,6 +49,11 @@ pub(crate) fn set_pending_array_index_out_of_bounds_exception(message: &str) -> 
     set_pending_exception_with_message("java/lang/ArrayIndexOutOfBoundsException", message)
 }
 
+/// Sets a pending `IndexOutOfBoundsException` (no message), as HotSpot's `io_util.c` does.
+pub(crate) fn set_pending_index_out_of_bounds_exception() -> Result<()> {
+    set_pending_exception("java/lang/IndexOutOfBoundsException", "<init>:()V", &[])
+}
+
 /// Sets a pending `ClassNotFoundException` with the given message.
 pub(crate) fn set_pending_class_not_found_exception(message: &str) -> Result<()> {
     set_pending_exception_with_message("java/lang/ClassNotFoundException", message)
@@ -56,11 +61,15 @@ pub(crate) fn set_pending_class_not_found_exception(message: &str) -> Result<()>
 
 /// Sets a pending `FileNotFoundException` with the given file path and message.
 pub(crate) fn set_pending_file_not_found_exception(path_ref: i32, message: &str) -> Result<()> {
+    if exception_already_pending("java/io/FileNotFoundException") {
+        return Ok(());
+    }
     let _path = JavaThread::hold_temp_roots(vec![Slot::Ref(path_ref)]);
-    let reason_ref = StringPoolHelper::get_string(message)?;
+    // Not interned: interned strings are permanent roots, and messages vary with input
+    let reason = StringPoolHelper::create_string(message)?;
     let args = vec![
         StackValueKind::Ref(path_ref),
-        StackValueKind::Ref(reason_ref),
+        StackValueKind::Ref(reason[0].value()),
     ];
     set_pending_exception(
         "java/io/FileNotFoundException",
@@ -112,12 +121,29 @@ pub(crate) fn set_pending_interrupted_exception() -> Result<()> {
 }
 
 fn set_pending_exception_with_message(class_name: &str, message: &str) -> Result<()> {
-    let message_ref = StringPoolHelper::get_string(message)?;
+    if exception_already_pending(class_name) {
+        return Ok(());
+    }
+    // Not interned: interned strings are permanent roots, and messages vary with input.
+    // `message` roots the string until the constructor has stored it.
+    let message = StringPoolHelper::create_string(message)?;
     set_pending_exception(
         class_name,
         "<init>:(Ljava/lang/String;)V",
-        &[StackValueKind::Ref(message_ref)],
+        &[StackValueKind::Ref(message[0].value())],
     )
+}
+
+/// First-wins: an exception that is already pending is preserved, and no Java code (not even a
+/// message string's constructor) runs while it is.
+fn exception_already_pending(class_name: &str) -> bool {
+    match JavaThread::get_pending_exception() {
+        Some(pending_ref) => {
+            warn!("Dropping {class_name}: an exception (ref={pending_ref}) is already pending");
+            true
+        }
+        None => false,
+    }
 }
 
 /// Constructs `class_name` via `constructor_signature`/`args` and records it as the

@@ -614,6 +614,7 @@ builtin_natives! {
 
     "jdk/internal/loader/NativeLibraries": static fn findBuiltinLib(name: string) -> string => sn::native_libraries::find_builtin_lib;
     "jdk/internal/loader/NativeLibraries": static fn load(imp: native_library_impl, name: string, builtin: boolean, throw: boolean) -> boolean => sn::native_libraries::load;
+    "jdk/internal/loader/NativeLibraries": static fn unload(name: string, builtin: boolean, handle: long) -> void => sn::native_libraries::unload;
     "jdk/internal/loader/NativeLibraries$NativeLibraryImpl": static fn findEntry0(handle: long, name: string) -> long => sn::native_libraries::find_entry0;
 
     "jdk/internal/misc/CDS": static fn initializeFromArchive(clazz: class) -> void => sn::cds::initialize_from_archive; // todo: implement me

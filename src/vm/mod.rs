@@ -237,6 +237,9 @@ fn init() -> Result<()> {
         StackValueKind::Ref(main_name_ref),
     ])?;
 
+    // Same order as HotSpot's threads.cpp. Initializing Finalizer runs Reference.<clinit>, which
+    // installs the JavaLangRefAccess that initPhase1 needs to start the reference-processing
+    // threads; nothing else guarantees it has run by then once the stream encodings are real.
     StaticInit::initialize("java/lang/reflect/Method")?;
     StaticInit::initialize("java/lang/ref/Finalizer")?;
     Executor::invoke_static_method("java/lang/System", "initPhase1:()V", &[])?;

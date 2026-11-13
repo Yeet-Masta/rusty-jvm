@@ -5,6 +5,7 @@ use crate::vm::error::{Error, Result};
 use crate::vm::exception::helpers::throw_null_pointer_exception;
 use crate::vm::exception::pending::Throws;
 use crate::vm::gc::budget::copy_string;
+#[cfg(test)]
 use crate::vm::gc::layout::References;
 use crate::vm::heap::allocation::Admission;
 use crate::vm::heap::charge;
@@ -69,7 +70,10 @@ impl Default for Heap {
 impl Heap {
     /// Read outgoing edges under one heap guard, then release it before the caller
     /// follows any edge. Only call while mutators are quiescent.
-    #[allow(dead_code)] // Traversal is connected by the task-7 collector.
+    ///
+    /// The collector itself uses [`Heap::trace_edges`], which visits edges without collecting
+    /// them; this owned form lets layout tests compare edge sets.
+    #[cfg(test)]
     pub(crate) fn references(&self, objectref: i32) -> Result<References> {
         let entry = self.data.get(objectref).ok_or_else(|| {
             Error::new_execution(&format!("Missing strong heap reference {objectref}"))
@@ -370,17 +374,6 @@ impl Heap {
             .ok_or_else(|| Error::new_execution(&format!("instance is not an array: {array_ref}")))
     }
 
-    pub(crate) fn set_entire_array(&self, array_ref: i32, array_val: Array) -> Result<()> {
-        let mut entry = self
-            .data
-            .get_mut(array_ref)
-            .ok_or_else(|| Error::new_execution("Missing array"))?;
-        match entry.value_mut() {
-            Arr(array) => array.set_entire_value(array_val),
-            Object(_) => Err(Error::new_execution("error getting array")),
-        }
-    }
-
     pub(crate) fn get_array_value(&self, arrayref: i32, index: i32) -> Result<Vec<i32>> {
         self.data
             .get(arrayref)
@@ -521,7 +514,8 @@ impl Heap {
             .get(objectref)
             .ok_or_else(|| Error::new_execution("Missing clone source"))?
             .planned_charge()?;
-        // Release the source shard before admission (task 7 may collect on failure).
+        // Release the source shard before admission, which collects when the budget is
+        // exhausted: a collection must never find a heap shard held.
         let reservation = self.reserve(charge)?;
         let cloned = self
             .data

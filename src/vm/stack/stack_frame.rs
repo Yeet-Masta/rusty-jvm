@@ -470,7 +470,6 @@ impl StackFrame {
     ///
     /// Only slots the interpreter tagged are reported, so an `int` that happens to equal a live
     /// reference is not mistaken for one.
-    #[allow(dead_code)] // consumed by the root scan added in a later step
     pub(crate) fn ref_slots(&self) -> impl Iterator<Item = i32> + '_ {
         self.locals
             .iter()

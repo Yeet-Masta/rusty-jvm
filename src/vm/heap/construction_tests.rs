@@ -37,25 +37,20 @@ fn gc_budget_dimensions_fail_before_any_host_payload_allocation() {
     );
 }
 
+/// Copy-back (JNI array release, stream reads) writes through the fixed-size raw view, which
+/// cannot resize charged storage.
 #[test]
-fn gc_budget_array_copyback_preserves_capacity_and_rejects_growth() {
+fn gc_budget_array_copyback_writes_in_place_without_charging() {
     let heap = Heap::default();
     let reference = heap.create_array("[I", 2, &mut RootedSlots::new()).unwrap();
     let used = heap.admission.lock().budget.used;
-    let mut replacement = Array::new_with_values("[I", &[7, 11]).unwrap();
-    replacement.raw_data_mut().reserve(4096);
-    heap.set_entire_array(reference, replacement).unwrap();
-    assert_eq!(heap.get_array_value(reference, 1).unwrap(), vec![11]);
-    assert_eq!(heap.admission.lock().budget.used, used);
-    assert!(heap
-        .set_entire_array(reference, Array::new("[I", 3).unwrap())
-        .is_err());
-    assert_eq!(heap.get_array_len(reference).unwrap(), 2);
     let mut view = heap.get_entire_raw_data_mut(reference).unwrap();
     let bytes: &mut [u8] = &mut view;
     bytes[..4].copy_from_slice(&13i32.to_ne_bytes());
     drop(view);
     assert_eq!(heap.get_array_value(reference, 0).unwrap(), vec![13]);
+    assert_eq!(heap.get_array_len(reference).unwrap(), 2);
+    assert_eq!(heap.admission.lock().budget.used, used);
 }
 
 #[test]

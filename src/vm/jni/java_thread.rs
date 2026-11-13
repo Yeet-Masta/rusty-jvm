@@ -230,6 +230,18 @@ impl JavaThread {
         });
     }
 
+    /// Unbinds the calling OS thread from its `java.lang.Thread`, when a thread attached through
+    /// the JNI invocation interface detaches.
+    pub(crate) fn clear_current_thread() {
+        JAVA_THREAD.with(|t| t.current_thread.set(None));
+    }
+
+    /// Whether the calling thread is running Java code further up its stack, i.e. it is inside a
+    /// native method rather than a native thread that merely attached to the VM.
+    pub(crate) fn has_java_frames() -> bool {
+        JAVA_THREAD.with(|t| !t.stack_frames.borrow().is_empty())
+    }
+
     /// Returns the calling thread's `ScopedValue` cache, or `0` (null) if it has none.
     pub(crate) fn scoped_value_cache() -> i32 {
         JAVA_THREAD.with(|t| t.scoped_value_cache.get())

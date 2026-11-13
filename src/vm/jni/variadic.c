@@ -1,14 +1,59 @@
-#include <jni.h>
+/*
+ * The C side of the variadic JNI calls (Call<Type>Method, Call<Type>MethodV, NewObject, ...).
+ *
+ * Rust cannot portably define C-variadic functions or read a va_list on the supported toolchains,
+ * so this shim does both and hands each argument to Rust, which resolves the method descriptor
+ * and delegates to the corresponding Call<Type>MethodA entry point.
+ */
 #include <stdarg.h>
+#include <stdint.h>
 
-enum InvocationKind { VIRTUAL, NONVIRTUAL, STATIC, CONSTRUCTOR };
+/*
+ * The few JNI types the shim needs, with the sizes and representations jni.h and jni_md.h give
+ * them on every supported (64-bit) platform. Declaring them here keeps the VM build independent of
+ * the JDK headers, so it needs neither JAVA_HOME nor a full JDK.
+ */
+typedef uint8_t jboolean;
+typedef int8_t jbyte;
+typedef uint16_t jchar;
+typedef int16_t jshort;
+typedef int32_t jint;
+typedef int64_t jlong;
+typedef float jfloat;
+typedef double jdouble;
+typedef struct _jobject *jobject;
+typedef jobject jclass;
+typedef struct _jmethodID *jmethodID;
+typedef union jvalue {
+    jboolean z;
+    jbyte b;
+    jchar c;
+    jshort s;
+    jint i;
+    jlong j;
+    jfloat f;
+    jdouble d;
+    jobject l;
+} jvalue;
+/* Only ever passed through to Rust, which knows its layout */
+typedef const struct JNINativeInterface_ *JNIEnv;
+
+#if defined(_WIN32)
+#define JNICALL __stdcall
+#else
+#define JNICALL
+#endif
+
+/* Crosses to Rust as a jint; must match `InvocationKind` in variadic.rs */
+enum InvocationKind { VIRTUAL = 0, NONVIRTUAL = 1, STATIC = 2, CONSTRUCTOR = 3 };
 
 extern jvalue rusty_jvm_invoke_variadic(JNIEnv *, jobject, jclass, jmethodID, void *, jint);
 
 void rusty_jvm_next_argument(void *arguments, char tag, jvalue *output) {
     va_list *list = (va_list *)arguments;
     switch (tag) {
-        case 'Z': output->z = va_arg(*list, int) != 0; break;
+        /* Like HotSpot (jni.cpp), truncate to jboolean before normalizing: 256 is false */
+        case 'Z': output->z = (jboolean)va_arg(*list, int) != 0; break;
         case 'B': output->b = (jbyte)va_arg(*list, int); break;
         case 'C': output->c = (jchar)va_arg(*list, int); break;
         case 'S': output->s = (jshort)va_arg(*list, int); break;
@@ -29,7 +74,7 @@ Type JNICALL rusty_jvm_##Name##V Parameters { \
     return result.Member; \
 }
 
-#define VIRTUAL(Name, Type, Member) \
+#define DEFINE_VIRTUAL(Name, Type, Member) \
 DEFINE_CALL(Call##Name##Method, Type, Member, \
     (JNIEnv *env, jobject receiver, jmethodID method, va_list arguments), receiver, NULL, VIRTUAL); \
 Type rusty_jvm_Call##Name##Method(JNIEnv *env, jobject receiver, jmethodID method, ...) { \
@@ -40,7 +85,7 @@ Type rusty_jvm_Call##Name##Method(JNIEnv *env, jobject receiver, jmethodID metho
     return result; \
 }
 
-#define NONVIRTUAL(Name, Type, Member) \
+#define DEFINE_NONVIRTUAL(Name, Type, Member) \
 DEFINE_CALL(CallNonvirtual##Name##Method, Type, Member, \
     (JNIEnv *env, jobject receiver, jclass target, jmethodID method, va_list arguments), receiver, target, NONVIRTUAL); \
 Type rusty_jvm_CallNonvirtual##Name##Method(JNIEnv *env, jobject receiver, jclass target, jmethodID method, ...) { \
@@ -51,7 +96,7 @@ Type rusty_jvm_CallNonvirtual##Name##Method(JNIEnv *env, jobject receiver, jclas
     return result; \
 }
 
-#define STATIC(Name, Type, Member) \
+#define DEFINE_STATIC(Name, Type, Member) \
 DEFINE_CALL(CallStatic##Name##Method, Type, Member, \
     (JNIEnv *env, jclass target, jmethodID method, va_list arguments), NULL, target, STATIC); \
 Type rusty_jvm_CallStatic##Name##Method(JNIEnv *env, jclass target, jmethodID method, ...) { \
@@ -62,41 +107,41 @@ Type rusty_jvm_CallStatic##Name##Method(JNIEnv *env, jclass target, jmethodID me
     return result; \
 }
 
-VIRTUAL(Object, jobject, l)
-NONVIRTUAL(Object, jobject, l)
-STATIC(Object, jobject, l)
+DEFINE_VIRTUAL(Object, jobject, l)
+DEFINE_NONVIRTUAL(Object, jobject, l)
+DEFINE_STATIC(Object, jobject, l)
 
-VIRTUAL(Boolean, jboolean, z)
-NONVIRTUAL(Boolean, jboolean, z)
-STATIC(Boolean, jboolean, z)
+DEFINE_VIRTUAL(Boolean, jboolean, z)
+DEFINE_NONVIRTUAL(Boolean, jboolean, z)
+DEFINE_STATIC(Boolean, jboolean, z)
 
-VIRTUAL(Byte, jbyte, b)
-NONVIRTUAL(Byte, jbyte, b)
-STATIC(Byte, jbyte, b)
+DEFINE_VIRTUAL(Byte, jbyte, b)
+DEFINE_NONVIRTUAL(Byte, jbyte, b)
+DEFINE_STATIC(Byte, jbyte, b)
 
-VIRTUAL(Char, jchar, c)
-NONVIRTUAL(Char, jchar, c)
-STATIC(Char, jchar, c)
+DEFINE_VIRTUAL(Char, jchar, c)
+DEFINE_NONVIRTUAL(Char, jchar, c)
+DEFINE_STATIC(Char, jchar, c)
 
-VIRTUAL(Short, jshort, s)
-NONVIRTUAL(Short, jshort, s)
-STATIC(Short, jshort, s)
+DEFINE_VIRTUAL(Short, jshort, s)
+DEFINE_NONVIRTUAL(Short, jshort, s)
+DEFINE_STATIC(Short, jshort, s)
 
-VIRTUAL(Int, jint, i)
-NONVIRTUAL(Int, jint, i)
-STATIC(Int, jint, i)
+DEFINE_VIRTUAL(Int, jint, i)
+DEFINE_NONVIRTUAL(Int, jint, i)
+DEFINE_STATIC(Int, jint, i)
 
-VIRTUAL(Long, jlong, j)
-NONVIRTUAL(Long, jlong, j)
-STATIC(Long, jlong, j)
+DEFINE_VIRTUAL(Long, jlong, j)
+DEFINE_NONVIRTUAL(Long, jlong, j)
+DEFINE_STATIC(Long, jlong, j)
 
-VIRTUAL(Float, jfloat, f)
-NONVIRTUAL(Float, jfloat, f)
-STATIC(Float, jfloat, f)
+DEFINE_VIRTUAL(Float, jfloat, f)
+DEFINE_NONVIRTUAL(Float, jfloat, f)
+DEFINE_STATIC(Float, jfloat, f)
 
-VIRTUAL(Double, jdouble, d)
-NONVIRTUAL(Double, jdouble, d)
-STATIC(Double, jdouble, d)
+DEFINE_VIRTUAL(Double, jdouble, d)
+DEFINE_NONVIRTUAL(Double, jdouble, d)
+DEFINE_STATIC(Double, jdouble, d)
 
 void JNICALL rusty_jvm_CallVoidMethodV(JNIEnv *env, jobject receiver, jmethodID method, va_list arguments) {
     va_list copy;

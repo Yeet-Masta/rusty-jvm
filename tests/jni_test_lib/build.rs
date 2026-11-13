@@ -8,10 +8,10 @@ fn main() {
         _ => "linux",
     };
     cc::Build::new()
-        .file("src/completion_demo.c")
+        .file("src/variadic_demo.c")
         .include(java_home.join("include"))
         .include(java_home.join("include").join(platform))
-        .compile("jni_completion_tests");
-    println!("cargo:rerun-if-changed=src/completion_demo.c");
+        .compile("jni_variadic_demo");
+    println!("cargo:rerun-if-changed=src/variadic_demo.c");
     println!("cargo:rerun-if-env-changed=JAVA_HOME");
 }

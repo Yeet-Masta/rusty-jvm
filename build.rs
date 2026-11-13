@@ -6,18 +6,10 @@ use std::process::{Command, Stdio};
 use std::{env, fs};
 
 fn main() -> anyhow::Result<()> {
-    println!("cargo:rerun-if-env-changed=JAVA_HOME");
-    let java_home = PathBuf::from(env::var("JAVA_HOME")?);
-    let target_os = env::var("CARGO_CFG_TARGET_OS")?;
-    let jni_platform = match target_os.as_str() {
-        "windows" => "win32",
-        "macos" => "darwin",
-        _ => "linux",
-    };
+    // The variadic JNI shim declares the JNI types it needs itself, so building the VM needs a C
+    // compiler but no JDK headers or JAVA_HOME
     cc::Build::new()
         .file("src/vm/jni/variadic.c")
-        .include(java_home.join("include"))
-        .include(java_home.join("include").join(jni_platform))
         .compile("jni_variadic");
     println!("cargo:rerun-if-changed=src/vm/jni/variadic.c");
     let manifest_dir = env::var("CARGO_MANIFEST_DIR")?;
@@ -42,9 +34,8 @@ fn main() -> anyhow::Result<()> {
     }
 
     println!("cargo:rerun-if-changed=tests/test_data");
-    println!("cargo:rerun-if-changed=tests/test_data/GcRootsDemo.java");
-    println!("cargo:rerun-if-changed=tests/test_data/GcThreadsDemo.java");
     // the test classes are compiled by, and must match, the JDK under `JAVA_HOME`
+    println!("cargo:rerun-if-env-changed=JAVA_HOME");
     let dest_dir = PathBuf::from(env::var("CARGO_TARGET_DIR").unwrap_or(String::from("target")))
         .join("java_classes_for_tests");
     create_dir_all(&dest_dir)?;
@@ -63,7 +54,10 @@ fn copy_generated_files(dest_dir: &Path) -> anyhow::Result<()> {
 }
 
 fn compile(dest_dir: &Path) -> anyhow::Result<()> {
-    let java_home = env::var("JAVA_HOME").map_err(|_| anyhow::anyhow!("JAVA_HOME is not set"))?;
+    let java_home = env::var("JAVA_HOME")
+        .ok()
+        .filter(|java_home| !java_home.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("JAVA_HOME is not set"))?;
     let mut javac = PathBuf::from(&java_home).join("bin").join("javac");
     if cfg!(windows) {
         javac.set_extension("exe");

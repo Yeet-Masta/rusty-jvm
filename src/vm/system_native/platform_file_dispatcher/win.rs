@@ -1,7 +1,9 @@
 use crate::vm::error::Result;
 use crate::vm::exception::pending_helpers::set_pending_io_exception;
 use crate::vm::helper::get_handle;
-use crate::vm::system_native::platform_native_dispatcher::windows_helpers::get_last_error;
+use crate::vm::system_native::platform_native_dispatcher::windows_helpers::{
+    blocking_win32, get_last_error,
+};
 use std::mem::zeroed;
 use std::ptr::null_mut;
 use winapi::shared::minwindef::{DWORD, FALSE, LPCVOID, LPVOID};
@@ -43,15 +45,17 @@ pub(crate) fn write0(fd_ref: i32, address: i64, len: i32, append: bool) -> Resul
     } else {
         null_mut()
     };
-    let result = unsafe {
+    // Can block on a pipe or console; only native memory is touched while Safe
+    let lp_ov = lp_ov as usize;
+    let result = blocking_win32(|| unsafe {
         WriteFile(
-            handle,             /* File handle to write */
-            address as LPCVOID, /* pointer to the buffer */
-            len as DWORD,       /* number of bytes to write */
-            &mut written,       /* receives number of bytes written */
-            lp_ov,              /* overlapped struct */
+            handle,                   /* File handle to write */
+            address as LPCVOID,       /* pointer to the buffer */
+            len as DWORD,             /* number of bytes to write */
+            &mut written,             /* receives number of bytes written */
+            lp_ov as *mut OVERLAPPED, /* overlapped struct */
         )
-    };
+    });
 
     if result == 0 {
         let error_msg = get_last_error()?;
@@ -71,7 +75,8 @@ pub(crate) fn read0(fd_ref: i32, address: i64, len: i32) -> Result<i32> {
     }
 
     let mut read: DWORD = 0;
-    let result = unsafe {
+    // Can block on a pipe or console; only native memory is touched while Safe
+    let result = blocking_win32(|| unsafe {
         ReadFile(
             handle,
             address as LPVOID,
@@ -79,7 +84,7 @@ pub(crate) fn read0(fd_ref: i32, address: i64, len: i32) -> Result<i32> {
             &mut read,
             0 as *mut OVERLAPPED,
         )
-    };
+    });
     if result == 0 {
         let error_code = unsafe { GetLastError() };
         if error_code == ERROR_BROKEN_PIPE {
@@ -120,7 +125,9 @@ pub(crate) fn pread0(fd_ref: i32, address: i64, len: i32, offset: i64) -> Result
     }
 
     let mut read: DWORD = 0;
-    let ret = unsafe { ReadFile(handle, address as LPVOID, len as DWORD, &mut read, &mut ov) };
+    let ret = blocking_win32(|| unsafe {
+        ReadFile(handle, address as LPVOID, len as DWORD, &mut read, &mut ov)
+    });
 
     if ret == 0 {
         let error_code = unsafe { GetLastError() };
