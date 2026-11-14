@@ -598,6 +598,24 @@ impl JavaClass {
         self.static_fields.get(field_name).map(Arc::clone)
     }
 
+    /// Every static field with its current storage, in declaration order.
+    pub(crate) fn static_field_values(&self) -> impl Iterator<Item = (&String, &Arc<FieldValue>)> {
+        self.static_fields.iter()
+    }
+
+    /// The instance fields this class itself declares, in the order an instance stores them.
+    pub(crate) fn declared_instance_fields(
+        &self,
+    ) -> impl Iterator<Item = (&String, Option<&TypeDescriptor>)> {
+        self.instance_fields_template.keys().map(|name| {
+            let descriptor = self
+                .fields_info
+                .get(name)
+                .map(|info| info.type_descriptor());
+            (name, descriptor)
+        })
+    }
+
     pub fn field_info(&self, field_name: &str) -> Option<&Arc<FieldInfo>> {
         self.fields_info.get(field_name)
     }

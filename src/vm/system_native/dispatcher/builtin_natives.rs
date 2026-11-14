@@ -662,6 +662,7 @@ builtin_natives! {
     "com/sun/management/internal/Flag": static fn getAllFlagNames() -> string_array => sn::management_ext::get_all_flag_names;
     "com/sun/management/internal/Flag": static fn getFlags(names: string_array, flags: flag_array, count: int) -> int => sn::management_ext::get_flags;
     "com/sun/management/internal/Flag": static fn getInternalFlagCount() -> int => sn::management_ext::get_internal_flag_count;
+    "com/sun/management/internal/HotSpotDiagnostic": instance fn dumpHeap0(file: string, live: boolean) -> void => sn::management_ext::dump_heap0;
     "com/sun/management/internal/DiagnosticCommandImpl": instance fn setNotificationEnabled(enabled: boolean) -> void => sn::management_ext::dcmd_set_notification_enabled;
     "com/sun/management/internal/DiagnosticCommandImpl": instance fn getDiagnosticCommands() -> string_array => sn::management_ext::get_diagnostic_commands;
     "com/sun/management/internal/DiagnosticCommandImpl": instance fn getDiagnosticCommandInfo(commands: string_array) -> dcmd_info_array => sn::management_ext::get_diagnostic_command_info;

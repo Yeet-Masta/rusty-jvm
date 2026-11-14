@@ -59,6 +59,11 @@ pub(crate) fn configure(options: &[String]) {
     }
 }
 
+/// The thread stack size the frame limit stands for, in bytes.
+pub(crate) fn stack_bytes() -> usize {
+    MAX_FRAMES.load(Ordering::Relaxed) * BYTES_PER_FRAME
+}
+
 pub(crate) fn set_max_frames(frames: usize) {
     MAX_FRAMES.store(frames, Ordering::Relaxed);
 }

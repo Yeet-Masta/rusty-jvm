@@ -9,6 +9,8 @@
 * Hidden classes are marked as such (`Class.isHidden`, nest hosts from the `NestHost` attribute)
 * `ThreadMXBean.getThreadInfo`/`dumpAllThreads` with lock owners, locked monitors and synchronizers,
   deadlock detection, and stack traces of blocked threads (`Thread.getAllStackTraces`)
+* Heap dumps in the HPROF format through `HotSpotDiagnosticMXBean.dumpHeap`, and the VM options
+  this VM acts on through `getVMOption`
 
 # 0.6.0
 

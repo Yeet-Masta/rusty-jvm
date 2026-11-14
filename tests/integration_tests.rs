@@ -5689,3 +5689,37 @@ after termination: null
 "#,
     );
 }
+
+#[test]
+fn should_dump_heap_in_hprof_format() {
+    assert_success(
+        "samples.management.heapdump.HeapDumpDemo",
+        r#"== all objects ==
+magic: JAVA PROFILE 1.0.2 idSize=8
+ended: true segments>0=true
+== live objects ==
+magic: JAVA PROFILE 1.0.2 idSize=8
+ended: true segments>0=true
+classes: marker=true base=true super=true superOfBase=java/lang/Object loader=jdk/internal/loader/ClassLoaders$AppClassLoader
+declared: id:10 weight:11 ratio:7 scale:6 flag:4 small:8 label:2 data:2 peers:2
+statics: COUNT=3 SHARED=[42]
+instances: marker=3 base=0
+garbage: 0
+keep: [Lsamples/management/heapdump/HeapDumpDemo$Marker; length=3
+  id=1 weight=1000000000000 ratio=0.25 scale=1.5 flag=false small=-1 tag=7 letter=q label=marker-1 data=[1, 2, 3, 5, 8] peers=null
+  id=2 weight=2000000000000 ratio=0.5 scale=3.0 flag=true small=-2 tag=7 letter=q label=marker-2 data=[1, 2, 3, 5, 16] peers=keep
+  id=3 weight=3000000000000 ratio=0.75 scale=4.5 flag=false small=-3 tag=7 letter=q label=marker-3 data=[1, 2, 3, 5, 24] peers=null
+threads: main=true threadRoots=true stickyClasses=true
+arrays: int[]=true String[]=true
+== failures ==
+existing file: File exists
+missing directory: No such file or directory
+wrong suffix: heapdump file must have .hprof extension
+null file: NullPointerException
+== options ==
+MaxHeapSize: positive=true writeable=false origin=ERGONOMIC
+unknown: VM option "NoSuchOption" does not exist
+read-only: VM Option "MaxHeapSize" is not writeable
+"#,
+    );
+}

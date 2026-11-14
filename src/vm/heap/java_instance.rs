@@ -462,6 +462,13 @@ impl JavaInstance {
         CLASSES.get_by_id(instance.klass_id)
     }
 
+    /// The object's fields grouped by declaring class, root class first.
+    pub(crate) fn field_groups(
+        &self,
+    ) -> &IndexMap<ClassName, IndexMap<FieldNameType, FieldValue>> {
+        &self.get_instance().fields
+    }
+
     /// Id of the object's class in the class registry, without resolving the class.
     pub(crate) fn klass_id(&self) -> usize {
         self.get_instance().klass_id

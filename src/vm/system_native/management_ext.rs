@@ -2,9 +2,22 @@
 //! instead of through `libmanagement_ext`, whose `JNI_OnLoad` needs HotSpot's `jmm` interface.
 
 use crate::vm::error::Result;
+use crate::vm::exception::pending_helpers::set_pending_io_exception;
+use crate::vm::execution_engine::executor::Executor;
+use crate::vm::execution_engine::string_pool_helper::StringPoolHelper;
+use crate::vm::gc;
 use crate::vm::heap::heap::HEAP;
+use crate::vm::heap::hprof;
 use crate::vm::helper::create_array_of_strings;
+use crate::vm::jni::java_thread::JavaThread;
+use crate::vm::stack::slot::Slot;
+use crate::vm::stack::stack_limit;
+use crate::vm::stack::stack_value::StackValueKind;
+use crate::vm::system_native::management::vm_arguments;
+use crate::vm::system_native::string::get_utf8_string_by_ref;
 use parking_lot::Mutex;
+use std::io::ErrorKind;
+use std::path::Path;
 use std::sync::LazyLock;
 use sysinfo::{Pid, ProcessesToUpdate, System};
 
@@ -207,17 +220,162 @@ pub(crate) fn flag_initialize() -> Result<()> {
     Ok(())
 }
 
-/// No `-XX` flags are exposed through `HotSpotDiagnosticMXBean`.
-pub(crate) fn get_all_flag_names() -> Result<i32> {
-    create_array_of_strings(&[])
+enum FlagValue {
+    Bool(bool),
+    Uint(u64),
 }
 
-pub(crate) fn get_flags(_names: i32, _flags: i32, _count: i32) -> Result<i32> {
-    Ok(0)
+/// A VM option as `HotSpotDiagnosticMXBean` reports it. Only options this VM acts on are listed,
+/// under HotSpot's names where HotSpot has the same option.
+struct VmFlag {
+    name: &'static str,
+    value: FlagValue,
+    /// Given when the VM was started, rather than left at its default.
+    on_command_line: bool,
+    /// `VMOption.Origin` of a value that was not given.
+    default_origin: &'static str,
+}
+
+fn vm_flags() -> Vec<VmFlag> {
+    let arguments = vm_arguments();
+    let given = |prefixes: &[&str]| {
+        arguments
+            .iter()
+            .any(|argument| prefixes.iter().any(|prefix| argument.starts_with(prefix)))
+    };
+    let mut flags = Vec::new();
+    if let Some(config) = gc::get() {
+        flags.push(VmFlag {
+            name: "MaxHeapSize",
+            value: FlagValue::Uint(config.max_heap_bytes),
+            on_command_line: given(&["-Xmx"]),
+            default_origin: "ERGONOMIC",
+        });
+        flags.push(VmFlag {
+            name: "GCAllocThreshold",
+            value: FlagValue::Uint(config.gc_alloc_threshold),
+            on_command_line: config.fixed_threshold,
+            default_origin: "DEFAULT",
+        });
+        flags.push(VmFlag {
+            name: "GCStressAtSafepoints",
+            value: FlagValue::Bool(config.stress_at_safepoints),
+            on_command_line: config.stress_at_safepoints,
+            default_origin: "DEFAULT",
+        });
+    }
+    flags.push(VmFlag {
+        name: "ThreadStackSize",
+        value: FlagValue::Uint(stack_limit::stack_bytes() as u64 / 1024),
+        on_command_line: given(&["-Xss", "-XX:ThreadStackSize="]),
+        default_origin: "DEFAULT",
+    });
+    flags
+}
+
+pub(crate) fn get_all_flag_names() -> Result<i32> {
+    let names: Vec<String> = vm_flags()
+        .iter()
+        .map(|flag| flag.name.to_string())
+        .collect();
+    create_array_of_strings(&names)
+}
+
+/// Builds a `com.sun.management.internal.Flag`, as `Flag.c` does: a `Boolean` or `Long` value,
+/// never writeable (no option can be changed in a running VM), and external (a product option).
+fn new_flag(flag: &VmFlag) -> Result<i32> {
+    const ORIGIN: &str = "com/sun/management/VMOption$Origin";
+    let name = StringPoolHelper::create_string(flag.name)?;
+    let value = match flag.value {
+        FlagValue::Bool(value) => Executor::invoke_static_method(
+            "java/lang/Boolean",
+            "valueOf:(Z)Ljava/lang/Boolean;",
+            &[StackValueKind::I32(value as i32)],
+        )?,
+        FlagValue::Uint(value) => Executor::invoke_static_method(
+            "java/lang/Long",
+            "valueOf:(J)Ljava/lang/Long;",
+            &[StackValueKind::I64(value as i64)],
+        )?,
+    };
+    let origin_name = StringPoolHelper::create_string(if flag.on_command_line {
+        "VM_CREATION"
+    } else {
+        flag.default_origin
+    })?;
+    let origin = Executor::invoke_static_method(
+        ORIGIN,
+        "valueOf:(Ljava/lang/String;)Lcom/sun/management/VMOption$Origin;",
+        &[StackValueKind::Ref(origin_name[0].value())],
+    )?;
+    let args = [
+        StackValueKind::Ref(name[0].value()),
+        StackValueKind::Ref(value[0].value()),
+        StackValueKind::I32(0),
+        StackValueKind::I32(1),
+        StackValueKind::Ref(origin[0].value()),
+    ];
+    let created = Executor::invoke_args_constructor(
+        "com/sun/management/internal/Flag",
+        "<init>:(Ljava/lang/String;Ljava/lang/Object;ZZLcom/sun/management/VMOption$Origin;)V",
+        &args,
+        None,
+    )?;
+    Ok(created[0].value())
+}
+
+/// `Flag.getFlags`: fills `flags` from the front with the named options that exist, or with
+/// every option when `names` is null, and returns how many it stored.
+pub(crate) fn get_flags(names: i32, flags: i32, count: i32) -> Result<i32> {
+    let all = vm_flags();
+    let wanted: Vec<&VmFlag> = if names == 0 {
+        all.iter().take(count.max(0) as usize).collect()
+    } else {
+        let mut wanted = Vec::new();
+        for index in 0..count.min(HEAP.get_array_len(names)?) {
+            let name_ref = HEAP.get_array_value(names, index)?[0];
+            if name_ref == 0 {
+                continue;
+            }
+            let name = get_utf8_string_by_ref(name_ref)?;
+            wanted.extend(all.iter().find(|flag| flag.name == name));
+        }
+        wanted
+    };
+    let capacity = HEAP.get_array_len(flags)?;
+    let mut stored = 0;
+    for flag in wanted {
+        if stored >= capacity {
+            break;
+        }
+        let flag_ref = new_flag(flag)?;
+        let _flag = JavaThread::hold_temp_roots(vec![Slot::Ref(flag_ref)]);
+        HEAP.set_array_value(flags, stored, vec![flag_ref])?;
+        stored += 1;
+    }
+    Ok(stored)
 }
 
 pub(crate) fn get_internal_flag_count() -> Result<i32> {
-    Ok(0)
+    Ok(vm_flags().len() as i32)
+}
+
+// ---- com.sun.management.internal.HotSpotDiagnostic ----
+
+/// `HotSpotDiagnostic.dumpHeap0`: writes an HPROF dump of the heap to a file that must not exist
+/// yet. Failures are `IOException`s with the operating system's reason, as HotSpot reports them.
+pub(crate) fn dump_heap0(_this: i32, output_file: i32, live: bool) -> Result<()> {
+    let path = get_utf8_string_by_ref(output_file)?;
+    if let Err(error) = hprof::dump(Path::new(&path), live)? {
+        let message = match error.kind() {
+            ErrorKind::AlreadyExists => "File exists".to_string(),
+            ErrorKind::NotFound => "No such file or directory".to_string(),
+            ErrorKind::PermissionDenied => "Permission denied".to_string(),
+            _ => error.to_string(),
+        };
+        set_pending_io_exception(&message)?;
+    }
+    Ok(())
 }
 
 pub(crate) fn dcmd_set_notification_enabled(_this: i32, _enabled: bool) -> Result<()> {

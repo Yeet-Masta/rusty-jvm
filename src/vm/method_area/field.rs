@@ -107,6 +107,12 @@ impl FieldValue {
         Ok(())
     }
 
+    /// The value as it is right now, or `None` while a writer holds it. For readers that have
+    /// stopped every other thread and so must not wait.
+    pub(crate) fn try_raw_value(&self) -> Option<Vec<i32>> {
+        self.value.try_read().ok().map(|guard| guard.clone())
+    }
+
     pub fn raw_value(&self) -> Result<Vec<i32>> {
         let guard = self.value.read()?;
         Ok(guard.clone())

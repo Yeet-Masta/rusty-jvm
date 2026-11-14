@@ -61,6 +61,11 @@ pub(crate) fn init(arguments: &Arguments) {
     let _ = VM_ARGUMENTS.set(options);
 }
 
+/// The options the VM was started with, as `RuntimeMXBean.getInputArguments()` reports them.
+pub(crate) fn vm_arguments() -> &'static [String] {
+    VM_ARGUMENTS.get().map_or(&[], Vec::as_slice)
+}
+
 fn set_static_bool(class: &str, field: &str, value: bool) -> Result<()> {
     if let Some(field) = CLASSES.get(class)?.static_field(field) {
         field.set_raw_value(vec![value as i32])?;
