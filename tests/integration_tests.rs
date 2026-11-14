@@ -5577,3 +5577,63 @@ Largest pool   : 4
 "#,
     );
 }
+
+/// Each class loader is a namespace of its own: loaders outside the built-in ones define their
+/// own copies of a class, resolve what those classes refer to, and may have no parent at all.
+/// Also covers duplicate definitions and hidden classes.
+#[test]
+fn should_isolate_classes_of_user_defined_class_loaders() {
+    assert_success(
+        "samples.loader.isolation.LoaderIsolation",
+        r#"== isolation ==
+distinct classes: true
+same name: true samples.loader.isolation.LoaderIsolation$IsoCounter
+loaders: isoA isoB app
+loadClass is stable: true
+forName through loader: true
+static state: a=4 b=2 app=1
+shared interface: true
+superclass: java.lang.Object
+instanceof app copy: false false true false
+cast: class samples.loader.isolation.LoaderIsolation$IsoCounter cannot be cast to class samples.loader.isolation.LoaderIsolation$IsoCounter (samples.loader.isolation.LoaderIsolation$IsoCounter is in unnamed module of loader 'isoA' @ID; samples.loader.isolation.LoaderIsolation$IsoCounter is in unnamed module of loader 'app')
+a: loader=isoA array=[Lsamples.loader.isolation.LoaderIsolation$IsoCounter; instanceof=true lambdaHidden=true lambdaLoader=isoA caught=own exception from isoA
+b: loader=isoB array=[Lsamples.loader.isolation.LoaderIsolation$IsoCounter; instanceof=true lambdaHidden=true lambdaLoader=isoB caught=own exception from isoB
+app: loader=app array=[Lsamples.loader.isolation.LoaderIsolation$IsoCounter; instanceof=true lambdaHidden=true lambdaLoader=app caught=own exception from app
+== arrays, modules, nests ==
+array: [Lsamples.loader.isolation.LoaderIsolation$IsoCounter; loader=isoA component=true distinct=true
+array forName: true
+module: true true named=false
+array module: true
+nest host: app=LoaderIsolation isolated is own host=true
+simple name: IsoCounter declaring=LoaderIsolation
+java.lang.IncompatibleClassChangeError: samples.loader.isolation.LoaderIsolation and samples.loader.isolation.LoaderIsolation$IsoCounter disagree on InnerClasses attribute
+method types: java.lang.String
+== findLoadedClass ==
+defined: true
+initiated: true
+untouched: false
+== duplicate definition ==
+java.lang.LinkageError: loader 'isoA' @ID attempted duplicate class definition for samples.loader.isolation.LoaderIsolation$IsoCounter. (samples.loader.isolation.LoaderIsolation$IsoCounter is in unnamed module of loader 'isoA' @ID, parent loader 'app')
+java.lang.NoClassDefFoundError: some/other/Name (wrong name: samples/loader/isolation/LoaderIsolation$IsoCounter)
+== null parent ==
+orphan: true true
+orphan interface: samples.loader.isolation.LoaderIsolation$Shared own copy=true loader=true
+orphan instance: false true
+orphan describe: loader=null array=[Lsamples.loader.isolation.LoaderIsolation$IsoCounter; instanceof=true lambdaHidden=true lambdaLoader=null caught=own exception from null
+orphan sees bootstrap: true
+orphan miss: no.such.Type
+url loader: true true true
+url interface: true
+url platform class: true
+bootstrap: samples/loader/isolation/LoaderIsolation$IsoCounter
+== hidden ==
+isHidden: true true true false false false
+name: samples.loader.isolation.LoaderIsolation$Hid/0xID distinct=true
+array name: [Lsamples.loader.isolation.LoaderIsolation$Hid/0xID;
+loader and module: true true
+nest host: plain is own=true nestmate=LoaderIsolation
+invoke: hello from hidden
+not discoverable: samples.loader.isolation.LoaderIsolation$Hid/0xID
+"#,
+    );
+}

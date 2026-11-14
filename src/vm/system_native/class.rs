@@ -1,17 +1,19 @@
 use crate::vm::assertions::java_assertions;
 use crate::vm::error::{Error, Result};
+use crate::vm::exception::pending_helpers::java_exception;
 use crate::vm::exception::pending_helpers::set_pending_class_not_found_exception;
 use crate::vm::execution_engine::executor::Executor;
 use crate::vm::execution_engine::static_init::StaticInit;
 use crate::vm::execution_engine::string_pool_helper::StringPoolHelper;
 use crate::vm::heap::heap::HEAP;
-use crate::vm::helper::{clazz_ref, klass, strip_nest_host};
+use crate::vm::helper::{clazz_ref, klass};
 use crate::vm::jni::java_thread::JavaThread;
 use crate::vm::method_area::instance_checker::InstanceChecker;
+use crate::vm::method_area::loaded_classes::CLASSES;
+use crate::vm::method_area::namespaces;
 use crate::vm::method_area::primitives_helper::{PRIMITIVE_CODE_BY_TYPE, PRIMITIVE_TYPE_BY_CODE};
 use crate::vm::stack::rooted_slots::RootedSlots;
 use crate::vm::stack::slot::Slot;
-use crate::vm::stack::stack_value::StackValueKind;
 use crate::vm::system_native::constant_pool::CONSTANT_POOL_OOP;
 use crate::vm::system_native::string::get_utf8_string_by_ref;
 use jclassmodel::modifiers::ClassModifier;
@@ -53,8 +55,8 @@ fn map_primitive_class(primitive_type: &str) -> Result<&str> {
 /// a system class when the bootstrap class loader loaded it. Never for primitive and array classes.
 pub(crate) fn desired_assertion_status0(class_ref: i32) -> Result<bool> {
     let klass = klass(class_ref)?;
-    let name = klass.this_class_name();
-    if name.starts_with('[') || PRIMITIVE_TYPE_BY_CODE.contains_key(name.as_str()) {
+    let name = klass.binary_name();
+    if name.starts_with('[') || PRIMITIVE_TYPE_BY_CODE.contains_key(name) {
         return Ok(false);
     }
     let class_loader_ref =
@@ -90,42 +92,43 @@ pub(crate) fn for_name0_with_caller(
 /// `java.lang.Class.forName0(Ljava/lang/String;ZLjava/lang/ClassLoader;)Ljava/lang/Class;` (JDK 26+)
 pub(crate) fn for_name0(name_ref: i32, initialize: bool, loader_ref: i32) -> Result<i32> {
     let name = get_utf8_string_by_ref(name_ref)?;
+    // A binary name never contains '/': that spelling belongs to hidden classes, which no
+    // loader can find by name.
+    if name.contains('/') {
+        set_pending_class_not_found_exception(&name)?;
+        return Ok(0);
+    }
     let internal_name = name.replace('.', "/");
-    let reflection_ref = if loader_ref == 0 {
-        // it's a bootstrap class loader, so we load class directly with native code
-        match clazz_ref(&internal_name) {
-            Ok(r) => RootedSlots::from_slots(vec![Slot::Ref(r)]),
-            Err(_) => {
-                set_pending_class_not_found_exception(&name)?;
-                return Ok(0);
+    // The class as `loader_ref` resolves the name (the bootstrap loader for null), arrays included.
+    let loaded = match namespaces::load_with_loader(loader_ref, &internal_name) {
+        Ok(loaded) => loaded,
+        Err(error) => {
+            // A failure of the loader other than "not found" (say a LinkageError) is the caller's
+            // to see; everything else is reported as HotSpot does, by name.
+            if let Some(throwable_ref) = error.throwable_ref() {
+                let not_found = HEAP.get_instance_name(throwable_ref).and_then(|thrown| {
+                    InstanceChecker::checkcast(&thrown, "java/lang/ClassNotFoundException")
+                });
+                if !not_found.unwrap_or(true) {
+                    return Err(error);
+                }
             }
-        }
-    } else {
-        // we have a class loader, so we use it to load the class
-        let res = Executor::invoke_non_static_method(
-            "java/lang/ClassLoader",
-            "loadClass:(Ljava/lang/String;)Ljava/lang/Class;",
-            loader_ref,
-            &[StackValueKind::Ref(name_ref)],
-        );
-
-        match res {
-            Ok(vals) => vals,
-            Err(_) => {
-                // fixme: samples.reflection.trivial.forname.NonExisting prints stacktrace here
-                // https://github.com/hextriclosan/rusty-jvm/issues/676
-                // ```
-                // Exception in thread "system" java.lang.ClassNotFoundException: samples.reflection.trivial.forname.NonExisting
-                // 	at jdk.internal.loader.BuiltinClassLoader.loadClass(BuiltinClassLoader.java:580)
-                // 	at java.lang.ClassLoader.loadClass(ClassLoader.java:490)```
-                set_pending_class_not_found_exception(&name)?;
-                return Ok(0);
-            }
+            // fixme: samples.reflection.trivial.forname.NonExisting prints stacktrace here
+            // https://github.com/hextriclosan/rusty-jvm/issues/676
+            // HotSpot's bootstrap loader reports the name in its internal form.
+            let reported = if loader_ref == 0 {
+                &internal_name
+            } else {
+                &name
+            };
+            set_pending_class_not_found_exception(reported)?;
+            return Ok(0);
         }
     };
+    let reflection_ref = RootedSlots::from_slots(vec![Slot::Ref(loaded.mirror_clazz_ref()?)]);
 
     if initialize {
-        StaticInit::initialize(&internal_name)?;
+        StaticInit::initialize_java_class(&loaded)?;
     }
 
     Ok(reflection_ref[0].value())
@@ -170,7 +173,7 @@ pub(crate) fn get_permitted_subclasses0(class_ref: i32) -> Result<i32> {
     let subclass_refs = subclasses
         .iter()
         .filter(|subclass| !subclass.starts_with('['))
-        .filter_map(|subclass| clazz_ref(subclass).ok())
+        .filter_map(|subclass| resolved_clazz_ref(&klass, subclass).ok())
         .collect::<Vec<_>>();
 
     HEAP.create_array_with_values(
@@ -183,13 +186,34 @@ pub(crate) fn get_permitted_subclasses0(class_ref: i32) -> Result<i32> {
 /// `java.lang.Class.getDeclaringClass0()Ljava/lang/Class;`
 pub(crate) fn get_declaring_class0(class_ref: i32) -> Result<i32> {
     let klass = klass(class_ref)?;
-    let declaring_class_ref = klass
-        .declaring_class()
-        .as_ref()
-        .map(|declaring_class| clazz_ref(declaring_class))
-        .unwrap_or(Ok(0));
-
-    declaring_class_ref
+    let Some(declaring_class) = klass.declaring_class() else {
+        return Ok(0);
+    };
+    let outer = CLASSES.get(&klass.resolve_class_name(declaring_class)?)?;
+    // HotSpot's `Reflection::check_for_inner_class`: the outer class must list this very class
+    // as a member, which fails when the two come from different loaders.
+    if klass.defining_loader().is_some() || outer.defining_loader().is_some() {
+        let lists_inner = outer
+            .attributes()
+            .get_declared_classes(outer.constant_pool(), outer.this_class_name())
+            .iter()
+            .any(|inner| {
+                outer
+                    .resolve_class_name(inner)
+                    .is_ok_and(|key| key == klass.this_class_name().as_str())
+            });
+        if !lists_inner {
+            return Err(java_exception(
+                "java/lang/IncompatibleClassChangeError",
+                &format!(
+                    "{} and {} disagree on InnerClasses attribute",
+                    outer.external_name(),
+                    klass.external_name()
+                ),
+            ));
+        }
+    }
+    outer.mirror_clazz_ref()
 }
 
 /// `java.lang.Class.getDeclaredFields0(Z)[Ljava/lang/reflect/Field;`
@@ -267,7 +291,7 @@ pub(crate) fn get_enclosing_method0(class_ref: i32) -> Result<i32> {
         return Ok(0);
     };
 
-    let class_name_ref = clazz_ref(&enclosing_method.class_name)?;
+    let class_name_ref = resolved_clazz_ref(&klass, &enclosing_method.class_name)?;
 
     // JVMS §4.7.7 allows the attribute to name an enclosing class without an enclosing method,
     // for a class declared in an initializer. `Class.EnclosingMethodInfo` accepts a null name and
@@ -317,7 +341,7 @@ pub(crate) fn get_simple_binary_name0(class_ref: i32) -> Result<i32> {
     let klass = klass(class_ref)?;
 
     let string_ref = klass
-        .this_class_name()
+        .binary_name()
         .rsplit_once('$')
         .map(|(_, last_token)| last_token)
         .filter(|s| s.parse::<u64>().is_err())
@@ -338,8 +362,17 @@ pub(crate) fn is_assignable_from(
 }
 
 /// `java.lang.Class.isHidden()Z`
-pub(crate) fn is_hidden(_class_ref: i32) -> Result<bool> {
-    Ok(false) // we are treating all classes as non-hidden since we don't have a way to mark them as hidden (yet)
+pub(crate) fn is_hidden(class_ref: i32) -> Result<bool> {
+    Ok(klass(class_ref)?.hidden())
+}
+
+/// The mirror of the class a symbolic `name` from `referrer`'s class file denotes, resolved
+/// through `referrer`'s defining loader.
+fn resolved_clazz_ref(
+    referrer: &crate::vm::method_area::java_class::JavaClass,
+    name: &str,
+) -> Result<i32> {
+    clazz_ref(&referrer.resolve_class_name(name)?)
 }
 
 /// `java.lang.Class.isInstance(Ljava/lang/Object;)Z`
@@ -370,13 +403,7 @@ pub(crate) fn get_constant_pool(clazz_ref: i32) -> Result<i32> {
 
 /// `java.lang.Class.getNestHost0()Ljava/lang/Class;`
 pub(crate) fn get_nest_host0(class_ref: i32) -> Result<i32> {
-    let klass = klass(class_ref)?;
-
-    let nest_host_class_ref = strip_nest_host(klass.this_class_name())
-        .map(clazz_ref)
-        .unwrap_or(Ok(class_ref));
-
-    nest_host_class_ref
+    clazz_ref(klass(class_ref)?.nest_host())
 }
 
 /// `java.lang.Class.isRecord0()Z`
@@ -411,7 +438,7 @@ pub(crate) fn get_record_components0(class_ref: i32) -> Result<i32> {
         roots.add_root(Slot::Ref(rc_ref));
 
         let name_ref = StringPoolHelper::get_string(&component.name)?;
-        let type_ref = clazz_ref(&component.descriptor)?;
+        let type_ref = resolved_clazz_ref(&klass, &component.descriptor)?;
         let accessor_ref = match klass
             .try_get_method(&format!("{}:(){}", component.name, component.descriptor))
         {
@@ -451,9 +478,16 @@ pub(crate) fn get_nest_members0(class_ref: i32) -> Result<i32> {
     let host = klass(host_ref)?;
     let mut refs = vec![host_ref];
     if let Some(members) = host.attributes().get_nest_members(host.constant_pool())? {
+        // As in HotSpot, a listed member counts only if it loads and names this host back.
         for member in members {
-            if let Ok(member_ref) = clazz_ref(&member) {
-                refs.push(member_ref);
+            let Ok(key) = host.resolve_class_name(&member) else {
+                continue;
+            };
+            let Ok(member_class) = CLASSES.get(&key) else {
+                continue;
+            };
+            if member_class.nest_host() == host.this_class_name() {
+                refs.push(member_class.mirror_clazz_ref()?);
             }
         }
     }
@@ -467,7 +501,7 @@ pub(crate) fn get_declared_classes0(class_ref: i32) -> Result<i32> {
         .attributes()
         .get_declared_classes(klass.constant_pool(), klass.this_class_name())
         .iter()
-        .map(|name| clazz_ref(name))
+        .map(|name| resolved_clazz_ref(&klass, name))
         .collect::<Result<Vec<_>>>()?;
     HEAP.create_array_with_values("[Ljava/lang/Class;", &refs, &mut RootedSlots::new())
 }

@@ -237,6 +237,7 @@ impl InvokeDynamicRunner {
                 HEAP.set_array_value(arguments_ref, index as i32, vec![value])
             })?;
 
+        let current_class = CLASSES.get(current_class_name)?;
         let call_site_clazz = clazz_ref("java/lang/invoke/CallSite")?;
         roots.add_root(Slot::Ref(call_site_clazz));
 
@@ -255,9 +256,11 @@ impl InvokeDynamicRunner {
             ReferenceKind::REF_invokeStatic
             | ReferenceKind::REF_invokeInterface
             | ReferenceKind::REF_invokeVirtual => {
-                build_methodtype_ref(bootstrap_info.invoke_dynamic_descriptor())
+                build_methodtype_ref(bootstrap_info.invoke_dynamic_descriptor(), &current_class)
             }
-            ReferenceKind::REF_getField => clazz_ref(bootstrap_info.invoke_dynamic_descriptor()),
+            ReferenceKind::REF_getField => current_class
+                .resolve_class_name(bootstrap_info.invoke_dynamic_descriptor())
+                .and_then(|key| clazz_ref(&key)),
             ReferenceKind::REF_getStatic
             | ReferenceKind::REF_putField
             | ReferenceKind::REF_putStatic

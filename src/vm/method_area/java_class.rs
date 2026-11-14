@@ -5,7 +5,9 @@ use crate::vm::heap::java_instance::{ClassName, FieldNameType};
 use crate::vm::helper::is_reference;
 use crate::vm::method_area::field::{FieldInfo, FieldValue};
 use crate::vm::method_area::java_method::{CodeContext, JavaMethod};
+use crate::vm::method_area::loaded_classes::CLASSES;
 use crate::vm::method_area::lookup;
+use crate::vm::method_area::namespaces::{self, DefiningLoader};
 use crate::vm::stack::stack_frame::ExceptionTable;
 use getset::{CopyGetters, Getters};
 use indexmap::{IndexMap, IndexSet};
@@ -97,6 +99,15 @@ pub(crate) struct JavaClass {
     /// Indexed by constant-pool index. Reads are a single atomic load: invokes from every thread
     /// hit this, so it must not take a lock or touch a shared reference count.
     member_refs: Box<[OnceLock<(MemberRefKind, MemberRef)>]>,
+    /// The loader that defined this class, when it is not one of the built-in loaders; `None`
+    /// for the shared built-in namespace, where symbolic names are registry keys as they stand.
+    #[get_copy = "pub(crate)"]
+    defining_loader: Option<DefiningLoader>,
+    /// Defined through `Lookup.defineHiddenClass` (which includes every lambda proxy).
+    #[get_copy = "pub(crate)"]
+    hidden: bool,
+    /// Registry key of the nest host, once determined.
+    nest_host: OnceLock<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -229,6 +240,7 @@ impl JavaClass {
             MemberRefKind::Field => pool.get_full_field_info(index),
         };
         let (class_name, name, descriptor) = resolved.ok_or_else(mismatch)?;
+        let class_name = self.resolve_class_name(&class_name)?.into_owned();
         let member = MemberRef {
             full_signature: format!("{name}:{descriptor}"),
             class_name,
@@ -479,7 +491,84 @@ impl JavaClass {
             mirror_clazz_ref: OnceLock::default(),
             class_file_version: (0, 0),
             member_refs: (0..member_ref_slots).map(|_| OnceLock::new()).collect(),
+            defining_loader: None,
+            hidden: false,
+            nest_host: OnceLock::new(),
         }
+    }
+
+    /// Records who defined the class. Only before publication, while it is exclusively owned.
+    pub(crate) fn set_definition(
+        &mut self,
+        defining_loader: Option<DefiningLoader>,
+        hidden: bool,
+        nest_host: Option<String>,
+    ) {
+        self.defining_loader = defining_loader;
+        self.hidden = hidden;
+        if let Some(nest_host) = nest_host {
+            self.nest_host = OnceLock::from(nest_host);
+        }
+    }
+
+    /// The name class files use for this class: the registry key without its loader serial.
+    pub(crate) fn binary_name(&self) -> &str {
+        match self.defining_loader {
+            Some(_) if !self.hidden => self
+                .this_class_name
+                .split(namespaces::LOADER_KEY_DELIM)
+                .next()
+                .unwrap_or(&self.this_class_name),
+            _ => &self.this_class_name,
+        }
+    }
+
+    /// The registry key of the class a symbolic `name` denotes to this class, i.e. as resolved
+    /// through its defining loader. See [`namespaces::resolve`].
+    pub(crate) fn resolve_class_name<'a>(
+        &self,
+        name: &'a str,
+    ) -> Result<std::borrow::Cow<'a, str>> {
+        namespaces::resolve(self, name)
+    }
+
+    /// The nest host's registry key (JVMS §5.4.4): the class named by `NestHost` when it loads,
+    /// shares this class's package and lists this class among its `NestMembers`; otherwise the
+    /// class itself. A hidden nestmate has its host fixed when it is defined.
+    pub(crate) fn nest_host(&self) -> &str {
+        if let Some(host) = self.nest_host.get() {
+            return host;
+        }
+        let host = self
+            .declared_nest_host()
+            .unwrap_or_else(|| self.this_class_name.clone());
+        self.nest_host.get_or_init(|| host)
+    }
+
+    fn declared_nest_host(&self) -> Option<String> {
+        let declared = self
+            .attributes
+            .get_nest_host(&self.constant_pool)
+            .ok()
+            .flatten()?;
+        let key = self.resolve_class_name(&declared).ok()?;
+        let host = CLASSES.get(&key).ok()?;
+        // Same runtime package: the same package name and the same defining loader.
+        let package = |name: &str| name.rfind('/').map(|end| name[..end].to_string());
+        if package(host.binary_name()) != package(self.binary_name())
+            || namespaces::mirror_loader(&host).ok()? != namespaces::mirror_loader(self).ok()?
+        {
+            return None;
+        }
+        let members = host
+            .attributes
+            .get_nest_members(&host.constant_pool)
+            .ok()
+            .flatten()?;
+        members
+            .iter()
+            .any(|member| member == self.binary_name())
+            .then(|| host.this_class_name.clone())
     }
 
     pub fn is_interface(&self) -> bool {

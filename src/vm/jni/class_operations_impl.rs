@@ -121,8 +121,13 @@ pub(super) extern "system" fn define_class(
             }
         }
     }
-    // `create_metaclass` hands back an already loaded class as is, so reject redefinitions here.
-    if CLASSES.is_loaded(&class_name) {
+    let loader = handles::resolve_or_return!(loader);
+    // In the built-in namespace `define_class` hands back a class the VM already loaded under
+    // the name, so reject redefinitions here. Other loaders are checked against their own
+    // namespace by `define_class` itself.
+    let builtin_namespace =
+        crate::vm::method_area::namespaces::namespace_of(loader).is_ok_and(|serial| serial == 0);
+    if builtin_namespace && CLASSES.is_loaded(&class_name) {
         set_pending_linkage_error(&format!(
             "attempted duplicate class definition for {}",
             class_name.replace('/', ".")
@@ -130,11 +135,9 @@ pub(super) extern "system" fn define_class(
         return null_mut();
     }
 
-    let loader = handles::resolve_or_return!(loader);
-    let result = with_method_area(|method_area| {
-        method_area.create_metaclass(&class_name, bytecode, loader)
-    })
-    .and_then(|(class_name, _)| clazz_ref(&class_name));
+    let result =
+        with_method_area(|method_area| method_area.define_class(None, bytecode, loader, None))
+            .and_then(|class| class.mirror_clazz_ref());
     match result {
         Ok(class_ref) => handles::new_local(class_ref),
         Err(error) => {

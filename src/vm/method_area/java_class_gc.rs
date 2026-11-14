@@ -15,6 +15,7 @@ impl JavaClass {
                 }
                 (name, TypeDescriptor::Object("java/lang/Object".to_string()))
             }
+            namespaces::CLASS_LOADER => (namespaces::LOADER_SERIAL_FIELD, TypeDescriptor::Integer),
             _ => return Ok(()),
         };
         if self.fields_info.contains_key(name) {

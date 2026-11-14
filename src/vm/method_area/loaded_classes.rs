@@ -122,16 +122,66 @@ impl LoadedClasses {
         fully_qualified_class_name: &str,
     ) -> Result<(usize, String, Arc<JavaClass>)> {
         let fully_qualified_class_name = undecorate(fully_qualified_class_name);
+        if fully_qualified_class_name.starts_with('[') {
+            return self.get_or_create_array(fully_qualified_class_name);
+        }
 
         self.get_or_load(fully_qualified_class_name, || {
-            if fully_qualified_class_name.starts_with('[') {
-                Ok(Self::generate_synthetic_array_class(
-                    fully_qualified_class_name,
-                ))
-            } else {
-                with_method_area(|a| a.load_class_file(fully_qualified_class_name))
-            }
+            with_method_area(|a| a.load_class_file(fully_qualified_class_name))
         })
+    }
+
+    /// An array class belongs to its element type: it has the element's defining loader and
+    /// module, and its name is spelled with the element's external name.
+    fn get_or_create_array(&self, array_name: &str) -> Result<(usize, String, Arc<JavaClass>)> {
+        if let Some(published) = self.get_published(array_name) {
+            return Ok(published);
+        }
+        let dimensions = array_name.bytes().take_while(|byte| *byte == b'[').count();
+        let (prefix, element) = array_name.split_at(dimensions);
+        let mut loader_ref = None;
+        let mut module_ref = None;
+        let mut element_external = None;
+        if !PRIMITIVE_TYPE_BY_CODE.contains_key(element) {
+            let element_name = element
+                .strip_prefix('L')
+                .and_then(|name| name.strip_suffix(';'))
+                .ok_or_else(|| {
+                    Error::new_execution(&format!("Unexpected descriptor {array_name}"))
+                })?;
+            let element_class = self.get(element_name)?;
+            if element_class.this_class_name() != element_name {
+                // The element was defined under another key (a loader of its own).
+                return self.get_full(&format!("{prefix}L{};", element_class.this_class_name()));
+            }
+            if let Some(mirror_ref) = element_class.mirror_ref_if_present() {
+                let field = |name| -> Result<Option<i32>> {
+                    Ok(
+                        Some(HEAP.get_object_field_value(mirror_ref, CLASS, name)?[0])
+                            .filter(|reference| *reference != 0),
+                    )
+                };
+                loader_ref = field("classLoader")?;
+                if element_class.defining_loader().is_some() || element_class.hidden() {
+                    module_ref = field("module")?;
+                }
+            }
+            element_external = Some(element_class.external_name().clone());
+        }
+        {
+            let _claim = self.loading.claim(array_name);
+            if let Some(published) = self.get_full_impl(array_name) {
+                return Ok(published);
+            }
+        }
+        let array_class =
+            Self::generate_synthetic_array_class(array_name, element_external.as_deref());
+        self.perform_array_insertion(
+            &array_class,
+            loader_ref,
+            module_ref,
+            element_external.as_deref(),
+        )
     }
 
     /// The loader may execute Java and publish this name itself.
@@ -192,6 +242,18 @@ impl LoadedClasses {
         klass: Arc<JavaClass>,
         class_loader_ref: Option<i32>,
     ) -> Result<(usize, String, Arc<JavaClass>)> {
+        self.insert_defined(klass, class_loader_ref, None)
+    }
+
+    /// [`Self::insert_klass`] for a class whose module is known to the definer (`module_ref`)
+    /// rather than derived from the runtime image: a class of a user-defined loader, which goes
+    /// in that loader's unnamed module, or a hidden class, which shares its lookup class's.
+    pub fn insert_defined(
+        &self,
+        klass: Arc<JavaClass>,
+        class_loader_ref: Option<i32>,
+        module_ref: Option<i32>,
+    ) -> Result<(usize, String, Arc<JavaClass>)> {
         let fully_qualified_class_name = klass.this_class_name();
         if let Some(published) = self.get_published(fully_qualified_class_name) {
             return Ok(published);
@@ -207,9 +269,9 @@ impl LoadedClasses {
         // claims a name, after preparing everything that can load another class.
         if !fully_qualified_class_name.starts_with('[') {
             // this is not an array class - insert directly
-            self.perform_insertion(&klass, None, class_loader_ref)
+            self.perform_insertion(&klass, None, class_loader_ref, module_ref)
         } else {
-            self.perform_array_insertion(&klass, class_loader_ref)
+            self.perform_array_insertion(&klass, class_loader_ref, module_ref, None)
         }
     }
 
@@ -233,6 +295,7 @@ impl LoadedClasses {
         klass: &Arc<JavaClass>,
         component_type_ref: Option<i32>,
         class_loader_ref: Option<i32>,
+        module_ref: Option<i32>,
     ) -> Result<(usize, String, Arc<JavaClass>)> {
         let fully_qualified_class_name = klass.this_class_name();
         let (class_klass_id, _name, class_klass) = self.get_full_impl(CLASS).ok_or_else(|| {
@@ -257,6 +320,7 @@ impl LoadedClasses {
             class_instance,
             component_type_ref,
             class_loader_ref,
+            module_ref,
         )?;
 
         Ok((
@@ -270,6 +334,8 @@ impl LoadedClasses {
         &self,
         array_klass: &Arc<JavaClass>,
         class_loader_ref: Option<i32>,
+        module_ref: Option<i32>,
+        element_external: Option<&str>,
     ) -> Result<(usize, String, Arc<JavaClass>)> {
         let fully_qualified_class_name = array_klass.this_class_name();
         if let Ok(TypeDescriptor::Array(value, dimension)) =
@@ -287,7 +353,7 @@ impl LoadedClasses {
             }?;
 
             let (_, _, component_klass) =
-                self.perform_insertion(&component_klass, None, class_loader_ref)?;
+                self.perform_insertion(&component_klass, None, class_loader_ref, None)?;
 
             // Create array classes from component up to the full array class (except the last one which is created outside)
             let mut component_type_ref = component_klass.mirror_clazz_ref()?;
@@ -299,12 +365,14 @@ impl LoadedClasses {
                         Ok((id, key.to_string(), Arc::clone(&klass)))
                     } else {
                         // create sub-array class
-                        let sub_array_klass = Self::generate_synthetic_array_class(name);
+                        let sub_array_klass =
+                            Self::generate_synthetic_array_class(name, element_external);
 
                         self.perform_insertion(
                             &sub_array_klass,
                             Some(component_type_ref),
                             class_loader_ref,
+                            module_ref,
                         )
                     }?;
 
@@ -312,7 +380,12 @@ impl LoadedClasses {
             }
 
             // Finally, create the full array class
-            self.perform_insertion(array_klass, Some(component_type_ref), class_loader_ref)
+            self.perform_insertion(
+                array_klass,
+                Some(component_type_ref),
+                class_loader_ref,
+                module_ref,
+            )
         } else {
             Err(Error::new_execution(&format!(
                 "Unexpected descriptor {fully_qualified_class_name}"
@@ -327,6 +400,7 @@ impl LoadedClasses {
         class_instance: InstancePlan,
         component_type_ref: Option<i32>,
         class_loader_ref: Option<i32>,
+        module_override: Option<i32>,
     ) -> Result<()> {
         let mut destination = RootedSlots::new();
         let class_instance_id =
@@ -377,6 +451,11 @@ impl LoadedClasses {
             "classLoader",
             vec![class_loader_ref.unwrap_or(0)],
         )?;
+
+        if let Some(module_ref) = module_override {
+            HEAP.set_object_field_value(class_instance_id, CLASS, "module", vec![module_ref])?;
+            return klass.inject_mirror_clazz_ref(class_instance_id);
+        }
 
         let (module_ref, patch, is_unnamed_module) = with_method_area(|a| {
             let file_name = format!("{}.class", Self::module_owner(klass.this_class_name()));
@@ -489,6 +568,7 @@ impl LoadedClasses {
                 class_klass.new_instance(class_klass_id)?,
                 None,
                 None,
+                None,
             )?;
 
             // Create Class<Object> instance
@@ -503,6 +583,7 @@ impl LoadedClasses {
                 class_klass.new_instance(class_klass_id)?,
                 None,
                 None,
+                None,
             )?;
 
             Ok(())
@@ -513,8 +594,22 @@ impl LoadedClasses {
         }
     }
 
-    fn generate_synthetic_array_class(array_class_name_internal: &str) -> Arc<JavaClass> {
-        let array_class_name_external = array_class_name_internal.replace('/', ".");
+    /// `element_external` is the external name of the innermost element class, which a plain
+    /// `/`-to-`.` rewrite gets wrong for hidden classes and classes of user-defined loaders.
+    fn generate_synthetic_array_class(
+        array_class_name_internal: &str,
+        element_external: Option<&str>,
+    ) -> Arc<JavaClass> {
+        let array_class_name_external = match element_external {
+            Some(element) => {
+                let dimensions = array_class_name_internal
+                    .bytes()
+                    .take_while(|byte| *byte == b'[')
+                    .count();
+                format!("{}L{element};", "[".repeat(dimensions))
+            }
+            None => array_class_name_internal.replace('/', "."),
+        };
         Arc::new(JavaClass::synthetic(
             array_class_name_internal.to_string(),
             array_class_name_external,

@@ -3,7 +3,7 @@ use crate::vm::execution_engine::executor::Executor;
 use crate::vm::execution_engine::string_pool_helper::StringPoolHelper;
 use crate::vm::gc::budget::{copy_slice, AllocError, AllocResult};
 use crate::vm::heap::heap::HEAP;
-use crate::vm::helper::{clazz_ref, default_value};
+use crate::vm::helper::{clazz_ref, clazz_ref_seen_by, default_value};
 use crate::vm::jni::java_thread::JavaThread;
 use crate::vm::stack::rooted_slots::RootedSlots;
 use crate::vm::stack::slot::Slot;
@@ -222,7 +222,7 @@ impl FieldInfo {
         let name_ref = StringPoolHelper::get_string(&self.name)?;
         roots.add_root(Slot::Ref(name_ref));
         let descr = self.type_descriptor.to_string();
-        let type_ref = clazz_ref(&descr)?;
+        let type_ref = clazz_ref_seen_by(&self.class_name, &descr)?;
         roots.add_root(Slot::Ref(type_ref));
 
         let modifiers = self.flags as i32;

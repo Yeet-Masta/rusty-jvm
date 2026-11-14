@@ -3,6 +3,7 @@ use crate::vm::exception::common::construct_exception_and_throw;
 use crate::vm::execution_engine::string_pool_helper::StringPoolHelper;
 use crate::vm::heap::heap::HEAP;
 use crate::vm::helper::{clazz_ref, undecorate};
+use crate::vm::method_area::namespaces::binary_name;
 use crate::vm::method_area::primitives_helper::PRIMITIVE_TYPE_BY_CODE;
 use crate::vm::stack::stack_frame::StackFrames;
 use crate::vm::stack::stack_value::StackValueKind;
@@ -17,8 +18,8 @@ pub fn throw_class_cast_exception(
     to: &str,
     stack_frames: &mut StackFrames,
 ) -> Result<()> {
-    let from_name = from.replace('/', ".");
-    let to_name = to.replace('/', ".");
+    let from_name = binary_name(from).replace('/', ".");
+    let to_name = binary_name(to).replace('/', ".");
     // The module details are only a description, so failing to look them up must not stop
     // the exception from being thrown
     let message = match class_cast_description(from, &from_name, to, &to_name) {
@@ -37,6 +38,35 @@ pub fn throw_class_cast_exception(
         &[StackValueKind::Ref(message[0].value())],
         stack_frames,
     )
+}
+
+/// HotSpot's `Klass::class_in_module_of_loader` for a published class: its loader's description
+/// and e.g. `p.C is in unnamed module of loader p.L @1b6d3586, parent loader 'app'`.
+pub(crate) fn class_in_module_of_loader(
+    class: &crate::vm::method_area::java_class::JavaClass,
+) -> Result<(String, String)> {
+    let location = ClassLocation::of(class.this_class_name())?;
+    let mut description = format!("{} is in {}", class.external_name(), location.describe());
+    if location.loader_ref != 0
+        && crate::vm::method_area::namespaces::namespace_of(location.loader_ref)? != 0
+    {
+        let parent_ref =
+            HEAP.get_object_field_value(location.loader_ref, "java/lang/ClassLoader", "parent")?
+                [0];
+        description.push_str(", parent loader ");
+        description.push_str(&loader_name(parent_ref)?);
+    }
+    Ok((location.loader_name, description))
+}
+
+/// E.g. `'bootstrap'`, `'app'` or `MyLoader @1b6d3586`.
+fn loader_name(loader_ref: i32) -> Result<String> {
+    if loader_ref == 0 {
+        return Ok("'bootstrap'".to_string());
+    }
+    let name_and_id_ref =
+        HEAP.get_object_field_value(loader_ref, "java/lang/ClassLoader", "nameAndId")?[0];
+    get_utf8_string_by_ref(name_and_id_ref)
 }
 
 fn class_cast_description(from: &str, from_name: &str, to: &str, to_name: &str) -> Result<String> {
@@ -92,13 +122,7 @@ impl ClassLocation {
             Some(get_utf8_string_by_ref(module_name_ref)?)
         };
 
-        let loader_name = if loader_ref == 0 {
-            "'bootstrap'".to_string()
-        } else {
-            let name_and_id_ref =
-                HEAP.get_object_field_value(loader_ref, "java/lang/ClassLoader", "nameAndId")?[0];
-            get_utf8_string_by_ref(name_and_id_ref)?
-        };
+        let loader_name = loader_name(loader_ref)?;
 
         Ok(Self {
             module_ref,

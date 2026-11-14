@@ -4,6 +4,9 @@
 * Add a precise, nonmoving mark-sweep garbage collector with managed-heap limits, JNI reference
   tracking, Java reference processing and opt-in `-Xlog:gc` output
 * Support `ACC_SYNCHRONIZED` on interpreted methods and bytecode-invoked native methods
+* Per-class-loader namespaces: user-defined loaders define their own copies of a class, resolve
+  the classes those refer to, and may have a null parent; duplicate definitions throw `LinkageError`
+* Hidden classes are marked as such (`Class.isHidden`, nest hosts from the `NestHost` attribute)
 
 # 0.6.0
 

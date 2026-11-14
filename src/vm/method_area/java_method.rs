@@ -2,7 +2,7 @@ use crate::vm::error::{Error, Result};
 use crate::vm::execution_engine::executor::Executor;
 use crate::vm::execution_engine::string_pool_helper::StringPoolHelper;
 use crate::vm::heap::heap::HEAP;
-use crate::vm::helper::{clazz_ref, ref_arg_chunks, undecorate};
+use crate::vm::helper::{clazz_ref, clazz_ref_seen_by, ref_arg_chunks, undecorate};
 use crate::vm::jni::java_thread::JavaThread;
 use crate::vm::stack::slot::Slot;
 use crate::vm::stack::stack_frame::{ExceptionTable, FrameCode, StackFrame};
@@ -233,7 +233,7 @@ impl JavaMethod {
             .iter()
             .map(|t| t.to_string())
             .map(|t| {
-                let reference = clazz_ref(undecorate(&t))?;
+                let reference = clazz_ref_seen_by(self.class_name(), undecorate(&t))?;
                 roots.add_root(Slot::Ref(reference));
                 Ok(reference)
             })
@@ -246,14 +246,14 @@ impl JavaMethod {
         roots.add_root(Slot::Ref(parameter_type_refs));
 
         let return_type = self.method_descriptor.return_type().to_string();
-        let return_type_ref = clazz_ref(&return_type)?;
+        let return_type_ref = clazz_ref_seen_by(self.class_name(), &return_type)?;
         roots.add_root(Slot::Ref(return_type_ref));
 
         let exception_type_clazz_refs = self
             .exceptions
             .iter()
             .map(|exception_type| {
-                let reference = clazz_ref(exception_type)?;
+                let reference = clazz_ref_seen_by(self.class_name(), exception_type)?;
                 roots.add_root(Slot::Ref(reference));
                 Ok(reference)
             })
@@ -340,7 +340,7 @@ impl JavaMethod {
             .iter()
             .map(|t| t.to_string())
             .map(|t| {
-                let reference = clazz_ref(undecorate(&t))?;
+                let reference = clazz_ref_seen_by(self.class_name(), undecorate(&t))?;
                 roots.add_root(Slot::Ref(reference));
                 Ok(reference)
             })
@@ -356,7 +356,7 @@ impl JavaMethod {
             .exceptions
             .iter()
             .map(|exception_type| {
-                let reference = clazz_ref(exception_type)?;
+                let reference = clazz_ref_seen_by(self.class_name(), exception_type)?;
                 roots.add_root(Slot::Ref(reference));
                 Ok(reference)
             })

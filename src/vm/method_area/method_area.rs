@@ -1,20 +1,23 @@
 use crate::vm::error::{Error, Result};
+use crate::vm::exception::class_cast::class_in_module_of_loader;
+use crate::vm::exception::pending_helpers::java_exception;
 use crate::vm::execution_engine::executor::Executor;
 use crate::vm::execution_engine::ldc_resolution_manager::LdcConstant;
 use crate::vm::execution_engine::ldc_resolution_manager::LdcResolutionManager;
 use crate::vm::execution_engine::string_pool_helper::StringPoolHelper;
 use crate::vm::heap::construction::InstancePlan;
+use crate::vm::heap::heap::HEAP;
 use crate::vm::helper::klass;
 use crate::vm::method_area::java_class::JavaClass;
 use crate::vm::method_area::loaded_classes::CLASSES;
 use crate::vm::method_area::module_helper::Modules;
+use crate::vm::method_area::namespaces::{self, DefiningLoader};
 use crate::vm::method_area::primitives_helper::PRIMITIVE_TYPE_BY_CODE;
 use crate::vm::stack::slot::Slot;
 use crate::vm::stack::stack_value::StackValueKind;
-use crate::vm::system_native::class_loader::SYNTH_CLASS_DELIM;
 use crate::vm::{JAVA_HOME, SYSTEM_CLASSLOADER_REF};
 use indexmap::IndexSet;
-use jclassmodel::{parse, ClassModel};
+use jclassmodel::parse;
 use jimage_rs::jimage::JImage;
 use jimage_rs::raw_jimage::RawJImage;
 use once_cell::sync::OnceCell;
@@ -26,6 +29,30 @@ use std::sync::Arc;
 use tracing::trace;
 
 static METHOD_AREA: OnceCell<MethodArea> = OnceCell::new();
+
+/// What makes a definition a hidden class (`Lookup.defineHiddenClass`).
+pub(crate) struct HiddenDefinition {
+    /// Makes the hidden class's name unique.
+    pub(crate) id: u32,
+    /// The class the defining `Lookup` was created for; the hidden class joins its module.
+    pub(crate) lookup_class: Arc<JavaClass>,
+    /// `ClassOption.NESTMATE`: the hidden class joins the lookup class's nest.
+    pub(crate) nestmate: bool,
+}
+
+/// HotSpot's `LinkageError` for a loader defining a name it already has a class for.
+fn duplicate_definition(existing: &JavaClass) -> Error {
+    let name = existing.external_name();
+    let message = match class_in_module_of_loader(existing) {
+        Ok((loader, location)) => {
+            format!(
+                "loader {loader} attempted duplicate class definition for {name}. ({location})"
+            )
+        }
+        Err(_) => format!("attempted duplicate class definition for {name}."),
+    };
+    java_exception("java/lang/LinkageError", &message)
+}
 
 /// Early bootstrap may not have installed the area. Reading roots must not initialize it.
 pub(crate) fn global_root_refs() -> Result<Vec<i32>> {
@@ -100,24 +127,119 @@ impl MethodArea {
         })
     }
 
-    pub(crate) fn create_metaclass(
+    /// Defines a class from `bytecode` on behalf of `class_loader_ref` (`ClassLoader.defineClass`,
+    /// `Lookup.defineClass`/`defineHiddenClass`, JNI `DefineClass`).
+    ///
+    /// `expected_name` is the internal name the caller asked for, when it gave one; the class
+    /// file must record that name. A class of a built-in loader is registered under its plain
+    /// name, a class of any other loader under a key private to that loader (see
+    /// [`namespaces`]), and a hidden class under a unique name no loader can look up.
+    pub(crate) fn define_class(
         &self,
-        fully_qualified_class_name: &str,
+        expected_name: Option<&str>,
         bytecode: &[u8],
         class_loader_ref: i32,
-    ) -> Result<(String, String)> {
-        let (internal, external) = derive_internal_and_external_names(fully_qualified_class_name);
+        hidden: Option<HiddenDefinition>,
+    ) -> Result<Arc<JavaClass>> {
+        let parsed = parse(bytecode)?;
+        let recorded = parsed
+            .this_class_name()
+            .ok_or_else(|| Error::new_constant_pool("Error getting class_name of parsed class"))?;
+        if let Some(expected) = expected_name.filter(|expected| *expected != recorded) {
+            return Err(java_exception(
+                "java/lang/NoClassDefFoundError",
+                &format!("{expected} (wrong name: {recorded})"),
+            ));
+        }
+        let serial = namespaces::namespace_of(class_loader_ref)?;
+        let defining_loader = (serial != 0).then_some(DefiningLoader {
+            serial,
+            loader_ref: class_loader_ref,
+        });
+        let dotted = recorded.replace('/', ".");
 
-        if CLASSES.is_loaded(&internal) {
-            return Ok((internal, external));
+        let (internal, external) = match &hidden {
+            Some(hidden) => {
+                let suffix = format!("0x{:016X}", hidden.id);
+                (format!("{recorded}/{suffix}"), format!("{dotted}/{suffix}"))
+            }
+            None if serial == 0 => {
+                if CLASSES.is_loaded(&recorded) {
+                    let existing = CLASSES.get(&recorded)?;
+                    if class_loader_ref != 0
+                        && namespaces::mirror_loader(&existing)? == class_loader_ref
+                    {
+                        return Err(duplicate_definition(&existing));
+                    }
+                    // The VM itself may have loaded the class for this name already; the
+                    // built-in namespace holds one class per name.
+                    return Ok(existing);
+                }
+                (recorded.clone(), dotted)
+            }
+            None => {
+                if let Some(key) = namespaces::recorded(serial, &recorded) {
+                    return Err(duplicate_definition(&*CLASSES.get(&key)?));
+                }
+                (namespaces::key_for(&recorded, serial), dotted)
+            }
+        };
+
+        let mut model = parsed.into_model(internal.clone(), external)?;
+        if let Some(loader) = defining_loader {
+            // Supertypes are resolved through the defining loader, so the hierarchy is stored as
+            // registry keys like every other class's.
+            let resolve = |name: &str| -> Result<String> {
+                Ok(namespaces::load_with_loader(loader.loader_ref, name)?
+                    .this_class_name()
+                    .clone())
+            };
+            if let Some(super_class) = model.super_class_name.as_deref() {
+                model.super_class_name = Some(resolve(super_class)?);
+            }
+            model.interfaces = model
+                .interfaces
+                .iter()
+                .map(|interface| resolve(interface))
+                .collect::<Result<_>>()?;
         }
 
-        let model = parse(bytecode)?.into_model(internal.clone(), external.clone())?;
-        let (_, java_class) = self.to_java_class(model)?;
-        CLASSES.insert_klass(Arc::clone(&java_class), Some(class_loader_ref))?;
-        trace!("<META CLASS LOADED> -> {}", java_class.this_class_name());
+        let nest_host = match &hidden {
+            Some(hidden) if hidden.nestmate => Some(hidden.lookup_class.nest_host().to_string()),
+            Some(_) => Some(internal.clone()),
+            None => None,
+        };
+        let module_ref = match &hidden {
+            Some(hidden) => Some(
+                HEAP.get_object_field_value(
+                    hidden.lookup_class.mirror_clazz_ref()?,
+                    "java/lang/Class",
+                    "module",
+                )?[0],
+            ),
+            None if serial != 0 => Some(
+                Executor::invoke_non_static_method(
+                    namespaces::CLASS_LOADER,
+                    "getUnnamedModule:()Ljava/lang/Module;",
+                    class_loader_ref,
+                    &[],
+                )?[0]
+                    .value(),
+            ),
+            None => None,
+        }
+        .filter(|module_ref| *module_ref != 0);
 
-        Ok((internal, external))
+        let mut java_class = JavaClass::from_model(model)?;
+        java_class.set_definition(defining_loader, hidden.is_some(), nest_host);
+        let (_, _, published) =
+            CLASSES.insert_defined(Arc::new(java_class), Some(class_loader_ref), module_ref)?;
+        if hidden.is_none() && serial != 0 && !namespaces::record(serial, &recorded, &internal) {
+            return Err(duplicate_definition(&published));
+        }
+        trace!("<META CLASS LOADED> -> {}", published.this_class_name());
+
+        Ok(published)
     }
 
     pub(crate) fn load_class_file(
@@ -193,14 +315,8 @@ impl MethodArea {
             .ok_or_else(|| Error::new_constant_pool("Error getting class_name of parsed class"))?;
 
         let (internal, external) = derive_internal_and_external_names(&class_name);
-        self.to_java_class(parsed.into_model(internal, external)?)
-            .map(|(_, java_class)| Ok(Some(java_class)))?
-    }
-
-    fn to_java_class(&self, model: ClassModel) -> Result<(String, Arc<JavaClass>)> {
-        let name = model.name.clone();
-
-        Ok((name, Arc::new(JavaClass::from_model(model)?)))
+        let model = parsed.into_model(internal, external)?;
+        Ok(Some(Arc::new(JavaClass::from_model(model)?)))
     }
 
     pub fn create_instance_with_default_fields(&self, class_name: &str) -> Result<InstancePlan> {
@@ -293,11 +409,9 @@ impl MethodArea {
     }
 }
 
-/// Takes a raw name like "my/package/MyClass#0xABCDEF"
 /// Returns (internal_name, external_name)
 ///
 /// Examples:
-///     "my/package/MyClass#0xABCDEF" -> ("my/package/MyClass/0xABCDEF", "my.package.MyClass/0xABCDEF")
 ///     "I" -> ("I", "int")
 ///     "my/package/MyClass" -> ("my/package/MyClass", "my.package.MyClass")
 fn derive_internal_and_external_names(raw: &str) -> (String, String) {
@@ -305,15 +419,6 @@ fn derive_internal_and_external_names(raw: &str) -> (String, String) {
         // Check if the raw name is a primitive type
         let internal = raw.to_string();
         let external = external_name.to_string();
-        (internal, external)
-    } else if let Some(pos) = raw.rfind(SYNTH_CLASS_DELIM) {
-        // Check for synthetic class delimiter
-        let (base, suffix) = raw.split_at(pos);
-        let suffix = &suffix[1..];
-
-        let internal = format!("{}/{}", base, suffix);
-        let external = format!("{}/{}", base.replace('/', "."), suffix);
-
         (internal, external)
     } else {
         // Just ordinary class name
@@ -363,20 +468,6 @@ mod tests {
     fn derive_internal_and_external_names_with_primitive_type() {
         let result = derive_internal_and_external_names("I");
         assert_eq!(result, ("I".to_string(), "int".to_string()));
-    }
-
-    #[test]
-    fn derive_internal_and_external_names_with_synthetic_class_delim() {
-        let result = derive_internal_and_external_names(
-            "java/lang/invoke/LambdaForm$MH#0x0000000000000002",
-        );
-        assert_eq!(
-            result,
-            (
-                "java/lang/invoke/LambdaForm$MH/0x0000000000000002".to_string(),
-                "java.lang.invoke.LambdaForm$MH/0x0000000000000002".to_string()
-            )
-        );
     }
 
     #[test]

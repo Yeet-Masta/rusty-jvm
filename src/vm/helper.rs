@@ -35,6 +35,13 @@ pub fn clazz_ref(class_name: &str) -> Result<i32> {
     CLASSES.get(class_name)?.mirror_clazz_ref()
 }
 
+/// The mirror of the class a symbolic `name` denotes to the class registered as `referrer_key`,
+/// i.e. resolved through that class's defining loader.
+pub fn clazz_ref_seen_by(referrer_key: &str, name: &str) -> Result<i32> {
+    let referrer = CLASSES.get(referrer_key)?;
+    clazz_ref(&referrer.resolve_class_name(name)?)
+}
+
 pub fn klass(clazz_ref: i32) -> Result<Arc<JavaClass>> {
     HEAP.get_mirror_klass_id(clazz_ref)
         .map(|klass_id| CLASSES.get_by_id(klass_id))?
@@ -215,10 +222,6 @@ pub fn default_value(type_descriptor: &TypeDescriptor) -> Result<Vec<i32>> {
 
 pub fn argument_length(args: &[TypeDescriptor]) -> Result<i32> {
     args.iter().map(get_length).sum()
-}
-
-pub fn strip_nest_host(class_name: &str) -> Option<&str> {
-    class_name.find('$').map(|index| &class_name[..index])
 }
 
 pub fn create_array_of_strings(props: &[String]) -> Result<i32> {

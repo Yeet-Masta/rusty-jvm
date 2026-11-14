@@ -68,8 +68,10 @@ fn is_hidden(element: &StackElement) -> Result<bool> {
     if method.has_annotation(HIDDEN) || method.is_polymorphic_signature() {
         return Ok(true);
     }
-    let class_name = method.class_name();
-    Ok(class_name.contains("$$Lambda") || class_name.contains("LambdaForm$"))
+    // Every method of a hidden class is a hidden frame, as in HotSpot.
+    Ok(crate::vm::method_area::loaded_classes::CLASSES
+        .get_loaded(method.class_name())
+        .is_some_and(|class| class.hidden()))
 }
 
 /// The frames a walk sees: the caller's stack minus the walker's own implementation frames

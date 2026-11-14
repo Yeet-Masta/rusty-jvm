@@ -320,6 +320,7 @@ pub(crate) fn process(
                         "Error getting class name by index {class_constpool_index}"
                     ))
                 })?;
+            let class_to_invoke_new_for = klass.resolve_class_name(&class_to_invoke_new_for)?;
 
             StaticInit::initialize(&class_to_invoke_new_for)?;
 
@@ -379,6 +380,7 @@ pub(crate) fn process(
                         "Error getting class name by index {class_constpool_index}"
                     ))
                 })?;
+            let class_of_array = klass.resolve_class_name(&class_of_array)?;
             let class_of_array = if class_of_array.starts_with("[") {
                 format!("[{class_of_array}")
             } else {
@@ -446,6 +448,7 @@ pub(crate) fn process(
                             "Error getting class name by index {class_constpool_index}"
                         ))
                     })?;
+                let class_name = klass.resolve_class_name(&class_name)?;
 
                 let instance_class_name = HEAP.get_instance_name(objectref)?;
 
@@ -484,6 +487,7 @@ pub(crate) fn process(
                             "Error getting class name by index {class_constpool_index}"
                         ))
                     })?;
+                let class_name = klass.resolve_class_name(&class_name)?;
 
                 let instance_class_name = HEAP.get_instance_name(objectref)?;
 

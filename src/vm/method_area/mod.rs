@@ -7,4 +7,5 @@ pub(crate) mod loaded_classes;
 pub(crate) mod lookup;
 pub(crate) mod method_area;
 pub(crate) mod module_helper;
+pub(crate) mod namespaces;
 pub(crate) mod primitives_helper;

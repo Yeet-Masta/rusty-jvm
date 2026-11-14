@@ -3,16 +3,20 @@ use crate::vm::error::Result;
 use crate::vm::execution_engine::static_init::StaticInit;
 use crate::vm::execution_engine::string_pool_helper::StringPoolHelper;
 use crate::vm::heap::heap::HEAP;
-use crate::vm::helper::{clazz_ref, vec_to_i64};
+use crate::vm::helper::{klass, vec_to_i64};
 use crate::vm::method_area::loaded_classes::CLASSES;
-use crate::vm::method_area::method_area::with_method_area;
+use crate::vm::method_area::method_area::{with_method_area, HiddenDefinition};
+use crate::vm::method_area::namespaces;
 use crate::vm::stack::rooted_slots::RootedSlots;
 use crate::vm::stack::slot::Slot;
 use crate::vm::system_native::string::get_utf8_string_by_ref;
 use std::sync::atomic::{AtomicU32, Ordering};
 use tracing::trace;
 
-pub(crate) const SYNTH_CLASS_DELIM: char = '#';
+/// `java.lang.invoke.MethodHandleNatives.Constants`-style flags of `ClassLoader.defineClass0`.
+const NESTMATE_CLASS: i32 = 0x1;
+const HIDDEN_CLASS: i32 = 0x2;
+
 static COUNTER: AtomicU32 = AtomicU32::new(1);
 
 /// `java/lang/ClassLoader:registerNatives:()V`
@@ -76,38 +80,78 @@ fn to_java_arrays(options: &[AssertionOption]) -> Result<RootedSlots> {
 }
 
 /// `java/lang/ClassLoader:defineClass0:(Ljava/lang/ClassLoader;Ljava/lang/Class;Ljava/lang/String;[BIILjava/security/ProtectionDomain;ZILjava/lang/Object;)Ljava/lang/Class;`
+///
+/// `Lookup.defineClass` and `Lookup.defineHiddenClass` (so every lambda proxy and compiled
+/// `LambdaForm`). `name` is an internal name.
 pub(crate) fn define_class0(
     class_loader_ref: i32,
-    _lookup_ref: i32,
+    lookup_ref: i32,
     name_ref: i32,
     buf_ref: i32,
     off: i32,
     len: i32,
     _protection_domain_ref: i32,
-    _initialize: bool,
-    _flags: i32,
-    _class_data_ref: i32,
+    initialize: bool,
+    flags: i32,
+    class_data_ref: i32,
 ) -> Result<i32> {
-    let name = format!(
-        "{}{SYNTH_CLASS_DELIM}0x{:016X}",
-        get_utf8_string_by_ref(name_ref)?,
-        increment_counter()
-    );
-    let buf = HEAP.get_entire_array(buf_ref)?;
+    let byte_code = array_bytes(buf_ref, off, len)?;
+    let hidden = if flags & HIDDEN_CLASS != 0 {
+        Some(HiddenDefinition {
+            id: increment_counter(),
+            lookup_class: klass(lookup_ref)?,
+            nestmate: flags & NESTMATE_CLASS != 0,
+        })
+    } else {
+        None
+    };
+    let expected_name = match (&hidden, name_ref) {
+        (None, name_ref) if name_ref != 0 => {
+            Some(get_utf8_string_by_ref(name_ref)?.replace('.', "/"))
+        }
+        _ => None,
+    };
 
-    let vec = buf.get_entire_value();
-    let byte_code: Vec<_> = vec
+    let defined = with_method_area(|method_area| {
+        method_area.define_class(
+            expected_name.as_deref(),
+            &byte_code,
+            class_loader_ref,
+            hidden,
+        )
+    })?;
+    let mirror_ref = defined.mirror_clazz_ref()?;
+    if class_data_ref != 0 {
+        HEAP.set_object_field_value(
+            mirror_ref,
+            "java/lang/Class",
+            "classData",
+            vec![class_data_ref],
+        )?;
+    }
+    if initialize {
+        StaticInit::initialize_java_class(&defined)?;
+    }
+
+    Ok(mirror_ref)
+}
+
+fn array_bytes(buf_ref: i32, off: i32, len: i32) -> Result<Vec<u8>> {
+    let buf = HEAP.get_entire_array(buf_ref)?;
+    Ok(buf
+        .get_entire_value()
         .iter()
         .skip(off as usize)
         .take(len as usize)
         .map(|v| v[0] as u8)
-        .collect();
+        .collect())
+}
 
-    let (internal_name, ..) = with_method_area(|method_area| {
-        method_area.create_metaclass(&name, &byte_code, class_loader_ref)
-    })?;
-
-    clazz_ref(&internal_name)
+fn expected_name(name_ref: i32) -> Result<Option<String>> {
+    if name_ref == 0 {
+        return Ok(None);
+    }
+    Ok(Some(get_utf8_string_by_ref(name_ref)?.replace('.', "/")))
 }
 
 /// `java/lang/ClassLoader:defineClass1:(Ljava/lang/ClassLoader;Ljava/lang/String;[BIILjava/security/ProtectionDomain;Ljava/lang/String;)Ljava/lang/Class;`
@@ -120,22 +164,13 @@ pub(crate) fn define_class1(
     _protection_domain_ref: i32,
     _source_ref: i32,
 ) -> Result<i32> {
-    let internal_name = get_utf8_string_by_ref(name_ref)?.replace(".", "/");
-    let buf = HEAP.get_entire_array(buf_ref)?;
+    let expected_name = expected_name(name_ref)?;
+    let byte_code = array_bytes(buf_ref, off, len)?;
 
-    let vec = buf.get_entire_value();
-    let byte_code: Vec<_> = vec
-        .iter()
-        .skip(off as usize)
-        .take(len as usize)
-        .map(|v| v[0] as u8)
-        .collect();
-
-    let (name, ..) = with_method_area(|method_area| {
-        method_area.create_metaclass(&internal_name, &byte_code, class_loader_ref)
-    })?;
-
-    clazz_ref(&name)
+    with_method_area(|method_area| {
+        method_area.define_class(expected_name.as_deref(), &byte_code, class_loader_ref, None)
+    })?
+    .mirror_clazz_ref()
 }
 
 /// `java/lang/ClassLoader:defineClass2:(Ljava/lang/ClassLoader;Ljava/lang/String;Ljava/nio/ByteBuffer;IILjava/security/ProtectionDomain;Ljava/lang/String;)Ljava/lang/Class;`
@@ -148,7 +183,7 @@ pub(crate) fn define_class2(
     _protection_domain_ref: i32,
     _source_ref: i32,
 ) -> Result<i32> {
-    let internal_name = get_utf8_string_by_ref(name_ref)?.replace(".", "/");
+    let expected_name = expected_name(name_ref)?;
     let instance_name = HEAP.get_instance_name(nio_byte_buf_ref)?;
     let addr = HEAP.get_object_field_value(nio_byte_buf_ref, &instance_name, "address")?;
     let addr = vec_to_i64(&addr);
@@ -161,22 +196,28 @@ pub(crate) fn define_class2(
     }
     let byte_code = unsafe { std::slice::from_raw_parts(addr.add(off as usize), len as usize) };
 
-    let (name, ..) = with_method_area(|method_area| {
-        method_area.create_metaclass(&internal_name, byte_code, class_loader_ref)
-    })?;
-
-    clazz_ref(&name)
+    with_method_area(|method_area| {
+        method_area.define_class(expected_name.as_deref(), byte_code, class_loader_ref, None)
+    })?
+    .mirror_clazz_ref()
 }
 
 /// `java/lang/ClassLoader:findBootstrapClass:(Ljava/lang/String;)Ljava/lang/Class;`
+///
+/// Only classes the bootstrap loader defines: a class of another loader is never handed out
+/// here, even when it is already loaded under the same name.
 pub(crate) fn find_bootstrap_class(name_ref: i32) -> Result<i32> {
     let name = get_utf8_string_by_ref(name_ref)?;
     let internal_name = &name.replace('.', "/");
 
     let opt_klass = with_method_area(|a| {
         let class_file_path = format!("{internal_name}.class");
-        if a.modules_mapping().contains_key(&class_file_path) {
-            Some(a.load_class_file(internal_name))
+        if let Some(module) = a.modules_mapping().get(&class_file_path) {
+            // Platform and application modules of the runtime image belong to their own loaders.
+            let boot_module = crate::vm::BOOT_MODULES
+                .get()
+                .is_none_or(|boot| boot.contains(module.as_str()));
+            boot_module.then(|| a.load_class_file(internal_name))
         } else if class_file_path.starts_with("java/") {
             // Try file-based loading for patched java.* classes (e.g. compiled with --patch-module java.base=.)
             // This is needed for hacky tests should_support_bootstrap_method_invoker, should_support_string_concat_helper, should_support_system_get_constant_pool
@@ -198,22 +239,49 @@ pub(crate) fn find_bootstrap_class(name_ref: i32) -> Result<i32> {
         CLASSES.insert_klass(klass?, None)?;
     }
 
-    if !CLASSES.is_loaded(internal_name) {
+    let Some(loaded) = CLASSES.get_loaded(internal_name) else {
+        return Ok(0);
+    };
+    if loaded.defining_loader().is_some() || namespaces::mirror_loader(&loaded)? != 0 {
         return Ok(0);
     }
-
-    clazz_ref(internal_name)
+    loaded.mirror_clazz_ref()
 }
 
 /// `java/lang/ClassLoader:findLoadedClass0:(Ljava/lang/String;)Ljava/lang/Class;`
-pub(crate) fn find_loaded_class0(_this: i32, name_ref: i32) -> Result<i32> {
+///
+/// The class this loader defined, or was recorded as an initiating loader of, under `name`.
+/// The built-in loaders share one namespace, so for them that is a loaded class defined by the
+/// loader itself or by one it delegates to (bootstrap, and platform for the application loader).
+pub(crate) fn find_loaded_class0(this: i32, name_ref: i32) -> Result<i32> {
     let name = get_utf8_string_by_ref(name_ref)?;
     let internal_name = &name.replace('.', "/");
-    if CLASSES.is_loaded(internal_name) {
-        clazz_ref(internal_name)
-    } else {
-        Ok(0)
+    let serial = namespaces::namespace_of(this)?;
+    if serial != 0 {
+        return match namespaces::recorded(serial, internal_name) {
+            Some(key) => CLASSES.get(&key)?.mirror_clazz_ref(),
+            None => Ok(0),
+        };
     }
+
+    let Some(loaded) = CLASSES.get_loaded(internal_name) else {
+        return Ok(0);
+    };
+    if loaded.defining_loader().is_some() {
+        return Ok(0);
+    }
+    let Some(mirror_ref) = loaded.mirror_ref_if_present() else {
+        return Ok(0);
+    };
+    let definer = HEAP.get_object_field_value(mirror_ref, "java/lang/Class", "classLoader")?[0];
+    let mut delegate = this;
+    while delegate != 0 {
+        if delegate == definer {
+            return Ok(mirror_ref);
+        }
+        delegate = HEAP.get_object_field_value(delegate, namespaces::CLASS_LOADER, "parent")?[0];
+    }
+    Ok(if definer == 0 { mirror_ref } else { 0 })
 }
 
 fn increment_counter() -> u32 {

@@ -457,7 +457,7 @@ builtin_natives! {
     "java/lang/Class": instance fn getEnclosingMethod0() -> object_array => sn::class::get_enclosing_method0;
     "java/lang/Class": instance fn getSimpleBinaryName0() -> string => sn::class::get_simple_binary_name0;
     "java/lang/Class": instance fn isAssignableFrom(clazz: class) -> boolean => sn::class::is_assignable_from;
-    "java/lang/Class": instance fn isHidden() -> boolean => sn::class::is_hidden;  // we are treating all classes as non-hidden since we don't have a way to mark them as hidden (yet)
+    "java/lang/Class": instance fn isHidden() -> boolean => sn::class::is_hidden;
     "java/lang/Class": instance fn isInstance(obj: object) -> boolean => sn::class::class_is_instance;
     "java/lang/Class": instance fn getConstantPool() -> constant_pool => sn::class::get_constant_pool;
     "java/lang/Class": instance fn getNestHost0() -> class => sn::class::get_nest_host0;
@@ -1090,12 +1090,30 @@ const RELEASE_SPECIFIC_NATIVES: &[(&str, &str)] = &[
     ("sun/nio/fs/WindowsNativeDispatcher", "init"),
     // Declared only by the Linux/macOS JDK:
     ("java/lang/Thread", "setNativeName"),
-    ("com/sun/management/internal/OperatingSystemImpl", "getHostConfiguredCpuCount0"),
-    ("com/sun/management/internal/OperatingSystemImpl", "getHostOnlineCpuCount0"),
-    ("com/sun/management/internal/OperatingSystemImpl", "getHostTotalCpuTicks0"),
-    ("com/sun/management/internal/OperatingSystemImpl", "getOpenFileDescriptorCount0"),
-    ("com/sun/management/internal/OperatingSystemImpl", "getMaxFileDescriptorCount0"),
-    ("com/sun/management/internal/OperatingSystemImpl", "getSingleCpuLoad0"),
+    (
+        "com/sun/management/internal/OperatingSystemImpl",
+        "getHostConfiguredCpuCount0",
+    ),
+    (
+        "com/sun/management/internal/OperatingSystemImpl",
+        "getHostOnlineCpuCount0",
+    ),
+    (
+        "com/sun/management/internal/OperatingSystemImpl",
+        "getHostTotalCpuTicks0",
+    ),
+    (
+        "com/sun/management/internal/OperatingSystemImpl",
+        "getOpenFileDescriptorCount0",
+    ),
+    (
+        "com/sun/management/internal/OperatingSystemImpl",
+        "getMaxFileDescriptorCount0",
+    ),
+    (
+        "com/sun/management/internal/OperatingSystemImpl",
+        "getSingleCpuLoad0",
+    ),
 ];
 
 /// Verifies that every built-in native declared in [`builtin_natives!`] matches a

@@ -108,7 +108,16 @@ impl ExceptionTable {
             let eligible = match record.catch_type() {
                 CatchType::Any => true,
                 CatchType::Class(catch_type) => {
-                    InstanceChecker::checkcast(exception_name, catch_type)?
+                    // Only a class outside the built-in namespace (its key carries a loader
+                    // serial or a hidden-class suffix) can see the catch type differently.
+                    if current_class_name.contains('#') || current_class_name.contains("/0x") {
+                        let catcher = crate::vm::method_area::loaded_classes::CLASSES
+                            .get(current_class_name)?;
+                        let catch_type = catcher.resolve_class_name(catch_type)?;
+                        InstanceChecker::checkcast(exception_name, &catch_type)?
+                    } else {
+                        InstanceChecker::checkcast(exception_name, catch_type)?
+                    }
                 }
             };
             if eligible {

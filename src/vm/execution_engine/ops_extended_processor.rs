@@ -61,6 +61,7 @@ pub(crate) fn process(
                         "Error getting class name by index {class_index}"
                     ))
                 })?;
+            let class_name = klass.resolve_class_name(&class_name)?;
 
             let dimentions = (0..dimension_number)
                 .map(|_| stack_frame.pop())
