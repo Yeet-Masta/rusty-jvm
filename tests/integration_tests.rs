@@ -5637,3 +5637,55 @@ not discoverable: samples.loader.isolation.LoaderIsolation$Hid/0xID
 "#,
     );
 }
+
+/// `ThreadMXBean`: what each thread is blocked on and by whom, stack traces of blocked threads,
+/// locked monitors and synchronizers, and deadlock detection.
+#[test]
+fn should_report_thread_info_and_deadlocks() {
+    assert_success(
+        "samples.management.threadinfo.ThreadInfoDemo",
+        r#"supported: monitors=true synchronizers=true
+== getThreadInfo ==
+blocked: state=BLOCKED lock=samples.management.threadinfo.ThreadInfoDemo$Gate lockName=samples.management.threadinfo.ThreadInfoDemo$Gate@ID owner=main ownerId=set blocked=1 waited=0 times=-1/-1 native=false suspended=false daemon=true priority=5
+  top=[samples.management.threadinfo.ThreadInfoDemo.lambda$main$4, samples.management.threadinfo.ThreadInfoDemo$$Lambda/0xID.run, java.lang.Thread.runWith]
+lock-waiter: state=WAITING lock=java.util.concurrent.locks.ReentrantLock$NonfairSync lockName=java.util.concurrent.locks.ReentrantLock$NonfairSync@ID owner=main ownerId=set blocked=0 waited=1 times=-1/-1 native=false suspended=false daemon=true priority=5
+  top=[jdk.internal.misc.Unsafe.park, java.util.concurrent.locks.LockSupport.park, java.util.concurrent.locks.AbstractQueuedSynchronizer.acquire]
+waiting: state=WAITING lock=samples.management.threadinfo.ThreadInfoDemo$Blocker lockName=samples.management.threadinfo.ThreadInfoDemo$Blocker@ID owner=null ownerId=-1 blocked=0 waited=1 times=-1/-1 native=false suspended=false daemon=true priority=5
+  top=[java.lang.Object.wait0, java.lang.Object.wait, java.lang.Object.wait]
+sleeping: state=TIMED_WAITING lock=null lockName=null owner=null ownerId=-1 blocked=0 waited=1 times=-1/-1 native=false suspended=false daemon=true priority=5
+  top=[java.lang.Thread.sleepNanos0, java.lang.Thread.sleepNanos, java.lang.Thread.sleep]
+parked: state=WAITING lock=samples.management.threadinfo.ThreadInfoDemo$Blocker lockName=samples.management.threadinfo.ThreadInfoDemo$Blocker@ID owner=null ownerId=-1 blocked=0 waited=1 times=-1/-1 native=false suspended=false daemon=true priority=5
+  top=[jdk.internal.misc.Unsafe.park, java.util.concurrent.locks.LockSupport.park, samples.management.threadinfo.ThreadInfoDemo.lambda$main$2]
+timed-wait: state=TIMED_WAITING lock=samples.management.threadinfo.ThreadInfoDemo$Blocker lockName=samples.management.threadinfo.ThreadInfoDemo$Blocker@ID owner=null ownerId=-1 blocked=0 waited=1 times=-1/-1 native=false suspended=false daemon=true priority=5
+  top=[java.lang.Object.wait0, java.lang.Object.wait, samples.management.threadinfo.ThreadInfoDemo.lambda$main$3]
+main: state=RUNNABLE lock=null lockName=null owner=null ownerId=-1 times=-1/-1 native=false suspended=false daemon=false priority=5
+  top=[sun.management.ThreadImpl.getThreadInfo1, sun.management.ThreadImpl.getThreadInfo, samples.management.threadinfo.ThreadInfoDemo.main]
+== depths ==
+default depth=0 one=1 all>1=true bottom=run
+unknown id: null null blocked
+bad id: Invalid thread ID parameter: 0
+== dumpAllThreads ==
+blocked: monitors=[] synchronizers=[] depth=4
+holder: monitors=[samples.management.threadinfo.ThreadInfoDemo$Blocker@5:holdInner, samples.management.threadinfo.ThreadInfoDemo$Gate@6:holdBoth] synchronizers=[] depth=11
+lock-waiter: monitors=[] synchronizers=[] depth=10
+main: monitors=[samples.management.threadinfo.ThreadInfoDemo$Gate@3:main] synchronizers=[java.util.concurrent.locks.ReentrantLock$NonfairSync] depth=4
+sync-method: monitors=[java.lang.Class@5:await] synchronizers=[] depth=10
+dump has every live thread: true
+limited depth: 2
+selected: 2 null
+toString: "holder" daemon prio=5 Id=N WAITING on java.util.concurrent.CountDownLatch$Sync@ID
+== deadlocks ==
+none: null null
+blocked thread got the gate
+monitor cycle: [monitor-a, monitor-b] all: [monitor-a, monitor-b]
+monitor-a: state=BLOCKED lock=samples.management.threadinfo.ThreadInfoDemo$Blocker lockName=samples.management.threadinfo.ThreadInfoDemo$Blocker@ID owner=monitor-b ownerId=set times=-1/-1 native=false suspended=false daemon=true priority=5
+  top=[samples.management.threadinfo.ThreadInfoDemo.deadlock]
+monitor-b: state=BLOCKED lock=samples.management.threadinfo.ThreadInfoDemo$Gate lockName=samples.management.threadinfo.ThreadInfoDemo$Gate@ID owner=monitor-a ownerId=set times=-1/-1 native=false suspended=false daemon=true priority=5
+  top=[samples.management.threadinfo.ThreadInfoDemo.deadlock]
+monitor cycle: [monitor-a, monitor-b] all: [lock-a, lock-b, monitor-a, monitor-b]
+lock-a: state=WAITING lock=java.util.concurrent.locks.ReentrantLock$NonfairSync owner=lock-b synchronizers=1
+lock-b: state=WAITING lock=java.util.concurrent.locks.ReentrantLock$NonfairSync owner=lock-a synchronizers=1
+after termination: null
+"#,
+    );
+}

@@ -25,6 +25,7 @@ use crate::vm::threads::{self, thread_status};
 use dashmap::DashMap;
 use parking_lot::{Condvar, Mutex};
 use std::collections::{HashSet, VecDeque};
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, LazyLock};
 use std::thread::ThreadId;
 use std::time::{Duration, Instant};
@@ -38,6 +39,9 @@ struct MonitorState {
     owner: Option<ThreadId>,
     /// Reentrant acquisition count for `owner`.
     count: u32,
+    /// How many Java frames `owner` had when it took the monitor (see
+    /// [`JavaThread::root_monitor`]), which locates the locking frame in its stack trace.
+    lock_depth: usize,
     /// Threads acquiring logical ownership (including wait-set reacquisition).
     entrants: u32,
     /// Number of threads currently in `Object.wait` on this monitor.
@@ -128,6 +132,7 @@ fn monitor_for(obj_ref: i32) -> Arc<ObjectMonitor> {
                 state: Mutex::new(MonitorState {
                     owner: None,
                     count: 0,
+                    lock_depth: 0,
                     entrants: 0,
                     waiters: 0,
                     wait_set: VecDeque::new(),
@@ -158,13 +163,22 @@ fn wake_after_release(m: &ObjectMonitor, s: &MonitorState) {
 /// `monitorenter`: acquire the object's monitor, blocking until it is free; reentrant for the
 /// current owner.
 pub(crate) fn enter(obj_ref: i32) {
-    JavaThread::root_monitor(obj_ref);
+    let depth = JavaThread::root_monitor(obj_ref);
     let m = monitor_for(obj_ref);
     let tid = std::thread::current().id();
     let mut s = safepoint::lock(&m.state);
     s.entrants += 1;
     let contended = s.owner.is_some() && s.owner != Some(tid);
+    let activity = if contended {
+        threads::current_activity()
+    } else {
+        None
+    };
     if contended {
+        if let Some(activity) = &activity {
+            activity.blocked_count.fetch_add(1, Ordering::Relaxed);
+            activity.contended_monitor.store(obj_ref, Ordering::Relaxed);
+        }
         threads::set_current_thread_status(thread_status::BLOCKED);
         // Short critical sections are the common case: spin briefly before parking, as HotSpot
         // does, instead of paying a safepoint transition and an OS sleep/wake for every handoff.
@@ -193,10 +207,36 @@ pub(crate) fn enter(obj_ref: i32) {
     } else {
         s.owner = Some(tid);
         s.count = 1;
+        s.lock_depth = depth;
     }
     if contended {
+        if let Some(activity) = &activity {
+            activity.contended_monitor.store(0, Ordering::Relaxed);
+        }
         threads::set_current_thread_status(thread_status::RUNNABLE);
     }
+}
+
+/// The `java.lang.Thread` owning the monitor of `obj_ref`, if any thread does.
+pub(crate) fn owner_thread(obj_ref: i32) -> Option<i32> {
+    let monitor = Arc::clone(MONITORS.get(&obj_ref)?.value());
+    let owner = safepoint::lock(&monitor.state).owner?;
+    threads::thread_of(owner)
+}
+
+/// Every monitor the OS thread `owner` holds, as `(object, depth of the locking frame)`.
+pub(crate) fn owned_by(owner: ThreadId) -> Vec<(i32, usize)> {
+    let monitors: Vec<_> = MONITORS
+        .iter()
+        .map(|entry| (*entry.key(), Arc::clone(entry.value())))
+        .collect();
+    monitors
+        .into_iter()
+        .filter_map(|(obj_ref, monitor)| {
+            let state = safepoint::lock(&monitor.state);
+            (state.owner == Some(owner)).then_some((obj_ref, state.lock_depth))
+        })
+        .collect()
 }
 
 /// `monitorexit`: release one level of the current thread's ownership. A mismatch (not the owner)
@@ -264,6 +304,12 @@ pub(crate) fn wait(obj_ref: i32, timeout_millis: i64) -> Result<()> {
 
     // Fully release the monitor, remembering the recursion depth to restore on re-acquire.
     let saved_count = s.count;
+    let saved_depth = s.lock_depth;
+    let activity = threads::current_activity();
+    if let Some(activity) = &activity {
+        activity.waited_count.fetch_add(1, Ordering::Relaxed);
+        activity.contended_monitor.store(obj_ref, Ordering::Relaxed);
+    }
     s.owner = None;
     s.count = 0;
     s.waiters += 1;
@@ -279,9 +325,9 @@ pub(crate) fn wait(obj_ref: i32, timeout_millis: i64) -> Result<()> {
     }
 
     threads::set_current_thread_status(if timeout_millis > 0 {
-        thread_status::TIMED_WAITING
+        thread_status::IN_OBJECT_WAIT_TIMED
     } else {
-        thread_status::WAITING
+        thread_status::IN_OBJECT_WAIT
     });
 
     let deadline = (timeout_millis > 0)
@@ -334,6 +380,10 @@ pub(crate) fn wait(obj_ref: i32, timeout_millis: i64) -> Result<()> {
     s.entrants -= 1;
     s.owner = Some(tid);
     s.count = saved_count;
+    s.lock_depth = saved_depth;
+    if let Some(activity) = &activity {
+        activity.contended_monitor.store(0, Ordering::Relaxed);
+    }
     threads::set_current_thread_status(thread_status::RUNNABLE);
 
     if interrupted {

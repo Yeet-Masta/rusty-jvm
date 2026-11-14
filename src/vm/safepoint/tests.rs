@@ -17,6 +17,7 @@ fn receive<T>(receiver: &Receiver<T>) -> T {
 fn roots(reference: i32) -> Snapshot {
     Snapshot {
         roots: vec![reference],
+        frames: None,
     }
 }
 
@@ -129,7 +130,9 @@ fn gc_coordinator_dump_timeout_does_not_cancel_a_collection() {
             }
         });
         let started = std::time::Instant::now();
-        let result = dump_coordinator.dump(dumper, 33, roots(11), |_| panic!("blocked target"));
+        let result = dump_coordinator
+            .dump(dumper, 33, roots(11), |_| panic!("blocked target"))
+            .polled();
         assert!(result.is_none());
         assert!(started.elapsed() >= Duration::from_secs(2));
         dump_coordinator.park(dumper, roots(11), Reason::Retirement);
@@ -192,6 +195,7 @@ fn gc_coordinator_dump_handoff_precedes_managed_resume() {
                     .collect(),
             );
         })
+        .polled()
         .unwrap();
     assert_eq!(result[0].class_ref(), 91);
     assert_eq!(destination[0], Slot::Ref(91));

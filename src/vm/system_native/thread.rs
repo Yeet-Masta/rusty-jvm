@@ -10,7 +10,7 @@ use crate::vm::method_area::lookup;
 use crate::vm::method_area::method_area::with_method_area;
 use crate::vm::stack::rooted_slots::RootedSlots;
 use crate::vm::stack::slot::Slot;
-use crate::vm::stack::stack_frames_util::StackFramesUtil;
+use crate::vm::stack::stack_frames_util::{StackElement, StackFramesUtil};
 use crate::vm::system_native::{stack_trace_element, throwable};
 use crate::vm::{monitor, safepoint, threads};
 use std::time::{Duration, Instant};
@@ -67,7 +67,9 @@ pub(crate) fn holds_lock(object_ref: i32) -> Result<bool> {
     Ok(crate::vm::monitor::holds_lock(object_ref))
 }
 
-static mut NEXT_TID_OFFSET: i64 = 3; // todo: should have volatile semantics
+/// The next thread identifier. Starts after `Thread.PRIMORDIAL_TID` (3), which the main thread
+/// is given without consulting this counter.
+static mut NEXT_TID_OFFSET: i64 = 4; // todo: should have volatile semantics
 /// `java/lang/Thread.getNextThreadIdOffset()J`
 pub(crate) fn get_next_threadid_offset() -> Result<i64> {
     Ok(&raw const NEXT_TID_OFFSET as i64) // todo: `NEXT_TID_OFFSET` should have volatile semantics
@@ -91,7 +93,12 @@ pub(crate) fn sleep_nanos0(nanos: i64) -> Result<()> {
     // panic on `Instant` overflow for the very large `nanos` a Java `long` permits (~292 years).
     let total = Duration::from_nanos(nanos as u64);
     let start = Instant::now();
-    threads::set_current_thread_status(threads::thread_status::TIMED_WAITING);
+    if let Some(activity) = threads::current_activity() {
+        activity
+            .waited_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    threads::set_current_thread_status(threads::thread_status::SLEEPING);
     let result = loop {
         if monitor::take_current_interrupt() {
             break set_pending_interrupted_exception();
@@ -137,17 +144,48 @@ pub(crate) fn interrupt0(this: i32) -> Result<()> {
 /// frames are turned into `StackTraceElement`s via the same backtrace path as `fillInStackTrace`.
 pub(crate) fn get_stack_trace0(this: i32) -> Result<i32> {
     let mut dump_roots = RootedSlots::new();
-    let frames = if JavaThread::current_thread() == Some(this) {
-        StackFramesUtil::collect_current_stack(MAX_STACK_DEPTH)?
-    } else {
-        match safepoint::dump_stack(this, &mut dump_roots) {
-            Some(frames) => frames,
-            None => return Ok(0), // null: the thread didn't reach a safepoint (or isn't registered)
-        }
-    };
+    match thread_frames(this, &mut dump_roots)? {
+        Some(frames) => stack_trace_elements(&frames),
+        None => Ok(0), // null: the thread didn't reach a safepoint (or isn't registered)
+    }
+}
 
+/// `java/lang/Thread.dumpThreads([Ljava/lang/Thread;)[[Ljava/lang/StackTraceElement;`
+///
+/// The stack of each given thread, for `Thread.getAllStackTraces`; null for a thread whose stack
+/// could not be taken.
+pub(crate) fn dump_threads(threads_ref: i32) -> Result<i32> {
+    let count = HEAP.get_array_len(threads_ref)?;
+    let mut destination = RootedSlots::new();
+    let traces_ref =
+        HEAP.create_array("[[Ljava/lang/StackTraceElement;", count, &mut destination)?;
+    for index in 0..count {
+        let thread_ref = HEAP.get_array_value(threads_ref, index)?[0];
+        if thread_ref == 0 {
+            continue;
+        }
+        let trace_ref = get_stack_trace0(thread_ref)?;
+        HEAP.set_array_value(traces_ref, index, vec![trace_ref])?;
+    }
+    Ok(traces_ref)
+}
+
+/// The Java frames of `thread_ref`, newest first, or `None` when another thread's stack could not
+/// be snapshotted. `dump_roots` keeps the frames' classes alive for the caller.
+pub(crate) fn thread_frames(
+    thread_ref: i32,
+    dump_roots: &mut RootedSlots,
+) -> Result<Option<Vec<StackElement>>> {
+    if JavaThread::current_thread() == Some(thread_ref) {
+        return StackFramesUtil::collect_current_stack(MAX_STACK_DEPTH).map(Some);
+    }
+    Ok(safepoint::dump_stack(thread_ref, dump_roots))
+}
+
+/// A `StackTraceElement[]` describing `frames`.
+pub(crate) fn stack_trace_elements(frames: &[StackElement]) -> Result<i32> {
     let depth = frames.len() as i32;
-    let backtrace_ref = throwable::build_backtrace(&frames)?;
+    let backtrace_ref = throwable::build_backtrace(frames)?;
     let mut roots = JavaThread::hold_temp_roots(vec![Slot::Ref(backtrace_ref)]);
 
     let mut destination = RootedSlots::new();

@@ -80,8 +80,8 @@ pub(crate) fn init_optional_support_fields() -> Result<()> {
     set_static_bool(VM_MANAGEMENT, "threadContentionMonitoringSupport", false)?;
     set_static_bool(VM_MANAGEMENT, "currentThreadCpuTimeSupport", true)?;
     set_static_bool(VM_MANAGEMENT, "otherThreadCpuTimeSupport", false)?;
-    set_static_bool(VM_MANAGEMENT, "objectMonitorUsageSupport", false)?;
-    set_static_bool(VM_MANAGEMENT, "synchronizerUsageSupport", false)?;
+    set_static_bool(VM_MANAGEMENT, "objectMonitorUsageSupport", true)?;
+    set_static_bool(VM_MANAGEMENT, "synchronizerUsageSupport", true)?;
     set_static_bool(VM_MANAGEMENT, "threadAllocatedMemorySupport", false)?;
     set_static_bool(VM_MANAGEMENT, "remoteDiagnosticCommandsSupport", false)?;
     Ok(())
@@ -153,7 +153,7 @@ pub(crate) fn zero_counter(_this: i32) -> Result<i64> {
 
 // ---- threads ----
 
-fn live_threads() -> Vec<i32> {
+pub(super) fn live_threads() -> Vec<i32> {
     threads::parker_refs()
 }
 
@@ -275,10 +275,6 @@ pub(crate) fn set_thread_contention_monitoring_enabled0(enabled: bool) -> Result
 }
 pub(crate) fn set_thread_allocated_memory_enabled0(_enabled: bool) -> Result<()> {
     Ok(())
-}
-/// No deadlock detection: reports none (null), as HotSpot does when there are none.
-pub(crate) fn find_deadlocked_threads0() -> Result<i32> {
-    Ok(0)
 }
 pub(crate) fn reset_peak_thread_count0() -> Result<()> {
     threads::PEAK_THREADS.store(live_threads().len(), Ordering::Relaxed);

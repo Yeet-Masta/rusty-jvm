@@ -200,6 +200,26 @@ impl StackFramesUtil {
         Self::resolve_trace(frames)
     }
 
+    /// The stack a blocked thread published (see `safepoint::Snapshot::frames`), in the form
+    /// [`Self::collect_current_stack`] gives for the calling thread.
+    pub(crate) fn resolve_published(
+        frames: &[crate::vm::safepoint::FrameSnapshot],
+    ) -> Result<Vec<StackElement>> {
+        Self::resolve_trace(
+            frames
+                .iter()
+                .map(|frame| {
+                    (
+                        frame.code.class_name.to_string(),
+                        frame.code.method_name.to_string(),
+                        Self::extract_line_number(&frame.code.line_numbers, frame.ex_pc),
+                        frame.bci as u16,
+                    )
+                })
+                .collect(),
+        )
+    }
+
     fn resolve_trace(frames: Vec<(String, String, u16, u16)>) -> Result<Vec<StackElement>> {
         frames
             .into_iter()

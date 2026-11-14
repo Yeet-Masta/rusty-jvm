@@ -215,6 +215,8 @@ jni_types! {
     flag_array                : ref   | i32  | jobjectArray | "[Lcom/sun/management/internal/Flag;";
     dcmd_info_array           : ref   | i32  | jobjectArray | "[Lcom/sun/management/internal/DiagnosticCommandInfo;";
     thread_array              : ref   | i32  | jobjectArray | "[Ljava/lang/Thread;";
+    stack_trace_array_array   : ref   | i32  | jobjectArray | "[[Ljava/lang/StackTraceElement;";
+    thread_info_array         : ref   | i32  | jobjectArray | "[Ljava/lang/management/ThreadInfo;";
     memory_pool_array         : ref   | i32  | jobjectArray | "[Ljava/lang/management/MemoryPoolMXBean;";
     memory_manager_array      : ref   | i32  | jobjectArray | "[Ljava/lang/management/MemoryManagerMXBean;";
     field_object_array        : ref   | i32  | jobjectArray | "[Ljava/lang/reflect/Field;";
@@ -539,6 +541,8 @@ builtin_natives! {
     "java/lang/Thread": static fn sleepNanos0(nanos: long) -> void => sn::thread::sleep_nanos0;
     "java/lang/Thread": static fn yield0() -> void => sn::thread::yield0;
     "java/lang/Thread": instance fn interrupt0() -> void => sn::thread::interrupt0;
+    "java/lang/Thread": static fn getThreads() -> thread_array => sn::management::get_threads;
+    "java/lang/Thread": static fn dumpThreads(threads: thread_array) -> stack_trace_array_array => sn::thread::dump_threads;
     "java/lang/Thread": instance fn getStackTrace0() -> object => sn::thread::get_stack_trace0; // JDK 25-26
     "java/lang/Thread": instance fn getStackTrace0() -> stack_trace_element_array => sn::thread::get_stack_trace0; // JDK 27+
     "java/lang/Thread": static fn setNativeName(name: string) -> void => sn::thread::set_native_name;
@@ -610,8 +614,10 @@ builtin_natives! {
     "sun/management/ThreadImpl": static fn setThreadCpuTimeEnabled0(enabled: boolean) -> void => sn::management::set_thread_cpu_time_enabled0;
     "sun/management/ThreadImpl": static fn setThreadContentionMonitoringEnabled0(enabled: boolean) -> void => sn::management::set_thread_contention_monitoring_enabled0;
     "sun/management/ThreadImpl": static fn setThreadAllocatedMemoryEnabled0(enabled: boolean) -> void => sn::management::set_thread_allocated_memory_enabled0;
-    "sun/management/ThreadImpl": static fn findDeadlockedThreads0() -> thread_array => sn::management::find_deadlocked_threads0;
-    "sun/management/ThreadImpl": static fn findMonitorDeadlockedThreads0() -> thread_array => sn::management::find_deadlocked_threads0;
+    "sun/management/ThreadImpl": static fn findDeadlockedThreads0() -> thread_array => sn::management_threads::find_deadlocked_threads0;
+    "sun/management/ThreadImpl": static fn findMonitorDeadlockedThreads0() -> thread_array => sn::management_threads::find_monitor_deadlocked_threads0;
+    "sun/management/ThreadImpl": static fn getThreadInfo1(ids: long_array, max_depth: int, result: thread_info_array) -> void => sn::management_threads::get_thread_info1;
+    "sun/management/ThreadImpl": static fn dumpThreads0(ids: long_array, locked_monitors: boolean, locked_synchronizers: boolean, max_depth: int) -> thread_info_array => sn::management_threads::dump_threads0;
     "sun/management/ThreadImpl": static fn resetPeakThreadCount0() -> void => sn::management::reset_peak_thread_count0;
     "sun/management/ThreadImpl": static fn resetContentionTimes0(id: long) -> void => sn::management::reset_contention_times0;
     "sun/management/HotspotThread": instance fn getInternalThreadCount() -> int => sn::management::get_internal_thread_count;

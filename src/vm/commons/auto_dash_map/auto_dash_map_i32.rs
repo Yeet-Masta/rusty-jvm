@@ -15,6 +15,12 @@ pub struct AutoDashMapI32<V> {
 }
 
 impl<V> AutoDashMapI32<V> {
+    /// Weakly consistent, like any `DashMap` iteration: entries added or removed meanwhile may
+    /// or may not be seen.
+    pub(crate) fn iter(&self) -> dashmap::iter::Iter<'_, i32, V> {
+        self.map.iter()
+    }
+
     pub(crate) fn contains_key(&self, key: i32) -> bool {
         self.map.contains_key(&key)
     }

@@ -307,11 +307,42 @@ impl JavaThread {
             }
         });
         roots.retain(|&reference| reference != 0);
-        Snapshot { roots }
+        Snapshot {
+            roots,
+            frames: None,
+        }
     }
 
-    pub(crate) fn root_monitor(reference: i32) {
-        JAVA_THREAD.with(|thread| thread.monitor_roots.borrow_mut().push(reference));
+    /// [`Self::snapshot_roots`] plus the thread's Java frames, for a thread about to block: it
+    /// cannot answer a stack dump request itself until it runs again.
+    pub(crate) fn snapshot_blocking() -> Snapshot {
+        let mut snapshot = Self::snapshot_roots();
+        snapshot.frames = Some(JAVA_THREAD.with(|thread| {
+            thread
+                .stack_frames
+                .borrow()
+                .iter()
+                .rev()
+                // SAFETY: as in `snapshot_roots`, the owner reads its own live segments.
+                .flat_map(|&segment| unsafe { &*segment }.iter().rev())
+                .map(|frame| frame.snapshot())
+                .collect()
+        }));
+        snapshot
+    }
+
+    /// Roots `reference` for a monitor acquisition and returns how many Java frames the calling
+    /// thread has, i.e. the depth of the frame taking the monitor (1 for the outermost).
+    pub(crate) fn root_monitor(reference: i32) -> usize {
+        JAVA_THREAD.with(|thread| {
+            thread.monitor_roots.borrow_mut().push(reference);
+            // SAFETY: registered segments outlive their guards (see `with_top_frames_mut`).
+            thread
+                .stack_frames
+                .borrow()
+                .last()
+                .map_or(0, |&segment| unsafe { (*segment).depth() })
+        })
     }
 
     pub(crate) fn unroot_monitor(reference: i32) {

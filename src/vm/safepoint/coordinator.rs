@@ -22,6 +22,25 @@ pub(crate) enum Reason {
 pub(crate) struct Snapshot {
     /// Owner-collected references, retained unchanged while the participant is Safe.
     pub(crate) roots: Vec<i32>,
+    /// The owner's Java frames, newest first, when it published them: a thread that blocks
+    /// does, because it will not reach a safepoint poll to answer a stack dump request.
+    pub(crate) frames: Option<Vec<FrameSnapshot>>,
+}
+
+/// One frame of a published stack: the method's shared metadata and where it was executing.
+#[derive(Debug, Clone)]
+pub(crate) struct FrameSnapshot {
+    pub(crate) code: Arc<crate::vm::stack::stack_frame::FrameCode>,
+    pub(crate) ex_pc: usize,
+    pub(crate) bci: usize,
+}
+
+/// A stack dump as the coordinator obtained it.
+pub(crate) enum Dumped {
+    /// Captured and resolved by the target at a safepoint poll (`None`: it never reached one).
+    Polled(Option<Vec<StackElement>>),
+    /// The target is blocked; these are the frames it published when it stopped running.
+    Published(Arc<Snapshot>),
 }
 
 #[derive(Debug)]
@@ -74,6 +93,17 @@ pub(crate) struct Coordinator {
     requested: AtomicBool,
 }
 
+#[cfg(test)]
+impl Dumped {
+    /// The frames of a dump answered at a safepoint poll.
+    pub(crate) fn polled(self) -> Option<Vec<StackElement>> {
+        match self {
+            Self::Polled(frames) => frames,
+            Self::Published(_) => panic!("the target published its frames"),
+        }
+    }
+}
+
 impl Coordinator {
     pub(crate) fn new() -> Self {
         Self {
@@ -110,6 +140,7 @@ impl Coordinator {
                     reason: Reason::Startup,
                     snapshot: Arc::new(Snapshot {
                         roots: vec![thread_ref],
+                        frames: None,
                     }),
                 },
             },
@@ -237,7 +268,7 @@ impl Coordinator {
         thread_ref: i32,
         roots: Snapshot,
         handoff: impl FnOnce(&[StackElement]),
-    ) -> Option<Vec<StackElement>> {
+    ) -> Dumped {
         self.park(owner, roots, Reason::Operation);
         let mut state = self.state.lock();
         while !matches!(state.phase, Phase::Open) {
@@ -247,14 +278,23 @@ impl Coordinator {
             .threads
             .iter()
             .find_map(|(&id, record)| (record.thread_ref == thread_ref).then_some(id));
-        let Some(target) = target else {
-            state
-                .threads
-                .get_mut(&owner)
-                .expect("registered owner")
-                .state = ThreadState::Running;
-            set_managed(true);
-            return None;
+        let published = target.and_then(|target| match &state.threads[&target].state {
+            ThreadState::Safe { snapshot, .. } if snapshot.frames.is_some() => {
+                Some(Arc::clone(snapshot))
+            }
+            _ => None,
+        });
+        let target = match (target, published) {
+            (Some(target), None) => target,
+            (_, published) => {
+                state
+                    .threads
+                    .get_mut(&owner)
+                    .expect("registered owner")
+                    .state = ThreadState::Running;
+                set_managed(true);
+                return published.map_or(Dumped::Polled(None), Dumped::Published);
+            }
         };
         state.next_operation = state
             .next_operation
@@ -298,7 +338,7 @@ impl Coordinator {
         self.cv.notify_all();
         drop(state);
         event(Event::Resumed);
-        result
+        Dumped::Polled(result)
     }
 
     /// An ordinary (non-pressure) [`Self::request_collection_for`]. No timeout or diagnostic

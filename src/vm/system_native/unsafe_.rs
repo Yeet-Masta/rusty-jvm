@@ -770,6 +770,9 @@ pub(crate) fn copy_swap_memory0(
 /// epoch. Backed by `std::thread` park, whose permit semantics match `LockSupport` (a prior
 /// `unpark` makes the next park return immediately). Spurious wakeups are allowed by the contract.
 pub(crate) fn park(_this: i32, is_absolute: bool, time: i64) -> Result<()> {
+    // As HotSpot's `JavaThreadParkedState`: the thread reports WAITING (or TIMED_WAITING) while
+    // parked, and each park counts as a wait.
+    let _parked = ParkedState::enter(is_absolute || time != 0);
     let _blocked = crate::vm::safepoint::Blocking::enter(crate::vm::safepoint::Reason::Blocking);
     if !is_absolute {
         if time == 0 {
@@ -790,6 +793,30 @@ pub(crate) fn park(_this: i32, is_absolute: bool, time: i64) -> Result<()> {
         }
     }
     Ok(())
+}
+
+struct ParkedState;
+
+impl ParkedState {
+    fn enter(timed: bool) -> Self {
+        if let Some(activity) = threads::current_activity() {
+            activity
+                .waited_count
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        threads::set_current_thread_status(if timed {
+            threads::thread_status::PARKED_TIMED
+        } else {
+            threads::thread_status::PARKED
+        });
+        Self
+    }
+}
+
+impl Drop for ParkedState {
+    fn drop(&mut self) {
+        threads::set_current_thread_status(threads::thread_status::RUNNABLE);
+    }
 }
 
 /// `jdk.internal.misc.Unsafe.unpark(Ljava/lang/Object;)V`

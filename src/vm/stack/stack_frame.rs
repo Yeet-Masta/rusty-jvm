@@ -343,6 +343,15 @@ impl StackFrame {
         self.pc
     }
 
+    /// What a stack trace needs of this frame, detached from the frame itself.
+    pub(crate) fn snapshot(&self) -> crate::vm::safepoint::FrameSnapshot {
+        crate::vm::safepoint::FrameSnapshot {
+            code: Arc::clone(&self.code),
+            ex_pc: self.ex_pc(),
+            bci: self.bci,
+        }
+    }
+
     /// Start pc of the instruction currently being dispatched. See the `bci` field.
     pub fn bci(&self) -> usize {
         self.bci

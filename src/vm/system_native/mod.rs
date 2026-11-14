@@ -18,6 +18,7 @@ pub(crate) mod interrupt_event;
 pub(crate) mod io_util;
 pub(crate) mod management;
 pub(crate) mod management_ext;
+pub(crate) mod management_threads;
 mod mapped_memory_utils;
 pub(crate) mod method_handle_natives;
 pub(crate) mod module;

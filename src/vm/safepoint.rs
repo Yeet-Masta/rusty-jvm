@@ -11,7 +11,7 @@ use crate::vm::stack::rooted_slots::RootedSlots;
 use crate::vm::stack::slot::Slot;
 use crate::vm::stack::stack_frames_util::{StackElement, StackFramesUtil};
 pub(crate) use blocking::{lock, wait, wait_for, Blocking, ManagedAccess};
-pub(crate) use coordinator::{Coordinator, Operation, Reason, Snapshot};
+pub(crate) use coordinator::{Coordinator, FrameSnapshot, Operation, Reason, Snapshot};
 use std::cell::Cell;
 #[cfg(test)]
 use std::cell::RefCell;
@@ -137,14 +137,29 @@ pub(crate) fn dump_stack(
     destination: &mut RootedSlots,
 ) -> Option<Vec<StackElement>> {
     let id = current()?;
-    COORDINATOR.dump(id, thread_ref, JavaThread::snapshot_roots(), |frames| {
+    let dumped = COORDINATOR.dump(id, thread_ref, JavaThread::snapshot_roots(), |frames| {
         destination.replace(
             frames
                 .iter()
                 .map(|frame| Slot::Ref(frame.class_ref()))
                 .collect(),
         );
-    })
+    });
+    match dumped {
+        coordinator::Dumped::Polled(frames) => frames,
+        coordinator::Dumped::Published(snapshot) => {
+            // Resolved here, by the requester: class mirrors are permanent, so the frames'
+            // classes need no handoff.
+            let frames = StackFramesUtil::resolve_published(snapshot.frames.as_deref()?).ok()?;
+            destination.replace(
+                frames
+                    .iter()
+                    .map(|frame| Slot::Ref(frame.class_ref()))
+                    .collect(),
+            );
+            Some(frames)
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

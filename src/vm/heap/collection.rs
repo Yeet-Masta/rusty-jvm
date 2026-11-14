@@ -33,6 +33,18 @@ impl Heap {
         Ok(entries)
     }
 
+    /// References of every plain object whose class id `wanted` accepts. A heap inspection, not
+    /// a reachability query: an object that is garbage but not yet collected is included.
+    pub(crate) fn instances_where(&self, mut wanted: impl FnMut(usize) -> bool) -> Vec<i32> {
+        self.data
+            .iter()
+            .filter_map(|entry| match entry.value() {
+                HeapValue::Object(instance) if wanted(instance.klass_id()) => Some(*entry.key()),
+                _ => None,
+            })
+            .collect()
+    }
+
     pub(crate) fn memory(&self) -> (u64, u64) {
         let admission = self.admission.lock();
         (admission.budget.max, admission.budget.used)

@@ -15,7 +15,12 @@ impl Blocking {
     pub(crate) fn enter(reason: Reason) -> Self {
         let id = current();
         if let Some(id) = id {
-            COORDINATOR.park(id, JavaThread::snapshot_roots(), reason);
+            let snapshot = if reason == Reason::Blocking {
+                JavaThread::snapshot_blocking()
+            } else {
+                JavaThread::snapshot_roots()
+            };
+            COORDINATOR.park(id, snapshot, reason);
         }
         Self {
             id,

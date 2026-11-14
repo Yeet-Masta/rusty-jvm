@@ -74,6 +74,7 @@ fn cycle(heap: &Heap, roots: &[i32], pending: &PendingList, cause: Cause) -> Res
             owner,
             Snapshot {
                 roots: roots.to_vec(),
+                frames: None,
             },
         )
         .unwrap();
@@ -528,7 +529,13 @@ fn gc_collect_scratch_high_water_tracks_current_objects_not_lifetime_keys() {
             array(&heap, "[I", &[9]);
         }
         let operation = coordinator
-            .request_collection(owner, Snapshot { roots: vec![live] })
+            .request_collection(
+                owner,
+                Snapshot {
+                    roots: vec![live],
+                    frames: None,
+                },
+            )
             .unwrap();
         let ((result, allocations), bytes) = measure_bytes(|| {
             measure(usize::MAX, || {
@@ -554,7 +561,13 @@ fn gc_collect_scratch_high_water_tracks_current_objects_not_lifetime_keys() {
         );
     }
     let operation = coordinator
-        .request_collection(owner, Snapshot { roots: vec![live] })
+        .request_collection(
+            owner,
+            Snapshot {
+                roots: vec![live],
+                frames: None,
+            },
+        )
         .unwrap();
     let (result, bytes) =
         measure_bytes(|| collect_snapshot(&heap, &[live], &pending, Cause::Explicit, &operation));
@@ -576,7 +589,13 @@ fn gc_collect_scratch_preflight_failure_leaves_heap_and_budget_unchanged() {
     let owner = coordinator.startup(0);
     coordinator.resume(owner);
     let operation = coordinator
-        .request_collection(owner, Snapshot { roots: vec![live] })
+        .request_collection(
+            owner,
+            Snapshot {
+                roots: vec![live],
+                frames: None,
+            },
+        )
         .unwrap();
     let before = heap.memory();
     let (result, _) = measure(0, || {

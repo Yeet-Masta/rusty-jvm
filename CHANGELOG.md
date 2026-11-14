@@ -7,6 +7,8 @@
 * Per-class-loader namespaces: user-defined loaders define their own copies of a class, resolve
   the classes those refer to, and may have a null parent; duplicate definitions throw `LinkageError`
 * Hidden classes are marked as such (`Class.isHidden`, nest hosts from the `NestHost` attribute)
+* `ThreadMXBean.getThreadInfo`/`dumpAllThreads` with lock owners, locked monitors and synchronizers,
+  deadlock detection, and stack traces of blocked threads (`Thread.getAllStackTraces`)
 
 # 0.6.0
 
