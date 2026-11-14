@@ -1,8 +1,10 @@
 use crate::vm::error::{Error, Result};
+use crate::vm::exception::pending_helpers::{java_exception, unsupported};
 use crate::vm::execution_engine::common::{last_frame_mut, push_typed};
 use crate::vm::execution_engine::executor::Executor;
 use crate::vm::execution_engine::invoker::{invoke, SignatureOrigin};
 use crate::vm::execution_engine::static_init::StaticInit;
+use crate::vm::execution_engine::string_pool_helper::StringPoolHelper;
 use crate::vm::heap::heap::HEAP;
 use crate::vm::helper::{klass, ref_arg_chunks, validate_arg_slots, vec_to_i64};
 use crate::vm::jni::java_thread::JavaThread;
@@ -12,13 +14,14 @@ use crate::vm::method_area::loaded_classes::CLASSES;
 use crate::vm::method_area::lookup;
 use crate::vm::method_area::method_area::with_method_area;
 use crate::vm::stack::slot::Slot;
+use crate::vm::stack::stack_value::StackValueKind;
 use crate::vm::system_native::method_handle_natives::member_name::MemberName;
 use crate::vm::system_native::method_handle_natives::method_type::MethodType;
 use crate::vm::system_native::method_handle_natives::offsets::{
     get_field_offset, get_static_field_offset,
 };
 use crate::vm::system_native::method_handle_natives::types::ReferenceKind::*;
-use jdescriptor::TypeDescriptor;
+use jdescriptor::{MethodDescriptor, TypeDescriptor};
 use once_cell::sync::Lazy;
 use std::env;
 use std::sync::Arc;
@@ -32,6 +35,69 @@ const SIMPLE_METHOD_HANDLE: &str = "java/lang/invoke/SimpleMethodHandle";
 
 static DEBUG_SPECIES_PRINTING: Lazy<bool> =
     Lazy::new(|| env::var("DEBUG_SPECIES_PRINTING").is_ok());
+
+/// `MethodHandle.invoke`: like `invokeExact`, but a handle whose type differs from the call site's
+/// is first adapted with `asType(callSiteType)`, which boxes, unboxes, widens, casts and drops the
+/// result as HotSpot's generic invoker does (`Invokers.checkGenericType`).
+pub(crate) fn invoke_with_call_site_type(
+    handle_ref: i32,
+    method_args: &[Slot],
+    call_site: &MethodDescriptor,
+) -> Result<()> {
+    if handle_ref == 0 {
+        return Err(java_exception(
+            "java/lang/NullPointerException",
+            "Cannot invoke \"java.lang.invoke.MethodHandle.invoke\" because the handle is null",
+        ));
+    }
+    let handle_name = HEAP.get_instance_name(handle_ref)?;
+    if handle_name == MUTABLE_CALL_SITE {
+        return invoke_exact(handle_ref, method_args);
+    }
+    let type_ref =
+        HEAP.get_object_field_value(handle_ref, "java/lang/invoke/MethodHandle", "type")?[0];
+    if MethodType::new(type_ref)?.descriptor()? == *call_site {
+        return invoke_exact(handle_ref, method_args);
+    }
+
+    let mut roots = JavaThread::hold_temp_roots(method_args.to_vec());
+    roots.add_root(Slot::Ref(handle_ref));
+    let call_site_type = method_type_for(call_site)?;
+    roots.add_root(Slot::Ref(call_site_type));
+    let adapted = Executor::invoke_non_static_method(
+        "java/lang/invoke/MethodHandle",
+        "asType:(Ljava/lang/invoke/MethodType;)Ljava/lang/invoke/MethodHandle;",
+        handle_ref,
+        &[StackValueKind::Ref(call_site_type)],
+    )?;
+    let adapted = adapted
+        .first()
+        .map(|slot| slot.value())
+        .ok_or_else(|| Error::new_execution("MethodHandle.asType returned nothing"))?;
+    roots.add_root(Slot::Ref(adapted));
+    invoke_exact(adapted, method_args)
+}
+
+/// A `java.lang.invoke.MethodType` for `descriptor`, resolving its classes through the system
+/// class loader so application types at the call site resolve.
+fn method_type_for(descriptor: &MethodDescriptor) -> Result<i32> {
+    let loader = Executor::invoke_static_method(
+        "java/lang/ClassLoader",
+        "getSystemClassLoader:()Ljava/lang/ClassLoader;",
+        &[],
+    )?;
+    let loader = loader.first().map(|slot| slot.value()).unwrap_or(0);
+    let _loader_root = JavaThread::hold_temp_roots(vec![Slot::Ref(loader)]);
+    let descriptor = StringPoolHelper::create_string(&descriptor.to_string())?;
+    let method_type = Executor::invoke_static_method(
+        "java/lang/invoke/MethodType",
+        "fromMethodDescriptorString:(Ljava/lang/String;Ljava/lang/ClassLoader;)Ljava/lang/invoke/MethodType;",
+        &[StackValueKind::Ref(descriptor[0].value()), StackValueKind::Ref(loader)],
+    )?;
+    method_type.first().map(|slot| slot.value()).ok_or_else(|| {
+        Error::new_execution("MethodType.fromMethodDescriptorString returned nothing")
+    })
+}
 
 pub fn invoke_exact(handle_ref: i32, method_args: &[Slot]) -> Result<()> {
     let mut roots = JavaThread::hold_temp_roots(method_args.to_vec());
@@ -56,7 +122,9 @@ pub fn invoke_exact(handle_ref: i32, method_args: &[Slot]) -> Result<()> {
         return mutable_call_site_invocation(handle_ref, method_args, &handle_name);
     }
 
-    unimplemented!("invoke_exact: handle: {} is not supported", handle_name)
+    Err(unsupported(&format!(
+        "MethodHandle.invokeExact: handle type {handle_name} is not supported"
+    )))
 }
 
 fn direct_method_handle_invocation(
@@ -76,14 +144,32 @@ fn direct_method_handle_invocation(
     }
 
     match reference_kind {
-        REF_invokeVirtual | REF_invokeStatic | REF_invokeSpecial | REF_newInvokeSpecial => {
+        REF_newInvokeSpecial => {
+            // `DirectMethodHandle$Constructor` allocates its `instanceClass`, which differs from
+            // the constructor's class for serialization constructors (an `ArrayList` built with
+            // the constructor of its first non-serializable superclass).
+            let instance_class =
+                if handle_name == "java/lang/invoke/DirectMethodHandle$Constructor" {
+                    let class_ref =
+                        HEAP.get_object_field_value(handle_ref, handle_name, "instanceClass")?[0];
+                    (class_ref != 0)
+                        .then(|| klass(class_ref).map(|class| class.this_class_name().to_owned()))
+                        .transpose()?
+                } else {
+                    None
+                };
+            if let Some(instance_class) = &instance_class {
+                StaticInit::initialize(instance_class)?;
+            }
+            invoke_exact_method_allocating(&member_name, method_args, instance_class.as_deref())
+        }
+        REF_invokeVirtual | REF_invokeInterface | REF_invokeStatic | REF_invokeSpecial => {
             invoke_exact_method(&member_name, method_args)
         }
         REF_getField => invoke_exact_get_field(&member_name, method_args),
         REF_putField => invoke_exact_put_field(&member_name, method_args),
         REF_getStatic => invoke_exact_get_static_field(&member_name, method_args),
         REF_putStatic => invoke_exact_put_static_field(&member_name, method_args),
-        REF_invokeInterface => unimplemented!("reference_kind: {:?}", reference_kind),
     }
 }
 
@@ -117,9 +203,11 @@ fn bound_method_handle_invocation(
     let method_to_invoke = klass
         .get_methods()
         .find_map(|(_, m)| (m.name_signature() == full_method_signature).then(|| Arc::clone(m)))
-        .ok_or(Error::new_execution(&format!(
-            "bound_method_handle_invocation: {full_method_signature} not found"
-        )))?;
+        .ok_or_else(|| {
+            Error::new_execution(&format!(
+                "bound_method_handle_invocation: {full_method_signature} not found"
+            ))
+        })?;
 
     let mut new_args = Vec::new();
     new_args.push(Slot::Ref(handle_ref));
@@ -168,7 +256,10 @@ fn print_species(handle_ref: i32, indent: usize) -> Result<()> {
                     let long = vec_to_i64(&raw);
                     eprintln!("{ind}  long={long}")
                 }
-                _ => todo!("print_species: handle_name: {handle_name} type: {type_} is not implemented yet"),
+                _ => {
+                    let raw = HEAP.get_object_field_value(handle_ref, &handle_name, &c)?;
+                    eprintln!("{ind}  {type_}={raw:?}")
+                }
             }
         }
     } else if handle_name == "java/lang/invoke/MethodType" {
@@ -185,10 +276,7 @@ fn print_species(handle_ref: i32, indent: usize) -> Result<()> {
             Executor::invoke_non_static_method(&handle_name, "getTarget", handle_ref, &[])?;
         print_species(target[0].value(), indent + 1)?;
     } else {
-        unimplemented!(
-            "print_species: handle_name: {} is not supported",
-            handle_name
-        );
+        eprintln!("{ind}  (no species details for {handle_name})");
     }
 
     Ok(())
@@ -205,6 +293,14 @@ fn mutable_call_site_invocation(
 }
 
 fn invoke_exact_method(member_name: &MemberName, method_args: &[Slot]) -> Result<()> {
+    invoke_exact_method_allocating(member_name, method_args, None)
+}
+
+fn invoke_exact_method_allocating(
+    member_name: &MemberName,
+    method_args: &[Slot],
+    instance_class: Option<&str>,
+) -> Result<()> {
     let effective_type = MethodType::new(member_name.type_obj_ref())?.descriptor()?;
     let (resolved_class_name, resolved_method_to_invoke) = extract_resolved(member_name)?;
 
@@ -212,10 +308,21 @@ fn invoke_exact_method(member_name: &MemberName, method_args: &[Slot]) -> Result
     // todo: merge me with opcodes logic including proper exception handling
     // todo: cover functionality below with test within MethodHandleExample
     let (method_to_invoke, method_args) = match reference_kind {
-        REF_invokeVirtual => {
+        // Interface dispatch selects the implementation from the receiver's class exactly like
+        // virtual dispatch (JVMS 5.4.6), including default methods.
+        REF_invokeVirtual | REF_invokeInterface => {
             let reference = method_args
                 .first()
                 .ok_or_else(|| Error::new_execution("Error getting reference from method_args"))?;
+            if reference.value() == 0 {
+                return Err(java_exception(
+                    "java/lang/NullPointerException",
+                    &format!(
+                        "Cannot invoke \"{}\" because the receiver is null",
+                        member_name.name()
+                    ),
+                ));
+            }
             let instance_type_class_name = HEAP.get_instance_name(reference.value())?;
 
             let type_obj_ref = member_name.type_obj_ref();
@@ -243,12 +350,9 @@ fn invoke_exact_method(member_name: &MemberName, method_args: &[Slot]) -> Result
             Arc::clone(&resolved_method_to_invoke),
             method_args.to_owned(),
         ),
-        REF_invokeInterface => {
-            todo!()
-        }
         REF_newInvokeSpecial => (
             Arc::clone(&resolved_method_to_invoke),
-            mimic_new(&resolved_class_name, method_args)?,
+            mimic_new(instance_class.unwrap_or(&resolved_class_name), method_args)?,
         ),
         REF_getField | REF_putField | REF_getStatic | REF_putStatic => {
             unreachable!(

@@ -5,7 +5,7 @@ use crate::vm::heap::heap::HEAP;
 use crate::vm::helper::{clazz_ref, ref_arg_chunks, undecorate};
 use crate::vm::jni::java_thread::JavaThread;
 use crate::vm::stack::slot::Slot;
-use crate::vm::stack::stack_frame::{ExceptionTable, StackFrame};
+use crate::vm::stack::stack_frame::{ExceptionTable, FrameCode, StackFrame};
 use crate::vm::stack::stack_value::StackValueKind;
 use derive_new::new;
 use getset::{CopyGetters, Getters};
@@ -32,8 +32,14 @@ pub(crate) struct JavaMethod {
     annotations_raw: Option<Vec<u8>>,
     runtime_visible_annotations: HashSet<String>,
     slot: i32,
+    /// Generic signature (`Signature` attribute) reported to reflection, if any.
+    generic_signature: Option<String>,
+    /// `MethodParameters` entries as `(name, access_flags)`; `None` without that attribute.
+    parameters: Option<Vec<(Option<String>, u16)>>,
     /// Which of this method's argument chunks are references — see [`JavaMethod::arg_ref_chunks`].
     arg_ref_chunks: OnceCell<Vec<bool>>,
+    /// Shared metadata for this method's frames, built on first call (after `with_class_name`).
+    frame_code: OnceCell<Arc<FrameCode>>,
 }
 
 #[derive(Debug, new, Getters, CopyGetters)]
@@ -55,6 +61,13 @@ pub(crate) struct CodeContext {
 }
 
 impl JavaMethod {
+    /// Replaces the class-name handle with one shared by the whole class.
+    pub(crate) fn with_class_name(mut self, class_name: Arc<String>) -> Self {
+        debug_assert_eq!(*self.class_name, *class_name);
+        self.class_name = class_name;
+        self
+    }
+
     pub fn new(
         method_descriptor: MethodDescriptor,
         class_name: &str,
@@ -83,26 +96,55 @@ impl JavaMethod {
             annotations_raw,
             runtime_visible_annotations,
             slot,
+            generic_signature: None,
+            parameters: None,
             arg_ref_chunks: OnceCell::new(),
+            frame_code: OnceCell::new(),
         }
     }
 
+    /// Attaches the reflection-only metadata that the interpreter itself never reads.
+    pub(crate) fn with_reflection_metadata(
+        mut self,
+        generic_signature: Option<String>,
+        parameters: Option<Vec<(Option<String>, u16)>>,
+    ) -> Self {
+        self.generic_signature = generic_signature;
+        self.parameters = parameters;
+        self
+    }
+
+    /// Index of this method in its class's method table (`Method.slot`, `vmtarget`).
+    pub(crate) fn slot(&self) -> i32 {
+        self.slot
+    }
+
+    /// `MethodParameters` entries as `(name, access_flags)`, or `None` without that attribute.
+    pub(crate) fn parameters(&self) -> Option<&[(Option<String>, u16)]> {
+        self.parameters.as_deref()
+    }
+
     pub fn new_stack_frame(&self) -> Result<StackFrame> {
-        let mut frame = match &self.code_context {
-            Some(context) => Ok(StackFrame::new(
-                Arc::clone(&self.name_signature),
-                context.max_locals() as usize,
-                context.max_stack() as usize,
-                Arc::clone(context.bytecode()),
-                Arc::clone(&self.class_name),
-                Arc::clone(context.line_numbers()),
-                Arc::clone(context.exception_table()),
-            )),
-            None => Err(Error::new_execution(&format!(
+        let context = self.code_context.as_ref().ok_or_else(|| {
+            Error::new_execution(&format!(
                 "Code context is missing for {}.{}",
                 self.class_name, self.name_signature
-            ))),
-        }?;
+            ))
+        })?;
+        let code = self.frame_code.get_or_init(|| {
+            Arc::new(FrameCode {
+                method_name: Arc::clone(&self.name_signature),
+                bytecode: Arc::clone(context.bytecode()),
+                class_name: Arc::clone(&self.class_name),
+                line_numbers: Arc::clone(context.line_numbers()),
+                exception_table: Arc::clone(context.exception_table()),
+            })
+        });
+        let mut frame = StackFrame::from_code(
+            Arc::clone(code),
+            context.max_locals() as usize,
+            context.max_stack() as usize,
+        );
         frame.set_synchronized_method(self.is_synchronized(), self.is_static());
         Ok(frame)
     }
@@ -111,11 +153,13 @@ impl JavaMethod {
     /// chain while it executes (native methods carry no `code_context`, hence no `new_stack_frame`),
     /// holding `args` so its reference arguments stay visible as roots for the duration.
     pub fn new_native_stack_frame(&self, args: Vec<Slot>) -> StackFrame {
-        StackFrame::new_native(
-            Arc::clone(&self.name_signature),
-            Arc::clone(&self.class_name),
-            args,
-        )
+        let code = self.frame_code.get_or_init(|| {
+            Arc::new(FrameCode::native(
+                Arc::clone(&self.name_signature),
+                Arc::clone(&self.class_name),
+            ))
+        });
+        StackFrame::native_from_code(Arc::clone(code), args)
     }
 
     pub fn get_method_descriptor(&self) -> &MethodDescriptor {
@@ -225,7 +269,13 @@ impl JavaMethod {
 
         let slot = self.slot;
 
-        let signature_ref = StringPoolHelper::get_string(name_signature_split.next().unwrap())?;
+        // `Executable.signature` is the *generic* signature (null when there is none), not the
+        // erased descriptor: `getGenericReturnType()` etc. parse it.
+        let _ = name_signature_split.next();
+        let signature_ref = match self.generic_signature.as_deref() {
+            Some(signature) => StringPoolHelper::get_string(signature)?,
+            None => 0,
+        };
         roots.add_root(Slot::Ref(signature_ref));
 
         let annotations = match self.annotations_raw.as_deref() {
@@ -322,7 +372,13 @@ impl JavaMethod {
 
         let slot = self.slot;
 
-        let signature_ref = StringPoolHelper::get_string(name_signature_split.next().unwrap())?;
+        // `Executable.signature` is the *generic* signature (null when there is none), not the
+        // erased descriptor: `getGenericReturnType()` etc. parse it.
+        let _ = name_signature_split.next();
+        let signature_ref = match self.generic_signature.as_deref() {
+            Some(signature) => StringPoolHelper::get_string(signature)?,
+            None => 0,
+        };
         roots.add_root(Slot::Ref(signature_ref));
 
         let annotations = match self.annotations_raw.as_deref() {

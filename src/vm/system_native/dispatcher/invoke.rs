@@ -16,14 +16,19 @@ use crate::vm::system_native::dispatcher::args::build_args;
 use crate::vm::system_native::dispatcher::builtin_natives::find_builtin_native;
 use crate::vm::system_native::dispatcher::cif_cache::get_cif;
 use crate::vm::system_native::dispatcher::utils::get_symbol_address;
+use crate::vm::system_native::native_libraries::find_libjava_symbol;
 use jdescriptor::{MethodDescriptor, TypeDescriptor};
 use jni_sys::jobject;
 use libffi::high::CodePtr;
 use libffi::middle::{Arg, Cif};
 use std::ffi::c_void;
 
+/// `method_signature` names the class that declares the native (`class:method:descriptor`), which
+/// is what JNI symbol names use. Built-ins may also be registered under `call_site_class`, the
+/// class the invoke instruction named, which is tried second.
 pub(crate) fn invoke(
     method_signature: &str,
+    call_site_class: &str,
     args: &[Slot],
     is_static: bool,
     destination: &mut RootedSlots,
@@ -67,7 +72,11 @@ pub(crate) fn invoke(
             set_pending_unsatisfied_link_error_without_message()?;
             return Ok(());
         }
-        None => match find_builtin_native(method_signature) {
+        None => match find_builtin_native(method_signature).or_else(|| {
+            (call_site_class != class_name)
+                .then(|| find_builtin_native(&format!("{call_site_class}:{name_signature}")))
+                .flatten()
+        }) {
             Some(address) => (address, false),
             None => {
                 let address = resolve_library_symbol(clazz_ref, &short_name, &long_name)?;
@@ -112,6 +121,20 @@ pub(crate) fn invoke(
         NativeReturn::Slots(raw) => raw,
     };
     destination.replace(typed_slots(method_descriptor.return_type(), &raw)?);
+    if !external && method_name == "initIDs" && method_descriptor.parameter_types().is_empty() {
+        // A built-in `initIDs` caches nothing for the JDK library that implements the class's other
+        // natives; run the library's own so those natives find their field and method IDs.
+        if let Ok(address) = resolve_library_symbol(clazz_ref, &short_name, &long_name) {
+            let init: extern "system" fn(*mut jni_sys::JNIEnv, jobject) =
+                unsafe { std::mem::transmute(address as usize) };
+            let env = get_jni_env();
+            let _native = Blocking::enter(Reason::Native);
+            init(env, clazz_handle);
+        }
+        if JavaThread::get_pending_exception().is_some() {
+            return Ok(());
+        }
+    }
     crate::vm::safepoint::poll();
     crate::vm::gc::trigger::at_safepoint();
     Ok(())
@@ -135,11 +158,21 @@ fn resolve_library_symbol(clazz_ref: i32, short_name: &str, long_name: &str) -> 
 
     match get_symbol_address(long_name, native_libraries_ref)? {
         Some(v) => Ok(v),
-        None => get_symbol_address(short_name, native_libraries_ref)?.ok_or_else(|| {
-            Error::new_native(&format!(
+        None => get_symbol_address(short_name, native_libraries_ref)?
+            .or_else(|| {
+                // Boot classes whose natives live in `libjava`, which no Java code loads.
+                (class_loader[0].value() == 0)
+                    .then(|| {
+                        find_libjava_symbol(long_name).or_else(|| find_libjava_symbol(short_name))
+                    })
+                    .flatten()
+                    .map(|address| address as i64)
+            })
+            .ok_or_else(|| {
+                Error::new_native(&format!(
                 "Failed to find symbol for both short and long names: {short_name}, {long_name}"
             ))
-        }),
+            }),
     }
 }
 

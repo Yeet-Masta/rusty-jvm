@@ -264,6 +264,11 @@ pub struct MethodModel {
     pub annotation_default_raw: Option<Vec<u8>>,
     pub annotations_raw: Option<Vec<u8>>,
     pub runtime_visible_annotations: HashSet<String>,
+    /// Generic signature from the `Signature` attribute, if any.
+    pub generic_signature: Option<String>,
+    /// Whether the method carries a `MethodParameters` attribute at all (`parameters` may then
+    /// still be empty for a no-arg method).
+    pub has_parameters_attribute: bool,
 }
 
 /// A formal parameter from the `MethodParameters` attribute (JVMS §4.7.24).
@@ -353,6 +358,8 @@ impl MethodModel {
             })
             .collect::<Result<Vec<String>>>()?;
 
+        let generic_signature = attributes.get_signature(constant_pool)?;
+        let has_parameters_attribute = attributes.get_method_parameter_records().is_some();
         let parameters = attributes
             .get_method_parameter_records()
             .unwrap_or_default()
@@ -390,6 +397,8 @@ impl MethodModel {
             annotation_default_raw: attributes.get_annotation_default_raw(),
             annotations_raw,
             runtime_visible_annotations,
+            generic_signature,
+            has_parameters_attribute,
         })
     }
 

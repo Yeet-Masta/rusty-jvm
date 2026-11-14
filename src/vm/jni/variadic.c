@@ -6,6 +6,7 @@
  * and delegates to the corresponding Call<Type>MethodA entry point.
  */
 #include <stdarg.h>
+#include <stddef.h>
 #include <stdint.h>
 
 /*

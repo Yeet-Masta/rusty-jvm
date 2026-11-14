@@ -43,6 +43,13 @@ static NON_DAEMON_THREADS: LazyLock<Mutex<Vec<JoinHandle<()>>>> =
 /// termination.
 static PARKERS: LazyLock<DashMap<i32, std::thread::Thread>> = LazyLock::new(DashMap::new);
 
+/// Threads ever started (for `ThreadMXBean.getTotalStartedThreadCount`).
+pub(crate) static STARTED_THREADS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+/// Most threads alive at once (for `ThreadMXBean.getPeakThreadCount`).
+pub(crate) static PEAK_THREADS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
 /// Keys are retained until exit; no parker guard spans a Safe transition.
 pub(crate) fn parker_refs() -> Vec<i32> {
     PARKERS.iter().map(|entry| *entry.key()).collect()
@@ -89,6 +96,8 @@ pub(crate) fn set_current_thread_status(status: i32) {
 /// child starts running, so an `unpark` that races ahead of the child's first `park` is never lost.
 pub(crate) fn register_parker(thread_ref: i32, handle: std::thread::Thread) {
     PARKERS.insert(thread_ref, handle);
+    STARTED_THREADS.fetch_add(1, Ordering::Relaxed);
+    PEAK_THREADS.fetch_max(PARKERS.len(), Ordering::Relaxed);
 }
 
 /// Drops the parker mapping for a terminated thread.

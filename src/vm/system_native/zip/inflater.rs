@@ -3,6 +3,7 @@ use crate::vm::commons::auto_dash_map::auto_dash_map_i64::AutoDashMapI64;
 use crate::vm::error::{Error, Result};
 use crate::vm::heap::heap::HEAP;
 use crate::vm::system_native::zip::common::DEFAULT_WINDOW_BITS;
+use crate::vm::system_native::zip::crc32::{native_bytes, native_bytes_mut};
 use miniz_oxide::inflate::stream::{inflate, InflateState};
 use miniz_oxide::{DataFormat, MZError, MZFlush, MZStatus, StreamResult};
 use std::sync::LazyLock;
@@ -40,31 +41,105 @@ pub(crate) fn inflate_bytes_bytes(
     output_off: i32,
     output_len: i32,
 ) -> Result<i64> {
-    let input = {
-        let input_array = HEAP.get_entire_raw_data(input_array_ref)?;
-        input_array[input_off as usize..(input_off + input_len) as usize].to_vec()
-    };
-
+    let input = heap_bytes(input_array_ref, input_off, input_len)?;
     let mut output = vec![0; output_len as usize];
+    let (status, written) = run(addr, &input, &mut output)?;
+    store_heap_bytes(output_array_ref, output_off, &output[..written])?;
+    Ok(status)
+}
+
+/// `java.util.zip.Inflater.inflateBytesBuffer(J[BIIJI)J`
+pub(crate) fn inflate_bytes_buffer(
+    _this: i32,
+    addr: i64,
+    input_array_ref: i32,
+    input_off: i32,
+    input_len: i32,
+    output_address: i64,
+    output_len: i32,
+) -> Result<i64> {
+    let input = heap_bytes(input_array_ref, input_off, input_len)?;
+    Ok(run(addr, &input, native_bytes_mut(output_address, output_len))?.0)
+}
+
+/// `java.util.zip.Inflater.inflateBufferBytes(JJI[BII)J`
+pub(crate) fn inflate_buffer_bytes(
+    _this: i32,
+    addr: i64,
+    input_address: i64,
+    input_len: i32,
+    output_array_ref: i32,
+    output_off: i32,
+    output_len: i32,
+) -> Result<i64> {
+    let input = native_bytes(input_address, 0, input_len);
+    let mut output = vec![0; output_len as usize];
+    let (status, written) = run(addr, input, &mut output)?;
+    store_heap_bytes(output_array_ref, output_off, &output[..written])?;
+    Ok(status)
+}
+
+/// `java.util.zip.Inflater.inflateBufferBuffer(JJIJI)J`
+pub(crate) fn inflate_buffer_buffer(
+    _this: i32,
+    addr: i64,
+    input_address: i64,
+    input_len: i32,
+    output_address: i64,
+    output_len: i32,
+) -> Result<i64> {
+    let input = native_bytes(input_address, 0, input_len);
+    Ok(run(addr, input, native_bytes_mut(output_address, output_len))?.0)
+}
+
+/// `java.util.zip.Inflater.getAdler(J)I`
+pub(crate) fn get_adler(addr: i64) -> Result<i32> {
+    let mut entry = REGISTRY.get_mut(addr).ok_or_else(|| missing(addr))?;
+    Ok(entry.value_mut().0.decompressor().adler32().unwrap_or(1) as i32)
+}
+
+/// `java.util.zip.Inflater.setDictionary(J[BII)V`: the miniz_oxide inflater has no preset
+/// dictionary support.
+pub(crate) fn set_dictionary(_addr: i64, _array: i32, _off: i32, _len: i32) -> Result<()> {
+    Err(crate::vm::exception::pending_helpers::java_exception(
+        "java/lang/UnsupportedOperationException",
+        "Inflater preset dictionaries are not supported by rusty-jvm",
+    ))
+}
+
+/// `java.util.zip.Inflater.setDictionaryBuffer(JJI)V`
+pub(crate) fn set_dictionary_buffer(addr: i64, _address: i64, len: i32) -> Result<()> {
+    set_dictionary(addr, 0, 0, len)
+}
+
+fn missing(addr: i64) -> Error {
+    Error::new_execution(&format!(
+        "Inflater not found in registry for address: {addr}"
+    ))
+}
+
+fn heap_bytes(array: i32, off: i32, len: i32) -> Result<Vec<u8>> {
+    Ok(HEAP.get_entire_raw_data(array)?[off as usize..(off + len) as usize].to_vec())
+}
+
+fn store_heap_bytes(array: i32, off: i32, data: &[u8]) -> Result<()> {
+    HEAP.get_entire_raw_data_mut(array)?[off as usize..off as usize + data.len()]
+        .copy_from_slice(data);
+    Ok(())
+}
+
+fn run(addr: i64, input: &[u8], output: &mut [u8]) -> Result<(i64, usize)> {
     let stream_result = crate::vm::safepoint::blocking(|| {
-        let mut entry = REGISTRY.get_mut(addr).ok_or_else(|| {
-            Error::new_execution(&format!(
-                "Inflater not found in registry for address: {addr}"
-            ))
-        })?;
+        let mut entry = REGISTRY.get_mut(addr).ok_or_else(|| missing(addr))?;
         Ok::<_, Error>(inflate(
             &mut entry.value_mut().0,
-            &input,
-            &mut output,
+            input,
+            output,
             MZFlush::Sync,
         ))
     })?;
     let written = stream_result.bytes_written;
-    HEAP.get_entire_raw_data_mut(output_array_ref)?
-        [output_off as usize..output_off as usize + written]
-        .copy_from_slice(&output[..written]);
-
-    check_inflate_status(stream_result)
+    Ok((check_inflate_status(stream_result)?, written))
 }
 
 fn check_inflate_status(stream_result: StreamResult) -> Result<i64> {

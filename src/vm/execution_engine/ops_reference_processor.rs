@@ -9,6 +9,8 @@ use crate::vm::execution_engine::static_init::StaticInit;
 use crate::vm::heap::heap::HEAP;
 use crate::vm::helper::{argument_length, get_length};
 use crate::vm::method_area::instance_checker::InstanceChecker;
+use crate::vm::method_area::java_class::{JavaClass, MemberRef, MemberRefKind};
+use crate::vm::method_area::java_method::JavaMethod;
 use crate::vm::method_area::loaded_classes::CLASSES;
 use crate::vm::method_area::lookup;
 use crate::vm::method_area::method_area::with_method_area;
@@ -16,7 +18,7 @@ use crate::vm::monitor;
 use crate::vm::stack::rooted_slots::RootedSlots;
 use crate::vm::stack::slot::Slot;
 use crate::vm::stack::stack_frame::{StackFrame, StackFrames};
-use jclassmodel::constant_pool::{ConstantPool, ConstantPoolLookup};
+use jclassmodel::constant_pool::ConstantPoolLookup;
 use jdescriptor::MethodDescriptor;
 use std::sync::Arc;
 use tracing::trace;
@@ -24,12 +26,14 @@ use tracing::trace;
 pub(crate) fn process(
     code: u8,
     current_class_name: &str,
+    current_class: &Arc<JavaClass>,
     stack_frames: &mut StackFrames,
 ) -> Result<()> {
     match code {
         GETSTATIC => {
             let stack_frame = last_frame_mut(stack_frames)?;
-            let (class_name, field_name) = get_field_info(stack_frame, current_class_name)?;
+            let field = get_field_info(stack_frame, current_class)?;
+            let (class_name, field_name) = (&field.class_name, &field.name);
 
             let (fields_class_name, field) =
                 lookup::lookup_for_static_field(&class_name, &field_name)?.ok_or_else(|| {
@@ -43,7 +47,7 @@ pub(crate) fn process(
             let klass = CLASSES.get(&fields_class_name)?;
             let field_info = klass
                 .field_info(&field_name)
-                .ok_or(Error::new_execution("Error getting field info"))?;
+                .ok_or_else(|| Error::new_execution("Error getting field info"))?;
             push_typed(
                 stack_frame,
                 field_info.type_descriptor(),
@@ -58,7 +62,8 @@ pub(crate) fn process(
         }
         PUTSTATIC => {
             let stack_frame = last_frame_mut(stack_frames)?;
-            let (class_name, field_name) = get_field_info(stack_frame, current_class_name)?;
+            let field = get_field_info(stack_frame, current_class)?;
+            let (class_name, field_name) = (&field.class_name, &field.name);
 
             let (fields_class_name, field_value) =
                 lookup::lookup_for_static_field(&class_name, &field_name)?.ok_or_else(|| {
@@ -70,7 +75,7 @@ pub(crate) fn process(
             let klass = CLASSES.get(&fields_class_name)?;
             let field_info = klass
                 .field_info(&field_name)
-                .ok_or(Error::new_execution("Error getting field info"))?;
+                .ok_or_else(|| Error::new_execution("Error getting field info"))?;
             let len = get_length(field_info.type_descriptor())?;
 
             StaticInit::initialize(&fields_class_name)?;
@@ -86,9 +91,11 @@ pub(crate) fn process(
             trace!("PUTSTATIC -> {class_name}.{field_name} = {value:?}");
         }
         GETFIELD => {
+            let field;
             let (class_name, field_name, type_descriptor, objectref) = {
                 let stack_frame = last_frame_mut(stack_frames)?;
-                let (class_name, field_name) = get_field_info(stack_frame, current_class_name)?;
+                field = get_field_info(stack_frame, current_class)?;
+                let (class_name, field_name) = (&field.class_name, &field.name);
                 // Metadata lookup can wait for class publication and cross a GC stop.
                 // Keep the receiver on the frame until it completes, and do not
                 // leave the raw field result unrooted across another lookup.
@@ -121,7 +128,8 @@ pub(crate) fn process(
         }
         PUTFIELD => {
             let stack_frame = last_frame_mut(stack_frames)?;
-            let (class_name, field_name) = get_field_info(stack_frame, current_class_name)?;
+            let field = get_field_info(stack_frame, current_class)?;
+            let (class_name, field_name) = (&field.class_name, &field.name);
             let type_descriptor = lookup::lookup_for_field_descriptor(&class_name, &field_name)
                 .ok_or_else(|| {
                     Error::new_constant_pool(&format!(
@@ -149,14 +157,12 @@ pub(crate) fn process(
         }
         INVOKEVIRTUAL => {
             store_ex_pc(stack_frames)?;
-            let (class_name_by_ref_type, full_signature, method_signature) =
-                get_class_name_and_signature(
-                    stack_frames,
-                    current_class_name,
-                    ConstantPool::get_full_method_info,
-                )?;
-            let method_descriptor = method_signature.parse()?;
-            let method_args = prepare_invoke_context(stack_frames, &method_descriptor, true)?;
+            let member =
+                get_class_name_and_signature(stack_frames, current_class, MemberRefKind::Method)?;
+            let (class_name_by_ref_type, full_signature) =
+                (&member.class_name, &member.full_signature);
+            let method_args =
+                prepare_invoke_context(stack_frames, member.method_descriptor()?, true)?;
             let reference = method_args
                 .first()
                 .ok_or_else(|| Error::new_execution("Error getting reference from method_args"))?;
@@ -166,16 +172,8 @@ pub(crate) fn process(
                 return Ok(());
             }
 
-            let class_name_by_instance = HEAP.get_instance_name(reference.value())?;
-
             let exact_implementation =
-                lookup::lookup_instance_method(&class_name_by_instance, &full_signature)?.ok_or_else(
-                    || {
-                        Error::new_constant_pool(&format!(
-                    "Error getting instance type JavaMethod by class name {class_name_by_instance} and full signature {full_signature} getting virtual_method"
-                ))
-                    },
-                )?;
+                virtual_target(member, reference.value(), "virtual_method")?;
 
             let class_name = exact_implementation.class_name();
             invoke(
@@ -190,14 +188,18 @@ pub(crate) fn process(
         }
         INVOKESPECIAL => {
             store_ex_pc(stack_frames)?;
-            let (class_name_to_start_lookup_from, full_signature, _) =
-                get_class_name_and_signature(
-                    stack_frames,
-                    current_class_name,
-                    ConstantPool::get_full_method_info,
-                )?;
-            let java_method = lookup::lookup_instance_method(&class_name_to_start_lookup_from, &full_signature)?
-                .ok_or_else(|| Error::new_constant_pool(&format!("Error getting instance type JavaMethod by class name {class_name_to_start_lookup_from} and full signature {full_signature} calling invokespecial")))?;
+            let member =
+                get_class_name_and_signature(stack_frames, current_class, MemberRefKind::Method)?;
+            let (class_name_to_start_lookup_from, full_signature) =
+                (&member.class_name, &member.full_signature);
+            let java_method = match member.special_target.get() {
+                Some(cached) => Arc::clone(cached),
+                None => {
+                    let resolved = lookup::lookup_instance_method(&class_name_to_start_lookup_from, &full_signature)?
+                        .ok_or_else(|| Error::new_constant_pool(&format!("Error getting instance type JavaMethod by class name {class_name_to_start_lookup_from} and full signature {full_signature} calling invokespecial")))?;
+                    Arc::clone(member.special_target.get_or_init(|| resolved))
+                }
+            };
             let method_args =
                 prepare_invoke_context(stack_frames, java_method.get_method_descriptor(), true)?;
             let class_name = java_method.class_name();
@@ -213,16 +215,25 @@ pub(crate) fn process(
         }
         INVOKESTATIC => {
             store_ex_pc(stack_frames)?;
-            let (class_name_to_start_lookup_from, full_signature, _) =
-                get_class_name_and_signature(
-                    stack_frames,
-                    current_class_name,
-                    ConstantPool::get_full_method_info,
-                )?;
-            let klass = CLASSES.get(&class_name_to_start_lookup_from)?;
-            StaticInit::initialize_java_class(&klass)?;
-            let java_method = lookup::lookup_static_method(&class_name_to_start_lookup_from, &full_signature)?
-                .ok_or_else(|| Error::new_constant_pool(&format!("Error getting static type JavaMethod by class name {class_name_to_start_lookup_from} and full signature {full_signature} calling invokestatic")))?;
+            let member =
+                get_class_name_and_signature(stack_frames, current_class, MemberRefKind::Method)?;
+            let (class_name_to_start_lookup_from, full_signature) =
+                (&member.class_name, &member.full_signature);
+            let java_method = match member.static_target.get() {
+                Some((klass, cached)) => {
+                    // Still required on every call: a no-op once the class is initialized, and
+                    // it rethrows for a class whose initialization failed.
+                    StaticInit::initialize_java_class(klass)?;
+                    Arc::clone(cached)
+                }
+                None => {
+                    let klass = CLASSES.get(&class_name_to_start_lookup_from)?;
+                    StaticInit::initialize_java_class(&klass)?;
+                    let resolved = lookup::lookup_static_method(&class_name_to_start_lookup_from, &full_signature)?
+                        .ok_or_else(|| Error::new_constant_pool(&format!("Error getting static type JavaMethod by class name {class_name_to_start_lookup_from} and full signature {full_signature} calling invokestatic")))?;
+                    Arc::clone(&member.static_target.get_or_init(|| (klass, resolved)).1)
+                }
+            };
             let method_args =
                 prepare_invoke_context(stack_frames, java_method.get_method_descriptor(), false)?;
             invoke(
@@ -249,11 +260,8 @@ pub(crate) fn process(
                 )));
             }
 
-            let (_, full_signature, _) = get_class_name_and_signature_by_index(
-                current_class_name,
-                ConstantPool::get_full_interfacemethodref_info,
-                index,
-            )?;
+            let member = current_class.member_ref(MemberRefKind::InterfaceMethod, index)?;
+            let full_signature = &member.full_signature;
             let reference = method_args
                 .first()
                 .ok_or_else(|| Error::new_execution("Error getting reference from method_args"))?;
@@ -263,13 +271,8 @@ pub(crate) fn process(
                 return Ok(());
             }
 
-            let instance_name = HEAP.get_instance_name(reference.value())?;
             let java_method =
-                lookup::lookup_instance_method(&instance_name, &full_signature)?.ok_or_else(|| {
-                    Error::new_constant_pool(&format!(
-                    "Error getting instance type JavaMethod by class name {instance_name} and full signature {full_signature} getting interface implementation"
-                ))
-                })?;
+                virtual_target(member, reference.value(), "interface implementation")?;
 
             let exact_class_name = java_method.class_name();
             invoke(
@@ -280,7 +283,7 @@ pub(crate) fn process(
                 Arc::clone(&java_method),
                 exact_class_name,
             )?;
-            trace!("INVOKEINTERFACE -> {exact_class_name}.{full_signature}({method_args:?}) on instance {instance_name}");
+            trace!("INVOKEINTERFACE -> {exact_class_name}.{full_signature}({method_args:?})");
         }
         INVOKEDYNAMIC => {
             store_ex_pc(stack_frames)?;
@@ -288,7 +291,7 @@ pub(crate) fn process(
             let invokedynamic_index = stack_frame.extract_two_bytes() as u16;
             stack_frame.incr_pc();
 
-            let klass = CLASSES.get(current_class_name)?;
+            let klass = Arc::clone(current_class);
             let invoke_dynamic_runner = klass.invoke_dynamic_runner();
             invoke_dynamic_runner
                 .run(stack_frames, current_class_name, invokedynamic_index)
@@ -307,7 +310,7 @@ pub(crate) fn process(
             let stack_frame = last_frame_mut(stack_frames)?;
             let class_constpool_index = stack_frame.extract_two_bytes() as u16;
 
-            let klass = CLASSES.get(current_class_name)?;
+            let klass = Arc::clone(current_class);
             let constant_pool = klass.constant_pool();
 
             let class_to_invoke_new_for = constant_pool
@@ -366,7 +369,7 @@ pub(crate) fn process(
             let length = stack_frame.pop();
 
             let class_constpool_index = stack_frame.extract_two_bytes() as u16;
-            let klass = CLASSES.get(current_class_name)?;
+            let klass = Arc::clone(current_class);
             let constant_pool = klass.constant_pool();
 
             let class_of_array = constant_pool
@@ -434,7 +437,7 @@ pub(crate) fn process(
             let objectref = operand[0].value();
 
             if objectref != 0 {
-                let klass = CLASSES.get(current_class_name)?;
+                let klass = Arc::clone(current_class);
                 let constant_pool = klass.constant_pool();
                 let class_name = constant_pool
                     .get_class_name(class_constpool_index)
@@ -472,7 +475,7 @@ pub(crate) fn process(
             // Unlike CHECKCAST, this consumes the reference and yields a boolean, so the result is
             // pushed untagged however the operand was tagged.
             let instance_of = if objectref != 0 {
-                let klass = CLASSES.get(current_class_name)?;
+                let klass = Arc::clone(current_class);
                 let constant_pool = klass.constant_pool();
                 let class_name = constant_pool
                     .get_class_name(class_constpool_index)
@@ -555,58 +558,47 @@ fn get_args(stack_frames: &mut StackFrames, arg_num: usize) -> Result<RootedSlot
     Ok(destination)
 }
 
-fn get_class_name_and_signature<F>(
+/// Selects the implementation for a virtual or interface call on `receiver`, through the call
+/// site's monomorphic inline cache when the receiver's class matches it.
+fn virtual_target(member: &MemberRef, receiver: i32, what: &str) -> Result<Arc<JavaMethod>> {
+    let klass_id = HEAP.instance_klass_id(receiver)?;
+    if let (Some(id), Some((cached_id, cached))) = (klass_id, member.virtual_target.get()) {
+        if id == *cached_id {
+            return Ok(Arc::clone(cached));
+        }
+    }
+    let instance_name = HEAP.get_instance_name(receiver)?;
+    let resolved = lookup::lookup_instance_method(&instance_name, &member.full_signature)?
+        .ok_or_else(|| {
+            Error::new_constant_pool(&format!(
+                "Error getting instance type JavaMethod by class name {instance_name} and full signature {} getting {what}",
+                member.full_signature
+            ))
+        })?;
+    if let Some(id) = klass_id {
+        let _ = member.virtual_target.set((id, Arc::clone(&resolved)));
+    }
+    Ok(resolved)
+}
+
+fn get_class_name_and_signature<'a>(
     stack_frames: &mut StackFrames,
-    current_class_name: &str,
-    cpool_getter: F,
-) -> Result<(String, String, String)>
-where
-    F: Fn(&ConstantPool, u16) -> Option<(String, String, String)>,
-{
+    current_class: &'a JavaClass,
+    kind: MemberRefKind,
+) -> Result<&'a MemberRef> {
     let stack_frame = last_frame_mut(stack_frames)?;
     let index = stack_frame.extract_two_bytes() as u16;
     stack_frame.incr_pc();
 
-    get_class_name_and_signature_by_index(current_class_name, cpool_getter, index)
+    current_class.member_ref(kind, index)
 }
 
-fn get_class_name_and_signature_by_index<F>(
-    current_class_name: &str,
-    cpool_getter: F,
-    index: u16,
-) -> Result<(String, String, String)>
-where
-    F: Fn(&ConstantPool, u16) -> Option<(String, String, String)>,
-{
-    let klass = CLASSES.get(current_class_name)?;
-    let constant_pool = klass.constant_pool();
-    let (class_name, method_name, method_descriptor) = cpool_getter(constant_pool, index)
-        .ok_or_else(|| {
-            Error::new_constant_pool(&format!(
-                "Error getting full method info by index {index} in {current_class_name}"
-            ))
-        })?;
-    let full_signature = format!("{}:{}", method_name, method_descriptor);
-    Ok((class_name, full_signature, method_descriptor))
-}
-
-fn get_field_info(
+fn get_field_info<'a>(
     stack_frame: &mut StackFrame,
-    current_class_name: &str,
-) -> Result<(String, String)> {
+    current_class: &'a JavaClass,
+) -> Result<&'a MemberRef> {
     let fieldref_constpool_index = stack_frame.extract_two_bytes() as u16;
-
-    let klass = CLASSES.get(current_class_name)?;
-    let constant_pool = klass.constant_pool();
-
-    let (class_name, field_name, _) = constant_pool
-        .get_full_field_info(fieldref_constpool_index)
-        .ok_or_else(|| {
-            Error::new_constant_pool(&format!(
-                "Error getting full field info by index {fieldref_constpool_index}"
-            ))
-        })?;
-    Ok((class_name, field_name))
+    current_class.member_ref(MemberRefKind::Field, fieldref_constpool_index)
 }
 
 #[cfg(test)]
@@ -682,7 +674,13 @@ mod ref_transfer_tests {
         source.push(Slot::Ref(throwable)).unwrap();
         let mut frames = StackFrames::new(vec![source]);
 
-        let error = process(ATHROW, "Test", &mut frames).unwrap_err();
+        let class = Arc::new(JavaClass::synthetic(
+            "Test".to_string(),
+            "Test".to_string(),
+            None,
+            indexmap::IndexSet::new(),
+        ));
+        let error = process(ATHROW, "Test", &class, &mut frames).unwrap_err();
 
         assert_eq!(error.throwable_ref(), Some(throwable));
         assert!(frames.is_empty());

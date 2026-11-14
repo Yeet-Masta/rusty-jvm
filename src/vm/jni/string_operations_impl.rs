@@ -189,7 +189,12 @@ pub(super) extern "system" fn get_string_chars(
         return ptr::null();
     }
 
-    let raw_data = get_string_raw_data(string_ref);
+    let Some(mut raw_data) = get_string_raw_data(string_ref) else {
+        return ptr::null();
+    };
+    // Like HotSpot, terminate the copy with a NUL code unit: JDK native code hands it straight to
+    // Win32 wide-string APIs (`ProcessImpl.create` passes it to `CreateProcessW`).
+    raw_data.push(0);
     // SAFETY: jchar is u16, whose complete initialized representation is native-endian bytes.
     let bytes = unsafe {
         std::slice::from_raw_parts(
@@ -208,31 +213,33 @@ pub(super) extern "system" fn get_string_chars(
     raw_ptr
 }
 
-fn get_string_raw_data(string_ref: i32) -> Vec<jchar> {
-    let (is_latin, array_ref) = match get_raw_string_info(string_ref) {
-        Ok(info) => info,
-        Err(e) => panic!("Failed to get raw string info: {e}"),
-    };
-    let raw_data = if is_latin {
-        let guard = match HEAP.get_entire_raw_data(array_ref) {
-            Ok(g) => g,
-            Err(e) => panic!("Failed to get string data: {e}"),
-        };
-        guard.iter().map(|x| *x as jchar).collect::<Vec<_>>()
-    } else {
-        let guard = match HEAP.get_entire_raw_data(array_ref) {
-            Ok(g) => g,
-            Err(e) => panic!("Failed to get string data: {e}"),
-        };
-        if guard.len() % 2 != 0 {
-            panic!("Invalid UTF16 String data");
+/// The string's UTF-16 code units, or `None` with a pending `InternalError` when the heap string is
+/// malformed (a VM bug, never caller misuse), instead of panicking across the JNI boundary.
+fn get_string_raw_data(string_ref: i32) -> Option<Vec<jchar>> {
+    let read = || -> std::result::Result<Vec<jchar>, String> {
+        let (is_latin, array_ref) =
+            get_raw_string_info(string_ref).map_err(|e| format!("string info: {e}"))?;
+        let guard = HEAP
+            .get_entire_raw_data(array_ref)
+            .map_err(|e| format!("string data: {e}"))?;
+        if is_latin {
+            return Ok(guard.iter().map(|x| *x as jchar).collect());
         }
-        guard
+        if guard.len() % 2 != 0 {
+            return Err("UTF-16 string data has an odd length".to_string());
+        }
+        Ok(guard
             .chunks_exact(2)
             .map(|chunk| u16::from_ne_bytes([chunk[0], chunk[1]]))
-            .collect::<Vec<_>>()
+            .collect())
     };
-    raw_data
+    read()
+        .map_err(|message| {
+            crate::vm::jni::utils::set_pending_internal_error(&format!(
+                "Malformed string: {message}"
+            ))
+        })
+        .ok()
 }
 
 pub(super) extern "system" fn release_string_chars(
@@ -273,7 +280,9 @@ pub(super) extern "system" fn get_string_utf_length_as_long(
         return 0;
     }
 
-    let raw_data = get_string_raw_data(string_ref);
+    let Some(raw_data) = get_string_raw_data(string_ref) else {
+        return 0;
+    };
     encode_utf16_to_modified_utf8(&raw_data).len() as jlong
 }
 
@@ -294,7 +303,10 @@ pub(super) extern "system" fn get_string_utf_chars(
         return ptr::null();
     }
 
-    let mut mutf8_data = encode_utf16_to_modified_utf8(&get_string_raw_data(string_ref));
+    let Some(raw_data) = get_string_raw_data(string_ref) else {
+        return ptr::null();
+    };
+    let mut mutf8_data = encode_utf16_to_modified_utf8(&raw_data);
     mutf8_data.push(0); // null terminator
     let raw_ptr = buffer_leases::copy(string_ref, &mutf8_data, align_of::<u8>()).cast();
 
@@ -391,7 +403,7 @@ fn get_string_region_data(str: jstring, start: jsize, len: jsize) -> Option<Vec<
         return None;
     }
 
-    let raw_data = get_string_raw_data(string_ref);
+    let raw_data = get_string_raw_data(string_ref)?;
     let string_len = raw_data.len() as jsize;
 
     // Check bounds (using overflow-safe comparison)

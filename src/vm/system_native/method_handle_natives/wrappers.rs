@@ -1,11 +1,10 @@
 use crate::vm::error::Result;
 use crate::vm::stack::rooted_slots::RootedSlots;
 use crate::vm::stack::slot::Slot;
-use crate::vm::system_native::method_handle_natives::invocation::invoke_exact;
-use crate::vm::system_native::method_handle_natives::var_handle::{
-    var_handle_compare_and_exchange, var_handle_compare_and_set, var_handle_get,
-    var_handle_get_opaque, var_handle_set,
+use crate::vm::system_native::method_handle_natives::invocation::{
+    invoke_exact, invoke_with_call_site_type,
 };
+use jdescriptor::MethodDescriptor;
 
 pub(crate) fn method_handle_invoke_exact_wrp(args: &[Slot]) -> Result<RootedSlots> {
     let handle_ref = args[0].value();
@@ -18,42 +17,11 @@ pub(crate) fn method_handle_invoke_basic_wrp(args: &[Slot]) -> Result<RootedSlot
     method_handle_invoke_exact_wrp(args) // TODO: implement real invokeBasic
 }
 
-pub(crate) fn method_handle_invoke_wrp(args: &[Slot]) -> Result<RootedSlots> {
-    // The invoke method should handle type conversions and argument adaptations that invokeExact does not perform,
-    // making this a temporary placeholder that could cause incorrect behavior.
-    // TODO: implement real invoke
-    method_handle_invoke_exact_wrp(args)
-}
-
-pub(crate) fn var_handle_set_wrp(args: &[Slot]) -> Result<RootedSlots> {
+pub(crate) fn method_handle_invoke_wrp(
+    args: &[Slot],
+    call_site: &MethodDescriptor,
+) -> Result<RootedSlots> {
     let handle_ref = args[0].value();
-    let args_to_set = &args[1..];
-    var_handle_set(handle_ref, args_to_set)?;
+    invoke_with_call_site_type(handle_ref, &args[1..], call_site)?;
     Ok(RootedSlots::new())
-}
-
-pub(crate) fn var_handle_get_wrp(args: &[Slot]) -> Result<RootedSlots> {
-    let handle_ref = args[0].value();
-    let args_to_get = &args[1..];
-    var_handle_get(handle_ref, args_to_get)
-}
-
-pub(crate) fn var_handle_get_opaque_wrp(args: &[Slot]) -> Result<RootedSlots> {
-    let handle_ref = args[0].value();
-    let args_to_get = &args[1..];
-    var_handle_get_opaque(handle_ref, args_to_get)
-}
-
-pub(crate) fn var_handle_compare_and_set_wrp(args: &[Slot]) -> Result<RootedSlots> {
-    let handle_ref = args[0].value();
-    let args_to_process = &args[1..];
-
-    var_handle_compare_and_set(handle_ref, args_to_process)
-}
-
-pub(crate) fn var_handle_compare_and_exchange_wrp(args: &[Slot]) -> Result<RootedSlots> {
-    let handle_ref = args[0].value();
-    let args_to_process = &args[1..];
-
-    var_handle_compare_and_exchange(handle_ref, args_to_process)
 }

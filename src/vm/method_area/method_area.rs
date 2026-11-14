@@ -126,6 +126,13 @@ impl MethodArea {
     ) -> Result<Arc<JavaClass>> {
         let class_file_path = format!("{fully_qualified_class_name}.class");
         if let Some(module) = self.modules_mapping.get(&class_file_path) {
+            let defined_by_java_loader = crate::vm::BOOT_MODULES
+                .get()
+                .is_some_and(|boot| !boot.contains(module.as_str()))
+                && SYSTEM_CLASSLOADER_REF.get().is_some();
+            if defined_by_java_loader {
+                return Self::load_through_system_loader(fully_qualified_class_name);
+            }
             let resource_path = format!("/{module}/{class_file_path}");
             if let Some(res) = self
                 .jimage
@@ -146,19 +153,25 @@ impl MethodArea {
                     Error::new_execution(&format!("error opening class file {class_file_path}"))
                 })
         } else {
-            let external_name = fully_qualified_class_name.replace('/', ".");
-            let name_ref = StringPoolHelper::get_string(&external_name)?;
-            let clazz_ref = Executor::invoke_static_method(
-                "java/lang/Class",
-                "forName:(Ljava/lang/String;ZLjava/lang/ClassLoader;)Ljava/lang/Class;",
-                &[
-                    StackValueKind::Ref(name_ref),
-                    0.into(),
-                    StackValueKind::Ref(SYSTEM_CLASSLOADER_REF.get().copied().unwrap_or(0)),
-                ],
-            )?;
-            klass(clazz_ref[0].value())
+            Self::load_through_system_loader(fully_qualified_class_name)
         }
+    }
+
+    /// `Class.forName(name, false, systemLoader)`: the system loader delegates to the platform
+    /// loader for platform modules, so the class ends up defined by the loader that owns it.
+    fn load_through_system_loader(fully_qualified_class_name: &str) -> Result<Arc<JavaClass>> {
+        let external_name = fully_qualified_class_name.replace('/', ".");
+        let name_ref = StringPoolHelper::get_string(&external_name)?;
+        let clazz_ref = Executor::invoke_static_method(
+            "java/lang/Class",
+            "forName:(Ljava/lang/String;ZLjava/lang/ClassLoader;)Ljava/lang/Class;",
+            &[
+                StackValueKind::Ref(name_ref),
+                0.into(),
+                StackValueKind::Ref(SYSTEM_CLASSLOADER_REF.get().copied().unwrap_or(0)),
+            ],
+        )?;
+        klass(clazz_ref[0].value())
     }
 
     fn try_open_and_parse(&self, path: &PathBuf) -> Result<Option<Arc<JavaClass>>> {

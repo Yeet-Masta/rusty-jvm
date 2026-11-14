@@ -101,8 +101,8 @@ the permanently rooted emergency `OutOfMemoryError` fails VM startup.
 
 ## Known limitations
 
-- Verified on Linux x86-64 with JDK 25 only. s390x (big-endian), Windows and macOS were not run
-  for this work; those platforms are covered only by CI when it runs.
+- Verified on Linux x86-64 and Windows 11 x86-64 with JDK 25. s390x (big-endian) and macOS were
+  not run for this work; those platforms are covered only by CI when it runs.
 - No moving, generational or concurrent collection; no class unloading or finalization.
 - Classes and selected caches are permanent roots. Runtime `String.intern()` can retain an
   input-dependent number of strings.
@@ -118,8 +118,6 @@ the permanently rooted emergency `OutOfMemoryError` fails VM startup.
 - Synchronized method monitors remain rooted until released and are released when their frames
   return, unwind for a Java exception, or are cleaned up after an internal VM error. The original
   internal error is preserved while remaining frames are released.
-- The VM implements only a subset of `java.lang.reflect.Array` native accessors; reflective uses
-  of unimplemented typed `getX`/`setX` accessors can fail with a missing native symbol.
 - 32-bit targets fail to compile: `src/vm/jni/utils.rs` has a `compile_error!` for targets
   without 64-bit pointers because its `jmethodID` encoding uses a 64-bit layout.
 - Classes initialized before and after startup can currently receive different `Module` objects

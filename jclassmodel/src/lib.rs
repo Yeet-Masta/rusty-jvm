@@ -86,7 +86,7 @@ pub mod error;
 pub mod exception_table;
 pub mod modifiers;
 
-pub use attributes::{Attributes, BootstrapMethodInfo, LocalVariableInfo};
+pub use attributes::{Attributes, BootstrapMethodInfo, LocalVariableInfo, RecordComponent};
 pub use class_model::{
     parse, ClassFileVersion, ClassModel, CodeModel, EnclosingMethodInfo, EnclosingMethodRef,
     FieldModel, MethodModel, ParameterInfo, ParsedClass,

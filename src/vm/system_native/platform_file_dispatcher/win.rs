@@ -221,3 +221,220 @@ pub(crate) fn duplicate_handle(fd: i64) -> Result<i64> {
 
     Ok(h_result as usize as i64)
 }
+
+/// `sun.nio.ch.FileDispatcherImpl.available0(Ljava/io/FileDescriptor;)I`
+///
+/// The bytes between the position and the end of a regular file; zero for other handle types.
+pub(crate) fn available0(fd_ref: i32) -> Result<i32> {
+    use winapi::um::fileapi::GetFileType;
+    use winapi::um::winbase::FILE_TYPE_DISK;
+
+    let handle = get_handle(fd_ref)? as usize as HANDLE;
+    if unsafe { GetFileType(handle) } != FILE_TYPE_DISK {
+        return Ok(0);
+    }
+    let mut position: LARGE_INTEGER = unsafe { zeroed() };
+    if unsafe { SetFilePointerEx(handle, zeroed(), &mut position, FILE_CURRENT) } == 0 {
+        set_pending_io_exception(&format!("Available failed: {}", get_last_error()?))?;
+        return Ok(0);
+    }
+    let mut size: LARGE_INTEGER = unsafe { zeroed() };
+    if unsafe { GetFileSizeEx(handle, &mut size) } == 0 {
+        set_pending_io_exception(&format!("Available failed: {}", get_last_error()?))?;
+        return Ok(0);
+    }
+    let available = unsafe { *size.QuadPart() - *position.QuadPart() };
+    Ok(available.clamp(0, i32::MAX as i64) as i32)
+}
+
+/// `sun.nio.ch.FileDispatcherImpl.pwrite0(Ljava/io/FileDescriptor;JIJ)I`
+pub(crate) fn pwrite0(fd_ref: i32, address: i64, len: i32, position: i64) -> Result<i32> {
+    let handle = get_handle(fd_ref)? as usize as HANDLE;
+    let mut saved: LARGE_INTEGER = unsafe { zeroed() };
+    if unsafe { SetFilePointerEx(handle, zeroed(), &mut saved, FILE_CURRENT) } == 0 {
+        set_pending_io_exception(&format!("Seek failed: {}", get_last_error()?))?;
+        return Ok(0);
+    }
+    let mut ov: OVERLAPPED = unsafe { zeroed() };
+    unsafe {
+        ov.u.s_mut().Offset = position as DWORD;
+        ov.u.s_mut().OffsetHigh = (position >> 32) as DWORD;
+    }
+    let mut written: DWORD = 0;
+    let (handle_address, ov_address) = (handle as usize, &mut ov as *mut OVERLAPPED as usize);
+    let result = blocking_win32(|| unsafe {
+        WriteFile(
+            handle_address as HANDLE,
+            address as LPCVOID,
+            len as DWORD,
+            &mut written,
+            ov_address as *mut OVERLAPPED,
+        )
+    });
+    if result == 0 {
+        set_pending_io_exception(&format!("Write failed: {}", get_last_error()?))?;
+        return Ok(0);
+    }
+    if unsafe { SetFilePointerEx(handle, saved, null_mut(), FILE_BEGIN) } == 0 {
+        set_pending_io_exception(&format!("Seek failed: {}", get_last_error()?))?;
+        return Ok(0);
+    }
+    Ok(written as i32)
+}
+
+/// An `iovec` as `sun.nio.ch.IOVecWrapper` lays it out: base address, then length.
+#[repr(C)]
+struct IoVec {
+    base: usize,
+    len: usize,
+}
+
+fn io_vectors<'a>(address: i64, count: i32) -> &'a [IoVec] {
+    if count <= 0 || address == 0 {
+        return &[];
+    }
+    unsafe { std::slice::from_raw_parts(address as usize as *const IoVec, count as usize) }
+}
+
+/// `sun.nio.ch.FileDispatcherImpl.readv0(Ljava/io/FileDescriptor;JI)J`
+pub(crate) fn readv0(fd_ref: i32, address: i64, count: i32) -> Result<i64> {
+    let mut total = 0i64;
+    for vector in io_vectors(address, count) {
+        if vector.len == 0 {
+            continue;
+        }
+        let len = vector.len.min(i32::MAX as usize) as i32;
+        let read = read0(fd_ref, vector.base as i64, len)?;
+        if read < 0 {
+            return Ok(if total > 0 { total } else { read as i64 });
+        }
+        total += read as i64;
+        if read < len {
+            break;
+        }
+    }
+    Ok(total)
+}
+
+/// `sun.nio.ch.FileDispatcherImpl.writev0(Ljava/io/FileDescriptor;JIZ)J`
+pub(crate) fn writev0(fd_ref: i32, address: i64, count: i32, append: bool) -> Result<i64> {
+    let mut total = 0i64;
+    for vector in io_vectors(address, count) {
+        if vector.len == 0 {
+            continue;
+        }
+        let len = vector.len.min(i32::MAX as usize) as i32;
+        let written = write0(fd_ref, vector.base as i64, len, append)?;
+        if written < 0 {
+            return Ok(if total > 0 { total } else { written as i64 });
+        }
+        total += written as i64;
+        if written < len {
+            break;
+        }
+    }
+    Ok(total)
+}
+
+/// `sun.nio.ch.FileDispatcherImpl.force0(Ljava/io/FileDescriptor;Z)I`
+pub(crate) fn force0(fd_ref: i32, _metadata: bool) -> Result<i32> {
+    use winapi::um::fileapi::FlushFileBuffers;
+    let handle_address = get_handle(fd_ref)? as usize;
+    if blocking_win32(|| unsafe { FlushFileBuffers(handle_address as HANDLE) }) == 0 {
+        set_pending_io_exception(&format!("Force failed: {}", get_last_error()?))?;
+        return Ok(-1);
+    }
+    Ok(0)
+}
+
+/// `sun.nio.ch.FileDispatcherImpl` lock results.
+const NO_LOCK: i32 = -1;
+const LOCKED: i32 = 0;
+
+/// `sun.nio.ch.FileDispatcherImpl.lock0(Ljava/io/FileDescriptor;ZJJZ)I`
+pub(crate) fn lock0(fd_ref: i32, block: bool, pos: i64, size: i64, shared: bool) -> Result<i32> {
+    use winapi::shared::winerror::{ERROR_IO_PENDING, ERROR_LOCK_VIOLATION};
+    use winapi::um::fileapi::LockFileEx;
+    use winapi::um::ioapiset::GetOverlappedResult;
+    use winapi::um::minwinbase::{LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY};
+
+    let handle_address = get_handle(fd_ref)? as usize;
+    let mut flags = 0;
+    if !block {
+        flags |= LOCKFILE_FAIL_IMMEDIATELY;
+    }
+    if !shared {
+        flags |= LOCKFILE_EXCLUSIVE_LOCK;
+    }
+    let mut ov: OVERLAPPED = unsafe { zeroed() };
+    unsafe {
+        ov.u.s_mut().Offset = pos as DWORD;
+        ov.u.s_mut().OffsetHigh = (pos >> 32) as DWORD;
+    }
+    let ov_address = &mut ov as *mut OVERLAPPED as usize;
+    let result = blocking_win32(|| unsafe {
+        LockFileEx(
+            handle_address as HANDLE,
+            flags,
+            0,
+            size as DWORD,
+            (size >> 32) as DWORD,
+            ov_address as *mut OVERLAPPED,
+        )
+    });
+    if result != 0 {
+        return Ok(LOCKED);
+    }
+    let mut error = unsafe { GetLastError() };
+    if error == ERROR_IO_PENDING {
+        let waited = blocking_win32(|| {
+            let mut transferred: DWORD = 0;
+            unsafe {
+                GetOverlappedResult(
+                    handle_address as HANDLE,
+                    ov_address as *mut OVERLAPPED,
+                    &mut transferred,
+                    1,
+                )
+            }
+        });
+        if waited != 0 {
+            return Ok(LOCKED);
+        }
+        error = unsafe { GetLastError() };
+    }
+    if error == ERROR_LOCK_VIOLATION && !block {
+        return Ok(NO_LOCK);
+    }
+    set_pending_io_exception(&format!("Lock failed: {}", get_last_error()?))?;
+    Ok(NO_LOCK)
+}
+
+/// `sun.nio.ch.FileDispatcherImpl.release0(Ljava/io/FileDescriptor;JJ)V`
+pub(crate) fn release0(fd_ref: i32, pos: i64, size: i64) -> Result<()> {
+    use winapi::shared::winerror::{ERROR_IO_PENDING, ERROR_NOT_LOCKED};
+    use winapi::um::fileapi::UnlockFileEx;
+    use winapi::um::ioapiset::GetOverlappedResult;
+
+    let handle = get_handle(fd_ref)? as usize as HANDLE;
+    let mut ov: OVERLAPPED = unsafe { zeroed() };
+    unsafe {
+        ov.u.s_mut().Offset = pos as DWORD;
+        ov.u.s_mut().OffsetHigh = (pos >> 32) as DWORD;
+    }
+    let result = unsafe { UnlockFileEx(handle, 0, size as DWORD, (size >> 32) as DWORD, &mut ov) };
+    if result == 0 {
+        let mut error = unsafe { GetLastError() };
+        if error == ERROR_IO_PENDING {
+            let mut transferred: DWORD = 0;
+            if unsafe { GetOverlappedResult(handle, &mut ov, &mut transferred, 1) } != 0 {
+                return Ok(());
+            }
+            error = unsafe { GetLastError() };
+        }
+        if error != ERROR_NOT_LOCKED {
+            set_pending_io_exception(&format!("Release failed: {}", get_last_error()?))?;
+        }
+    }
+    Ok(())
+}

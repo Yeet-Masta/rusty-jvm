@@ -25,8 +25,8 @@ public class GcJniIdentityDemo {
             throw new AssertionError("JNI frame lifetime");
         }
         System.out.println("frames-ok");
-        if (!(capacity(object, true) instanceof OutOfMemoryError)
-                || !(capacity(object, false) instanceof OutOfMemoryError)) {
+        // Like HotSpot, an oversized capacity is refused with no exception, leaving locals intact
+        if (capacity(object, true) != object || capacity(object, false) != object) {
             throw new AssertionError("JNI capacity failure");
         }
         System.out.println("capacity-ok");

@@ -10,7 +10,7 @@ use crate::vm::stack::stack_frame::ExceptionTable;
 use getset::{CopyGetters, Getters};
 use indexmap::{IndexMap, IndexSet};
 use jclassmodel::attributes::Attributes;
-use jclassmodel::constant_pool::ConstantPool;
+use jclassmodel::constant_pool::{ConstantPool, ConstantPoolLookup};
 use jclassmodel::modifiers::{ClassModifier, NestedClassModifier};
 use jclassmodel::{ClassModel, EnclosingMethodInfo, FieldModel, MethodModel};
 use jdescriptor::TypeDescriptor;
@@ -88,6 +88,53 @@ pub(crate) struct JavaClass {
     #[get = "pub"]
     invoke_dynamic_runner: InvokeDynamicRunner,
     mirror_clazz_ref: OnceLock<i32>,
+    /// `(major, minor)` class file version; `(0, 0)` for synthetic (primitive and array) classes.
+    #[get_copy = "pub"]
+    class_file_version: (u16, u16),
+    /// Symbolic references already resolved from this class's constant pool, keyed by kind and
+    /// index. Invoke and field opcodes hit this on every execution, so resolution (and descriptor
+    /// parsing) happens once per call site instead of once per bytecode.
+    /// Indexed by constant-pool index. Reads are a single atomic load: invokes from every thread
+    /// hit this, so it must not take a lock or touch a shared reference count.
+    member_refs: Box<[OnceLock<(MemberRefKind, MemberRef)>]>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum MemberRefKind {
+    Method,
+    InterfaceMethod,
+    Field,
+}
+
+/// A resolved `CONSTANT_{Methodref,InterfaceMethodref,Fieldref}` entry.
+#[derive(Debug)]
+pub(crate) struct MemberRef {
+    pub(crate) class_name: String,
+    pub(crate) name: String,
+    pub(crate) descriptor: String,
+    /// `name:descriptor`, the key used by method lookup.
+    pub(crate) full_signature: String,
+    method_descriptor: OnceLock<jdescriptor::MethodDescriptor>,
+    /// Inline caches for invoke sites using this reference. Resolution is deterministic for a
+    /// given (receiver) class, so each is filled once and then only read (a single atomic load).
+    /// `invokestatic`: the resolved class and method.
+    pub(crate) static_target: OnceLock<(Arc<JavaClass>, Arc<JavaMethod>)>,
+    /// `invokespecial`: the resolved method.
+    pub(crate) special_target: OnceLock<Arc<JavaMethod>>,
+    /// `invokevirtual`/`invokeinterface`: the first receiver class seen and its implementation
+    /// (monomorphic). Other receiver classes take the full lookup.
+    pub(crate) virtual_target: OnceLock<(usize, Arc<JavaMethod>)>,
+}
+
+impl MemberRef {
+    /// The parsed method descriptor, parsed on first use.
+    pub(crate) fn method_descriptor(&self) -> Result<&jdescriptor::MethodDescriptor> {
+        if let Some(parsed) = self.method_descriptor.get() {
+            return Ok(parsed);
+        }
+        let parsed = self.descriptor.parse()?;
+        Ok(self.method_descriptor.get_or_init(|| parsed))
+    }
 }
 
 #[derive(Debug, Default)]
@@ -156,13 +203,52 @@ pub enum InnerState {
 }
 
 impl JavaClass {
+    /// Resolves a member reference from this class's constant pool, caching the result.
+    pub(crate) fn member_ref(&self, kind: MemberRefKind, index: u16) -> Result<&MemberRef> {
+        let mismatch = || {
+            Error::new_constant_pool(&format!(
+                "Error getting {kind:?} info by index {index} in {}",
+                self.this_class_name()
+            ))
+        };
+        let slot = self
+            .member_refs
+            .get(usize::from(index))
+            .ok_or_else(mismatch)?;
+        if let Some((cached_kind, member)) = slot.get() {
+            return if *cached_kind == kind {
+                Ok(member)
+            } else {
+                Err(mismatch())
+            };
+        }
+        let pool = self.constant_pool();
+        let resolved = match kind {
+            MemberRefKind::Method => pool.get_full_method_info(index),
+            MemberRefKind::InterfaceMethod => pool.get_full_interfacemethodref_info(index),
+            MemberRefKind::Field => pool.get_full_field_info(index),
+        };
+        let (class_name, name, descriptor) = resolved.ok_or_else(mismatch)?;
+        let member = MemberRef {
+            full_signature: format!("{name}:{descriptor}"),
+            class_name,
+            name,
+            descriptor,
+            method_descriptor: OnceLock::new(),
+            static_target: OnceLock::new(),
+            special_target: OnceLock::new(),
+            virtual_target: OnceLock::new(),
+        };
+        // Racing resolvers produce identical values; keep whichever was stored first.
+        let (_, member) = slot.get_or_init(|| (kind, member));
+        Ok(member)
+    }
+
     /// Builds a class from its resolved class-file view, adding the runtime state (field values,
     /// initialization state, vtable and offset caches) that the class file itself cannot describe.
     pub fn from_model(model: ClassModel) -> Result<Self> {
         let ClassModel {
-            // The class file version is not used by the runtime yet; bound explicitly rather than
-            // with `..` so a new model field still breaks here.
-            version: _,
+            version,
             nested_class_modifiers,
             name,
             external_name,
@@ -200,6 +286,7 @@ impl JavaClass {
             enclosing_method,
             source_file,
         );
+        class.class_file_version = (version.major, version.minor);
         class.add_vm_fields()?;
         Ok(class)
     }
@@ -239,8 +326,11 @@ impl JavaClass {
         class_name: &str,
     ) -> IndexMap<String, Arc<JavaMethod>> {
         let mut method_by_signature = IndexMap::new();
+        // One shared name for every method of the class, so the interpreter can tell that
+        // consecutive frames belong to the same class by pointer identity alone.
+        let shared_class_name = Arc::new(class_name.to_string());
 
-        for method in methods {
+        for mut method in methods {
             // Polymorphic-signature natives have no fixed descriptor, so they are keyed by bare name.
             let key = if method.is_polymorphic_signature() {
                 method.name.clone()
@@ -250,6 +340,14 @@ impl JavaClass {
 
             // Read before `code` is moved out of `method` below.
             let is_native = method.is_native();
+            let parameters = method.has_parameters_attribute.then(|| {
+                method
+                    .parameters
+                    .iter()
+                    .map(|parameter| (parameter.name.clone(), parameter.modifiers.bits()))
+                    .collect::<Vec<_>>()
+            });
+            let generic_signature = method.generic_signature.take();
 
             let code_context = method.code.map(|code| {
                 CodeContext::new(
@@ -264,20 +362,24 @@ impl JavaClass {
 
             method_by_signature.insert(
                 key,
-                Arc::new(JavaMethod::new(
-                    method.descriptor,
-                    class_name,
-                    &method.name_signature,
-                    code_context,
-                    is_native,
-                    method.exceptions,
-                    method.modifiers.bits() as i32,
-                    &method.name,
-                    method.annotation_default_raw,
-                    method.annotations_raw,
-                    method.runtime_visible_annotations,
-                    method_by_signature.len() as i32, // God, forgive me, this is a hack to get the method index
-                )),
+                Arc::new(
+                    JavaMethod::new(
+                        method.descriptor,
+                        class_name,
+                        &method.name_signature,
+                        code_context,
+                        is_native,
+                        method.exceptions,
+                        method.modifiers.bits() as i32,
+                        &method.name,
+                        method.annotation_default_raw,
+                        method.annotations_raw,
+                        method.runtime_visible_annotations,
+                        method_by_signature.len() as i32, // God, forgive me, this is a hack to get the method index
+                    )
+                    .with_reflection_metadata(generic_signature, parameters)
+                    .with_class_name(Arc::clone(&shared_class_name)),
+                ),
             );
         }
 
@@ -349,6 +451,7 @@ impl JavaClass {
         enclosing_method: Option<EnclosingMethodInfo>,
         source_file: Option<String>,
     ) -> Self {
+        let member_ref_slots = constant_pool.len();
         Self {
             methods,
             fields_info,
@@ -374,6 +477,8 @@ impl JavaClass {
             source_file,
             invoke_dynamic_runner: InvokeDynamicRunner::default(),
             mirror_clazz_ref: OnceLock::default(),
+            class_file_version: (0, 0),
+            member_refs: (0..member_ref_slots).map(|_| OnceLock::new()).collect(),
         }
     }
 

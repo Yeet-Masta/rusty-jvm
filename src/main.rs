@@ -34,8 +34,22 @@ fn main() -> ExitCode {
         }
     };
 
-    if let Err(msg) = handle_execution(args) {
-        eprintln!("{msg}");
+    // Like the `java` launcher, run the VM on a thread of its own: the process's main thread has
+    // a small native stack (1 MB on Windows), and nested interpreter re-entries need more.
+    let vm_thread = std::thread::Builder::new()
+        .name("main".to_string())
+        .stack_size(rusty_jvm::VM_THREAD_STACK_BYTES)
+        .spawn(move || handle_execution(args));
+    let outcome = match vm_thread {
+        Ok(handle) => handle
+            .join()
+            .unwrap_or_else(|_| Err("VM thread panicked".to_string())),
+        Err(error) => Err(format!("Failed to start the VM thread: {error}")),
+    };
+    if let Err(msg) = outcome {
+        if !msg.is_empty() {
+            eprintln!("{msg}");
+        }
         return ExitCode::FAILURE;
     }
     ExitCode::SUCCESS

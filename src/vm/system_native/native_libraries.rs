@@ -19,7 +19,7 @@ use std::ffi::{c_void, CString};
 use std::fs;
 use std::path::Path;
 use std::str::FromStr;
-use std::sync::{Arc, LazyLock};
+use std::sync::{Arc, LazyLock, OnceLock};
 use tracing::{enabled, trace, warn};
 
 static REGISTRY: LazyLock<DashMap<usize, Arc<LibraryEntry>>> = LazyLock::new(DashMap::default);
@@ -65,7 +65,7 @@ pub(crate) fn load(
                     .file_name()
                     .and_then(|n| n.to_str())
                     .and_then(|s| extract_lib_name(s))
-                    .is_some_and(|lib_name| ["nio", "jimage", "zip", "net"].contains(&lib_name))
+                    .is_some_and(|lib_name| built_in_library(lib_name))
                 {
                     return Ok(true);
                 }
@@ -168,6 +168,74 @@ pub(crate) fn unload(_name_ref: i32, _builtin: bool, handle: i64) -> Result<()> 
     Ok(())
 }
 
+/// JDK libraries whose natives are all built into the VM, so loading the real one is skipped.
+/// `libnet` and `libnio` load for real once the JVM shim is in place: their natives that rusty-jvm
+/// does not implement (sockets, selectors, most of `sun.nio.fs`) then resolve to the JDK's code.
+fn built_in_library(name: &str) -> bool {
+    if crate::vm::jvm_shim::is_installed() {
+        // `management` is served by rusty-jvm's own `sun.management` natives: its JNI_OnLoad
+        // needs HotSpot's `jmm` interface, which rusty-jvm does not provide.
+        ["jimage", "zip", "management", "management_ext"].contains(&name)
+    } else {
+        [
+            "nio",
+            "jimage",
+            "zip",
+            "net",
+            "management",
+            "management_ext",
+        ]
+        .contains(&name)
+    }
+}
+
+/// HotSpot loads `libjava` itself at startup; no Java code asks for it. It holds natives of boot
+/// classes (`ProcessImpl`, `Console`, `TimeZone`, ...) that rusty-jvm resolves to it when it has
+/// no built-in, and the `JNU_*` helpers the other JDK libraries import. Loaded on first use.
+static LIBJAVA: OnceLock<Option<Library>> = OnceLock::new();
+
+fn libjava() -> Option<&'static Library> {
+    LIBJAVA
+        .get_or_init(|| {
+            if !crate::vm::jvm_shim::is_installed() {
+                return None;
+            }
+            let file = if cfg!(windows) {
+                "java.dll"
+            } else if cfg!(target_os = "macos") {
+                "libjava.dylib"
+            } else {
+                "libjava.so"
+            };
+            let path = Path::new(sun_boot_library_path()).join(file);
+            let library = match crate::vm::safepoint::blocking(|| unsafe { Library::new(&path) }) {
+                Ok(library) => library,
+                Err(error) => {
+                    warn!("cannot load {}: {error}", path.display());
+                    return None;
+                }
+            };
+            match on_load(&library, &path.to_string_lossy()) {
+                Ok(Some(_)) => Some(library),
+                _ => {
+                    warn!("JNI_OnLoad of {} failed", path.display());
+                    None
+                }
+            }
+        })
+        .as_ref()
+}
+
+/// The address of `symbol` in `libjava`, for a boot-class native without a built-in.
+pub(crate) fn find_libjava_symbol(symbol: &str) -> Option<usize> {
+    let library = libjava()?;
+    let c_name = CString::new(symbol).ok()?;
+    unsafe { library.get::<*const c_void>(c_name.as_bytes_with_nul()) }
+        .ok()
+        .map(|symbol| *symbol as usize)
+        .filter(|&address| address != 0)
+}
+
 fn extract_lib_name(s: &str) -> Option<&str> {
     let s = s.strip_prefix("lib").unwrap_or(s);
     Some(s.rsplit_once('.')?.0)
@@ -178,7 +246,11 @@ pub(crate) fn find_entry0(handle: i64, name_ref: i32) -> Result<i64> {
     let lib = match REGISTRY.get(&(handle as usize)) {
         Some(lib) => Arc::clone(lib.value()),
         None => {
-            warn!("Library not found in registry for handle: {handle}");
+            // Handle 0 is the JDK probing for a statically linked (builtin) library's
+            // `JNI_OnLoad_<name>`; there are none, so "not found" is the expected answer.
+            if handle != 0 {
+                warn!("Library not found in registry for handle: {handle}");
+            }
             return Ok(0);
         }
     };

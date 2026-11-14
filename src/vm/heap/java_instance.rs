@@ -402,9 +402,11 @@ impl JavaInstance {
     pub fn get_field_value(&self, class_name: &str, field_name_type: &str) -> Result<Vec<i32>> {
         self.lookup_for_field(class_name, field_name_type)
             .map(|v| v.raw_value())
-            .ok_or(Error::new_execution(&format!(
-                "error getting instance field value {class_name}.{field_name_type}"
-            )))?
+            .ok_or_else(|| {
+                Error::new_execution(&format!(
+                    "error getting instance field value {class_name}.{field_name_type}"
+                ))
+            })?
     }
 
     fn lookup_for_field(
@@ -458,6 +460,11 @@ impl JavaInstance {
     pub fn klass(&self) -> Result<Arc<JavaClass>> {
         let instance = self.get_instance();
         CLASSES.get_by_id(instance.klass_id)
+    }
+
+    /// Id of the object's class in the class registry, without resolving the class.
+    pub(crate) fn klass_id(&self) -> usize {
+        self.get_instance().klass_id
     }
 
     pub fn instance_name(&self) -> Result<String> {

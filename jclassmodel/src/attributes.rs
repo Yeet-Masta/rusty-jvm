@@ -412,6 +412,87 @@ impl Attributes {
     }
 }
 
+/// One component of a record class (`Record` attribute, JVMS §4.7.30).
+#[derive(Debug, Clone, PartialEq)]
+pub struct RecordComponent {
+    pub name: String,
+    pub descriptor: String,
+    pub signature: Option<String>,
+    pub annotations_raw: Option<Vec<u8>>,
+}
+
+impl Attributes {
+    /// The components of a record class, in declaration order, or `Ok(None)` when the class
+    /// carries no `Record` attribute.
+    pub fn get_record_components<T: ConstantPoolLookup>(
+        &self,
+        constant_pool: &T,
+    ) -> Result<Option<Vec<RecordComponent>>> {
+        let Some(Attribute::Record { components }) = self.data.get(&AttributeType::Record) else {
+            return Ok(None);
+        };
+        components
+            .iter()
+            .map(|component| {
+                let name = constant_pool
+                    .get_utf8(component.name_index())
+                    .ok_or_else(|| {
+                        Error::constant_pool("Invalid record component name index".to_string())
+                    })?;
+                let descriptor = constant_pool
+                    .get_utf8(component.descriptor_index())
+                    .ok_or_else(|| {
+                        Error::constant_pool(
+                            "Invalid record component descriptor index".to_string(),
+                        )
+                    })?;
+                let mut signature = None;
+                let mut annotations_raw = None;
+                for attribute in component.attributes() {
+                    match attribute {
+                        Attribute::Signature { signature_index } => {
+                            signature = constant_pool.get_utf8(*signature_index);
+                        }
+                        Attribute::RuntimeVisibleAnnotations { raw, .. } => {
+                            annotations_raw = Some(raw.clone());
+                        }
+                        _ => {}
+                    }
+                }
+                Ok(RecordComponent {
+                    name,
+                    descriptor,
+                    signature,
+                    annotations_raw,
+                })
+            })
+            .collect::<Result<Vec<_>>>()
+            .map(Some)
+    }
+
+    /// The member classes this class declares: `InnerClasses` entries whose outer class is
+    /// `this_class` (what `Class.getDeclaredClasses()` reports).
+    pub fn get_declared_classes<T: ConstantPoolLookup>(
+        &self,
+        constant_pool: &T,
+        this_class: &str,
+    ) -> Vec<String> {
+        let Some(records) = self.get_inner_class_records() else {
+            return Vec::new();
+        };
+        records
+            .iter()
+            .filter(|record| record.outer_class_info_index() != 0)
+            .filter(|record| {
+                constant_pool
+                    .get_class_name(record.outer_class_info_index())
+                    .is_some_and(|outer| outer == this_class)
+            })
+            .filter_map(|record| constant_pool.get_class_name(record.inner_class_info_index()))
+            .collect()
+    }
+}
+
 fn resolve_class_names<T: ConstantPoolLookup>(
     constant_pool: &T,
     indexes: &[u16],

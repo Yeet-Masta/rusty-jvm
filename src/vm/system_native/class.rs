@@ -6,6 +6,7 @@ use crate::vm::execution_engine::static_init::StaticInit;
 use crate::vm::execution_engine::string_pool_helper::StringPoolHelper;
 use crate::vm::heap::heap::HEAP;
 use crate::vm::helper::{clazz_ref, klass, strip_nest_host};
+use crate::vm::jni::java_thread::JavaThread;
 use crate::vm::method_area::instance_checker::InstanceChecker;
 use crate::vm::method_area::primitives_helper::{PRIMITIVE_CODE_BY_TYPE, PRIMITIVE_TYPE_BY_CODE};
 use crate::vm::stack::rooted_slots::RootedSlots;
@@ -387,4 +388,110 @@ pub(crate) fn is_record0(clazz_ref: i32) -> Result<bool> {
             .as_ref()
             .is_some_and(|p| p == "java/lang/Record");
     Ok(record)
+}
+
+/// `java.lang.Class.getRecordComponents0()[Ljava/lang/reflect/RecordComponent;`
+///
+/// Builds one `RecordComponent` per `Record` attribute entry, filling the same fields HotSpot's
+/// `java_lang_reflect_RecordComponent::create` does. Returns null for a non-record class.
+pub(crate) fn get_record_components0(class_ref: i32) -> Result<i32> {
+    const RC: &str = "java/lang/reflect/RecordComponent";
+    let klass = klass(class_ref)?;
+    let Some(components) = klass
+        .attributes()
+        .get_record_components(klass.constant_pool())?
+    else {
+        return Ok(0);
+    };
+
+    let mut roots = JavaThread::hold_temp_roots(vec![Slot::Ref(class_ref)]);
+    let mut component_refs = Vec::with_capacity(components.len());
+    for component in &components {
+        let rc_ref = Executor::invoke_default_constructor(RC)?[0].value();
+        roots.add_root(Slot::Ref(rc_ref));
+
+        let name_ref = StringPoolHelper::get_string(&component.name)?;
+        let type_ref = clazz_ref(&component.descriptor)?;
+        let accessor_ref = match klass
+            .try_get_method(&format!("{}:(){}", component.name, component.descriptor))
+        {
+            Some(method) => method.reflection_ref()?,
+            None => 0,
+        };
+        let signature_ref = match component.signature.as_deref() {
+            Some(signature) => StringPoolHelper::get_string(signature)?,
+            None => 0,
+        };
+        let annotations_ref = match component.annotations_raw.as_deref() {
+            Some(raw) => HEAP.create_byte_array(raw, &mut RootedSlots::new())?,
+            None => 0,
+        };
+
+        HEAP.set_object_field_value(rc_ref, RC, "clazz", vec![class_ref])?;
+        HEAP.set_object_field_value(rc_ref, RC, "name", vec![name_ref])?;
+        HEAP.set_object_field_value(rc_ref, RC, "type", vec![type_ref])?;
+        HEAP.set_object_field_value(rc_ref, RC, "accessor", vec![accessor_ref])?;
+        HEAP.set_object_field_value(rc_ref, RC, "signature", vec![signature_ref])?;
+        HEAP.set_object_field_value(rc_ref, RC, "annotations", vec![annotations_ref])?;
+        component_refs.push(rc_ref);
+    }
+
+    HEAP.create_array_with_values(
+        "[Ljava/lang/reflect/RecordComponent;",
+        &component_refs,
+        &mut RootedSlots::new(),
+    )
+}
+
+/// `java.lang.Class.getNestMembers0()[Ljava/lang/Class;`
+///
+/// The nest host first, then every member it lists (HotSpot `JVM_GetNestMembers`).
+pub(crate) fn get_nest_members0(class_ref: i32) -> Result<i32> {
+    let host_ref = get_nest_host0(class_ref)?;
+    let host = klass(host_ref)?;
+    let mut refs = vec![host_ref];
+    if let Some(members) = host.attributes().get_nest_members(host.constant_pool())? {
+        for member in members {
+            if let Ok(member_ref) = clazz_ref(&member) {
+                refs.push(member_ref);
+            }
+        }
+    }
+    HEAP.create_array_with_values("[Ljava/lang/Class;", &refs, &mut RootedSlots::new())
+}
+
+/// `java.lang.Class.getDeclaredClasses0()[Ljava/lang/Class;`
+pub(crate) fn get_declared_classes0(class_ref: i32) -> Result<i32> {
+    let klass = klass(class_ref)?;
+    let refs = klass
+        .attributes()
+        .get_declared_classes(klass.constant_pool(), klass.this_class_name())
+        .iter()
+        .map(|name| clazz_ref(name))
+        .collect::<Result<Vec<_>>>()?;
+    HEAP.create_array_with_values("[Ljava/lang/Class;", &refs, &mut RootedSlots::new())
+}
+
+/// `java.lang.Class.getClassAccessFlagsRaw0()I`: the class file's own `access_flags`.
+pub(crate) fn get_class_access_flags_raw0(class_ref: i32) -> Result<i32> {
+    let klass = klass(class_ref)?;
+    Ok(klass.class_modifiers().bits() as i32)
+}
+
+/// `java.lang.Class.getClassFileVersion0()I`: `minor << 16 | major`. Primitive classes (no class
+/// file) report the newest version this VM supports, as HotSpot does.
+pub(crate) fn get_class_file_version0(class_ref: i32) -> Result<i32> {
+    const LATEST_MAJOR: i32 = 69; // Java 25
+    let klass = klass(class_ref)?;
+    let (major, minor) = klass.class_file_version();
+    if major == 0 {
+        return Ok(LATEST_MAJOR);
+    }
+    Ok(((minor as i32) << 16) | major as i32)
+}
+
+/// `java.lang.Class.getRawTypeAnnotations()[B`. Type annotations are not retained by the class
+/// parser, so this reports none (null), which `TypeAnnotationParser` treats as "no annotations".
+pub(crate) fn get_raw_type_annotations(_class_ref: i32) -> Result<i32> {
+    Ok(0)
 }

@@ -13,9 +13,9 @@ mod method_type;
 pub(crate) mod native_accessor;
 mod offsets;
 mod resolution;
-mod resolved_method_name;
+pub(crate) mod resolved_method_name;
 pub(crate) mod types;
-mod var_handle;
+pub(crate) mod var_handle;
 pub(crate) mod wrappers;
 
 /// `java.lang.invoke.MethodHandleNatives.registerNatives()V`

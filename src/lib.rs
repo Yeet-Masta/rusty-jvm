@@ -33,6 +33,7 @@ use derive_new::new;
 use getset::Getters;
 use indexmap::IndexMap;
 pub use vm::run;
+pub use vm::VM_THREAD_STACK_BYTES;
 
 #[derive(PartialEq, Debug, new, Getters, Default)]
 #[get = "pub"]

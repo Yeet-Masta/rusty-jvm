@@ -121,6 +121,8 @@ pub(crate) fn yield0() -> Result<()> {
 /// from a blocking operation so it observes the flag: `unpark` covers `LockSupport.park` and
 /// `Thread.sleep`, and [`monitor::interrupt_waiter`] covers `Object.wait`.
 pub(crate) fn interrupt0(this: i32) -> Result<()> {
+    #[cfg(windows)]
+    crate::vm::system_native::interrupt_event::signal(this);
     threads::unpark(this);
     monitor::interrupt_waiter(this);
     Ok(())
@@ -169,6 +171,10 @@ pub(crate) fn get_stack_trace0(this: i32) -> Result<i32> {
 /// Clears any VM-level pending interrupt event. We keep no such event (the `interrupted` field is
 /// the sole source of truth), so this is a no-op.
 pub(crate) fn clear_interrupt_event() -> Result<()> {
+    #[cfg(windows)]
+    if let Some(thread) = JavaThread::current_thread() {
+        crate::vm::system_native::interrupt_event::clear(thread);
+    }
     Ok(())
 }
 
@@ -202,6 +208,7 @@ pub(crate) fn start0(this: i32) -> Result<()> {
     // The child cannot claim managed access until the parent publishes its parker.
     let (ready, claim) = std::sync::mpsc::sync_channel(1);
     let handle = std::thread::Builder::new()
+        .stack_size(crate::vm::stack::stack_limit::NATIVE_STACK_BYTES)
         .spawn(move || {
             if claim.recv().is_ok() {
                 safepoint::claim(startup);
@@ -273,6 +280,8 @@ pub(crate) fn terminate(this: i32) {
         error!("failed to clear eetop on thread exit: {e}");
     }
     threads::set_thread_status(this, threads::thread_status::TERMINATED);
+    #[cfg(windows)]
+    crate::vm::system_native::interrupt_event::release(this);
     // Wake any joiners: Thread.join sits in `synchronized(thread) { while (isAlive()) wait(); }`,
     // and isAlive() is now false (eetop cleared above), so a notify lets them observe termination.
     crate::vm::monitor::wake_all_on_exit(this);
@@ -295,4 +304,27 @@ fn invoke_run(this: i32) -> Result<RootedSlots> {
 /// Writes `Thread.eetop` (a `long`), whose non-zero-ness is what `Thread.isAlive()` reports.
 fn set_eetop(this: i32, value: i64) -> Result<()> {
     HEAP.set_object_field_value(this, "java/lang/Thread", "eetop", i64_to_vec(value))
+}
+
+/// `java.lang.Thread.setNativeName(Ljava/lang/String;)V` (Linux and macOS): names the calling OS
+/// thread, truncated to the 15 bytes the kernel keeps, as HotSpot's `os::set_native_thread_name`.
+pub(crate) fn set_native_name(name_ref: i32) -> Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        let name = crate::vm::system_native::string::get_utf8_string_by_ref(name_ref)?;
+        let mut bytes: Vec<u8> = name.bytes().filter(|b| *b != 0).take(15).collect();
+        bytes.push(0);
+        unsafe {
+            nix::libc::prctl(
+                nix::libc::PR_SET_NAME,
+                bytes.as_ptr() as nix::libc::c_ulong,
+                0,
+                0,
+                0,
+            );
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = name_ref;
+    Ok(())
 }

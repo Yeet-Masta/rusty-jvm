@@ -7,7 +7,6 @@ use crate::vm::execution_engine::ops_math_processor::increment;
 use crate::vm::execution_engine::ops_store_processor::handle_store;
 use crate::vm::heap::construction::ArrayLayout;
 use crate::vm::heap::heap::HEAP;
-use crate::vm::method_area::loaded_classes::CLASSES;
 use crate::vm::stack::rooted_slots::RootedSlots;
 use crate::vm::stack::slot::Slot;
 use crate::vm::stack::stack_frame::{StackFrame, StackFrames};
@@ -18,7 +17,7 @@ use tracing::trace;
 
 pub(crate) fn process(
     code: u8,
-    current_class_name: &str,
+    current_class: &std::sync::Arc<crate::vm::method_area::java_class::JavaClass>,
     stack_frames: &mut StackFrames,
 ) -> Result<()> {
     let stack_frame = last_frame_mut(stack_frames)?;
@@ -53,7 +52,7 @@ pub(crate) fn process(
             let class_index = stack_frame.extract_two_bytes();
             let dimension_number = stack_frame.extract_one_byte();
 
-            let klass = CLASSES.get(current_class_name)?;
+            let klass = std::sync::Arc::clone(current_class);
             let constant_pool = klass.constant_pool();
             let class_name = constant_pool
                 .get_class_name(class_index as u16)

@@ -1,7 +1,7 @@
 use crate::vm::error::Result;
 use crate::vm::exception::pending_helpers::{
-    set_pending_array_index_out_of_bounds_exception, set_pending_illegal_argument_exception,
-    set_pending_null_pointer_exception,
+    set_pending_array_index_out_of_bounds_exception_without_message,
+    set_pending_illegal_argument_exception, set_pending_null_pointer_exception,
 };
 use crate::vm::execution_engine::executor::Executor;
 use crate::vm::heap::heap::HEAP;
@@ -145,9 +145,8 @@ fn array_info(array_ref: i32) -> Result<Option<(String, i32)>> {
 
 fn check_index(index: i32, length: i32) -> Result<bool> {
     if index < 0 || index >= length {
-        set_pending_array_index_out_of_bounds_exception(&format!(
-            "Index {index} out of bounds for length {length}"
-        ))?;
+        // HotSpot raises this one without a message.
+        set_pending_array_index_out_of_bounds_exception_without_message()?;
         return Ok(false);
     }
     Ok(true)
@@ -268,4 +267,133 @@ pub(crate) fn set_int(array_ref: i32, index: i32, value: i32) -> Result<()> {
         return illegal_argument("int cannot be converted to the array component type");
     };
     HEAP.set_array_value(array_ref, index, value.raw())
+}
+
+/// Reads element `index` of a primitive array and widens it to `target` (JLS 5.1.2), as the typed
+/// `Array.getX` accessors require. `None` means a pending exception was set.
+fn get_widened(array_ref: i32, index: i32, target: &str) -> Result<Option<Primitive>> {
+    let _array = JavaThread::hold_temp_roots(vec![Slot::Ref(array_ref)]);
+    let Some((type_name, length)) = array_info(array_ref)? else {
+        return Ok(None);
+    };
+    if !check_index(index, length)? {
+        return Ok(None);
+    }
+    let element = Primitive::from_array(&type_name[1..], &HEAP.get_array_value(array_ref, index)?);
+    match element.and_then(|value| value.widen_to(target)) {
+        Some(value) => Ok(Some(value)),
+        None => {
+            set_pending_illegal_argument_exception(
+                "Argument is not an array of a compatible type",
+            )?;
+            Ok(None)
+        }
+    }
+}
+
+/// Widens `value` to the array's element type and stores it, as the typed `Array.setX` accessors
+/// require.
+fn set_widened(array_ref: i32, index: i32, value: Primitive) -> Result<()> {
+    let _array = JavaThread::hold_temp_roots(vec![Slot::Ref(array_ref)]);
+    let Some((type_name, length)) = array_info(array_ref)? else {
+        return Ok(());
+    };
+    if !check_index(index, length)? {
+        return Ok(());
+    }
+    let Some(value) = value.widen_to(&type_name[1..]) else {
+        return illegal_argument("argument type mismatch");
+    };
+    HEAP.set_array_value(array_ref, index, value.raw())
+}
+
+macro_rules! typed_accessors {
+    ($($get:ident / $set:ident : $ty:ty, $code:literal, $variant:ident;)*) => {$(
+        #[doc = concat!("`java.lang.reflect.Array.get", stringify!($variant), "` for a `", $code, "` result.")]
+        pub(crate) fn $get(array_ref: i32, index: i32) -> Result<$ty> {
+            Ok(match get_widened(array_ref, index, $code)? {
+                Some(Primitive::$variant(value)) => value,
+                _ => <$ty>::default(),
+            })
+        }
+
+        #[doc = concat!("`java.lang.reflect.Array.set", stringify!($variant), "` for a `", $code, "` value.")]
+        pub(crate) fn $set(array_ref: i32, index: i32, value: $ty) -> Result<()> {
+            set_widened(array_ref, index, Primitive::$variant(value))
+        }
+    )*};
+}
+
+typed_accessors! {
+    get_boolean / set_boolean: bool, "Z", Boolean;
+    get_byte / set_byte: i8, "B", Byte;
+    get_char / set_char: u16, "C", Char;
+    get_short / set_short: i16, "S", Short;
+    get_long / set_long: i64, "J", Long;
+    get_float / set_float: f32, "F", Float;
+    get_double / set_double: f64, "D", Double;
+}
+
+/// `java.lang.reflect.Array.multiNewArray(Ljava/lang/Class;[I)Ljava/lang/Object;`
+///
+/// Allocates `dimensions.length` nested array levels around `component_type` (which may itself be
+/// an array type). Every level is stored into its parent as soon as it exists, so the whole tree
+/// stays reachable from the rooted outermost array.
+pub(crate) fn multi_new_array(component_type_clazz_ref: i32, dimensions_ref: i32) -> Result<i32> {
+    let _roots = JavaThread::hold_temp_roots(vec![
+        Slot::Ref(component_type_clazz_ref),
+        Slot::Ref(dimensions_ref),
+    ]);
+    if component_type_clazz_ref == 0 || dimensions_ref == 0 {
+        set_pending_null_pointer_exception()?;
+        return Ok(0);
+    }
+    let count = HEAP.get_array_len(dimensions_ref)?;
+    if count == 0 {
+        return illegal_argument("Empty dimensions array");
+    }
+    let mut dimensions = Vec::with_capacity(count as usize);
+    for index in 0..count {
+        let length = HEAP.get_array_value(dimensions_ref, index)?[0];
+        if length < 0 {
+            crate::vm::exception::pending_helpers::set_pending_negative_array_size_exception(
+                &length.to_string(),
+            )?;
+            return Ok(0);
+        }
+        dimensions.push(length);
+    }
+
+    let element = decorate(
+        klass(component_type_clazz_ref)?
+            .this_class_name()
+            .to_owned(),
+    );
+    if element == "V" {
+        return illegal_argument("Cannot create an array of void");
+    }
+    let total_rank = dimensions.len() + element.chars().take_while(|c| *c == '[').count();
+    if total_rank > 255 {
+        return illegal_argument("Array has too many dimensions");
+    }
+
+    let mut outer = RootedSlots::new();
+    allocate_level(&element, &dimensions, &mut outer)
+}
+
+fn allocate_level(
+    element: &str,
+    dimensions: &[i32],
+    destination: &mut RootedSlots,
+) -> Result<i32> {
+    let type_name = format!("{}{element}", "[".repeat(dimensions.len()));
+    let array_ref = HEAP.create_array(&type_name, dimensions[0], destination)?;
+    if dimensions.len() > 1 {
+        for index in 0..dimensions[0] {
+            let mut child = RootedSlots::new();
+            let child_ref = allocate_level(element, &dimensions[1..], &mut child)?;
+            HEAP.set_array_value(array_ref, index, vec![child_ref])?;
+        }
+    }
+    Ok(array_ref)
 }

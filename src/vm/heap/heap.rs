@@ -235,6 +235,20 @@ impl Heap {
         Ok(Some(result))
     }
 
+    /// The class id of a non-array object, or `None` for an array. Unlike `get_instance_name` this
+    /// neither resolves the class nor allocates, so call sites can use it as an inline-cache key.
+    pub(crate) fn instance_klass_id(&self, objectref: i32) -> Result<Option<usize>> {
+        let entry = self.data.get(objectref).ok_or_else(|| {
+            Error::new_execution(&format!(
+                "error getting object from heap by ref {objectref}"
+            ))
+        })?;
+        Ok(match entry.value() {
+            Object(java_instance) => Some(java_instance.klass_id()),
+            Arr(_) => None,
+        })
+    }
+
     pub fn get_instance_name(&self, objectref: i32) -> Result<String> {
         if let Some(entry) = self.data.get(objectref) {
             match entry.value() {

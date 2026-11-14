@@ -7,6 +7,20 @@ use std::fmt::Display;
 use tracing::trace;
 
 pub(crate) fn process(code: u8, stack_frames: &mut StackFrames) -> Result<()> {
+    if matches!(code, IDIV | IREM | LDIV | LREM) && divisor_is_zero(code, stack_frames)? {
+        // JVMS 6.5: integer division and remainder by zero throw ArithmeticException. The operands
+        // stay on the stack; unwinding to a handler discards them.
+        return crate::vm::exception::common::construct_exception_and_throw(
+            "java/lang/ArithmeticException",
+            "<init>:(Ljava/lang/String;)V",
+            &[crate::vm::stack::stack_value::StackValueKind::Ref(
+                crate::vm::execution_engine::string_pool_helper::StringPoolHelper::get_string(
+                    "/ by zero",
+                )?,
+            )],
+            stack_frames,
+        );
+    }
     let stack_frame = last_frame_mut(stack_frames)?;
     match code {
         IADD => binary_operation(stack_frame, |a: i32, b| a.wrapping_add(b), "IADD"),
@@ -93,6 +107,20 @@ fn unary_operation<T: StackValue + Copy + Display>(
     stack_frame.incr_pc();
     trace!("{name} -> ({value})->{result}");
     Ok(())
+}
+
+/// Whether the divisor on top of the operand stack of an `IDIV`/`IREM`/`LDIV`/`LREM` is zero.
+fn divisor_is_zero(code: u8, stack_frames: &mut StackFrames) -> Result<bool> {
+    let frame = last_frame_mut(stack_frames)?;
+    Ok(if matches!(code, IDIV | IREM) {
+        let divisor: i32 = frame.pop();
+        frame.push(divisor)?;
+        divisor == 0
+    } else {
+        let divisor: i64 = frame.pop();
+        frame.push(divisor)?;
+        divisor == 0
+    })
 }
 
 fn binary_operation<T1: StackValue + Copy + Display, T2: StackValue + Copy + Display>(

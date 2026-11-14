@@ -285,15 +285,17 @@ fn jni_handles_failed_pop_preserves_child_and_parent_records() {
             &mut crate::vm::stack::rooted_slots::RootedSlots::new(),
         )
         .unwrap();
+    // Like HotSpot's, frames grow past MaxJNILocalCapacity on demand
     for _ in 0..65_536 {
         assert!(!new_local(target).is_null());
     }
     JavaThread::with_jni_frames(|frames| frames.push(1, false)).unwrap();
     let child = new_local(target);
-    assert_eq!(
-        JavaThread::with_jni_frames(|frames| frames.pop(child)),
-        Err(HandleError::OutOfMemory)
-    );
+    // Moving the result to the parent needs a token; without one the pop fails as a whole
+    let next = exhaust_tokens_for_test();
+    let failed = JavaThread::with_jni_frames(|frames| frames.pop(child));
+    restore_tokens_for_test(next);
+    assert_eq!(failed, Err(HandleError::OutOfMemory));
     assert_eq!(resolve(child), Some(target));
     assert_eq!(local_roots().len(), 65_537);
     assert_eq!(

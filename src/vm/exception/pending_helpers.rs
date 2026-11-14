@@ -11,7 +11,7 @@
 //! cannot receive `&mut StackFrames` across the libffi boundary) raise precise
 //! Java exceptions without threading the call stack into the FFI layer.
 
-use crate::vm::error::Result;
+use crate::vm::error::{Error, Result};
 use crate::vm::execution_engine::executor::Executor;
 use crate::vm::execution_engine::string_pool_helper::StringPoolHelper;
 use crate::vm::jni::java_thread::JavaThread;
@@ -47,6 +47,21 @@ pub(crate) fn set_pending_array_store_exception(message: &str) -> Result<()> {
 /// Sets a pending `ArrayIndexOutOfBoundsException` with the given message.
 pub(crate) fn set_pending_array_index_out_of_bounds_exception(message: &str) -> Result<()> {
     set_pending_exception_with_message("java/lang/ArrayIndexOutOfBoundsException", message)
+}
+
+/// Sets a pending `ArrayIndexOutOfBoundsException` without a message, as HotSpot's reflective
+/// array accessors (`Reflection::array_get`/`array_set`) raise it.
+pub(crate) fn set_pending_array_index_out_of_bounds_exception_without_message() -> Result<()> {
+    set_pending_exception(
+        "java/lang/ArrayIndexOutOfBoundsException",
+        "<init>:()V",
+        &[],
+    )
+}
+
+/// Sets a pending `NegativeArraySizeException`; HotSpot's message is the requested length.
+pub(crate) fn set_pending_negative_array_size_exception(message: &str) -> Result<()> {
+    set_pending_exception_with_message("java/lang/NegativeArraySizeException", message)
 }
 
 /// Sets a pending `IndexOutOfBoundsException` (no message), as HotSpot's `io_util.c` does.
@@ -171,4 +186,27 @@ pub(super) fn set_pending_exception(
         warn!("Dropping {class_name}: {e}");
     }
     Ok(())
+}
+
+/// Builds a Java exception and returns it as an error the interpreter rethrows in Java, for VM code
+/// that cannot (or should not) continue: an unsupported feature becomes a catchable exception
+/// instead of a Rust panic that aborts the whole VM. If constructing the exception itself fails,
+/// that failure is returned instead.
+pub(crate) fn java_exception(class_name: &str, message: &str) -> Error {
+    let construct = || -> Result<Error> {
+        let message = StringPoolHelper::create_string(message)?;
+        let throwable = Executor::invoke_args_constructor(
+            class_name,
+            "<init>:(Ljava/lang/String;)V",
+            &[StackValueKind::Ref(message[0].value())],
+            None,
+        )?;
+        Ok(Error::uncaught_exception(throwable[0]))
+    };
+    construct().unwrap_or_else(|error| error)
+}
+
+/// `UnsupportedOperationException` for VM features that are not implemented yet.
+pub(crate) fn unsupported(message: &str) -> Error {
+    java_exception("java/lang/UnsupportedOperationException", message)
 }

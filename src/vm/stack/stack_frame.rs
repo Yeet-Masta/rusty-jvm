@@ -8,18 +8,14 @@ use jclassmodel::exception_table::ExceptionTableRecord;
 use jclassmodel::CatchType;
 use std::collections::BTreeMap;
 use std::fmt::Display;
-use std::sync::atomic::AtomicU32;
-use std::sync::atomic::Ordering::SeqCst;
 use std::sync::Arc;
 use tracing::trace;
 
-static COUNTER: AtomicU32 = AtomicU32::new(0);
-
 #[derive(Clone, Debug)]
 pub(crate) struct StackFrame {
-    #[allow(dead_code)]
-    index: u32, // this field is only for debugging, it isn't involved in any program logic
-    method_name: Arc<String>, // this field is only for debugging, it isn't involved in any program logic
+    /// Per-method metadata shared by every frame of the method: one reference-count update per
+    /// call instead of one per field.
+    code: Arc<FrameCode>,
     pc: usize,
     /// Start pc of the instruction currently being dispatched, stamped by the interpreter loop
     /// before the opcode's operands are decoded. Unlike `pc` (which the handler advances while
@@ -30,13 +26,49 @@ pub(crate) struct StackFrame {
     ex_pc: Option<usize>,
     locals: Box<[Slot]>,
     operand_stack: Stack<Slot>,
-    bytecode_ref: Arc<Vec<u8>>,
-    current_class_name: Arc<String>,
-    line_numbers: Arc<BTreeMap<u16, u16>>,
-    exception_table: Arc<ExceptionTable>,
     synchronized_method: bool,
     synchronized_static: bool,
     synchronized_monitor: Option<i32>,
+    /// This frame's class, resolved from `current_class_name` on first use. Opcodes that consult
+    /// their own class (invokes, field access, `ldc`) then skip the by-name registry lookup.
+    klass: ClassCache,
+}
+
+/// Lazily resolved class of a frame; `Debug` prints a marker instead of the whole class.
+#[derive(Clone, Default)]
+struct ClassCache(std::sync::OnceLock<Arc<crate::vm::method_area::java_class::JavaClass>>);
+
+impl std::fmt::Debug for ClassCache {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(if self.0.get().is_some() {
+            "<resolved>"
+        } else {
+            "<unresolved>"
+        })
+    }
+}
+
+/// The immutable, per-method part of a frame. Built once per method and shared by its frames.
+#[derive(Debug)]
+pub(crate) struct FrameCode {
+    pub(crate) method_name: Arc<String>,
+    pub(crate) bytecode: Arc<Vec<u8>>,
+    pub(crate) class_name: Arc<String>,
+    pub(crate) line_numbers: Arc<BTreeMap<u16, u16>>,
+    pub(crate) exception_table: Arc<ExceptionTable>,
+}
+
+impl FrameCode {
+    /// Metadata for a native method's synthetic frame: no bytecode, lines or handlers.
+    pub(crate) fn native(method_name: Arc<String>, class_name: Arc<String>) -> Self {
+        Self {
+            method_name,
+            bytecode: Arc::new(Vec::new()),
+            class_name,
+            line_numbers: Arc::new(BTreeMap::new()),
+            exception_table: Arc::new(ExceptionTable::new(Vec::new())),
+        }
+    }
 }
 
 #[derive(Debug, new)]
@@ -89,12 +121,32 @@ impl ExceptionTable {
     }
 }
 
-#[derive(Debug, new)]
+#[derive(Debug)]
 pub struct StackFrames {
     frames: Vec<StackFrame>,
+    /// Java frames of this thread in older segments (outer interpreter loops paused in native
+    /// code), so [`StackFrames::depth`] is the thread's whole Java stack depth.
+    base_depth: usize,
 }
 
 impl StackFrames {
+    pub fn new(frames: Vec<StackFrame>) -> Self {
+        Self {
+            frames,
+            base_depth: 0,
+        }
+    }
+
+    pub(crate) fn set_base_depth(&mut self, base_depth: usize) {
+        self.base_depth = base_depth;
+    }
+
+    /// Java frames on this thread, across all segments.
+    #[inline]
+    pub(crate) fn depth(&self) -> usize {
+        self.base_depth + self.frames.len()
+    }
+
     pub fn iter(&self) -> std::slice::Iter<'_, StackFrame> {
         self.frames.iter()
     }
@@ -197,21 +249,32 @@ impl StackFrame {
         line_numbers: Arc<BTreeMap<u16, u16>>,
         exception_table: Arc<ExceptionTable>,
     ) -> Self {
+        Self::from_code(
+            Arc::new(FrameCode {
+                method_name,
+                bytecode: bytecode_ref,
+                class_name: current_class_name,
+                line_numbers,
+                exception_table,
+            }),
+            locals_size,
+            stack_size,
+        )
+    }
+
+    /// A frame for a method whose shared metadata is already built.
+    pub(crate) fn from_code(code: Arc<FrameCode>, locals_size: usize, stack_size: usize) -> Self {
         StackFrame {
-            index: COUNTER.fetch_add(1, SeqCst),
-            method_name,
+            code,
             pc: 0,
             bci: 0,
             ex_pc: None,
             locals: vec![Slot::Value(0); locals_size].into_boxed_slice(),
             operand_stack: Stack::with_capacity(stack_size),
-            bytecode_ref,
-            current_class_name,
-            line_numbers,
-            exception_table,
             synchronized_method: false,
             synchronized_static: false,
             synchronized_monitor: None,
+            klass: ClassCache::default(),
         }
     }
 
@@ -245,21 +308,25 @@ impl StackFrame {
         current_class_name: Arc<String>,
         args: Vec<Slot>,
     ) -> Self {
+        Self::native_from_code(
+            Arc::new(FrameCode::native(method_name, current_class_name)),
+            args,
+        )
+    }
+
+    /// A native method's synthetic frame over already-built shared metadata.
+    pub(crate) fn native_from_code(code: Arc<FrameCode>, args: Vec<Slot>) -> Self {
         StackFrame {
-            index: COUNTER.fetch_add(1, SeqCst),
-            method_name,
+            code,
             pc: 0,
             bci: 0,
             ex_pc: None,
             locals: args.into_boxed_slice(),
             operand_stack: Stack::with_capacity(0),
-            bytecode_ref: Arc::new(Vec::new()),
-            current_class_name,
-            line_numbers: Arc::new(BTreeMap::new()),
-            exception_table: Arc::new(ExceptionTable::new(Vec::new())),
             synchronized_method: false,
             synchronized_static: false,
             synchronized_monitor: None,
+            klass: ClassCache::default(),
         }
     }
 
@@ -279,25 +346,46 @@ impl StackFrame {
     }
 
     pub fn current_class_name(&self) -> &str {
-        &self.current_class_name
+        &self.code.class_name
+    }
+
+    /// The class this frame executes, resolved once per frame and then reused.
+    pub(crate) fn current_class(
+        &self,
+    ) -> Result<Arc<crate::vm::method_area::java_class::JavaClass>> {
+        if let Some(klass) = self.klass.0.get() {
+            return Ok(Arc::clone(klass));
+        }
+        let klass = crate::vm::method_area::loaded_classes::CLASSES.get(&self.code.class_name)?;
+        Ok(Arc::clone(self.klass.0.get_or_init(|| klass)))
+    }
+
+    /// The shared class-name handle itself, for identity comparison without touching its count.
+    pub(crate) fn current_class_name_ref(&self) -> &Arc<String> {
+        &self.code.class_name
+    }
+
+    /// Shared handle to the class name; cloning it is a reference-count bump, not a copy.
+    pub(crate) fn current_class_name_arc(&self) -> Arc<String> {
+        Arc::clone(&self.code.class_name)
     }
 
     pub fn get_bytecode_byte(&self) -> u8 {
-        self.bytecode_ref[self.pc]
+        self.code.bytecode[self.pc]
     }
 
     pub fn get_two_bytes_ahead(&self) -> i16 {
-        let branchbyte1 = self.bytecode_ref[self.pc + 1] as u16;
-        let branchbyte2 = self.bytecode_ref[self.pc + 2] as u16;
+        let branchbyte1 = self.code.bytecode[self.pc + 1] as u16;
+        let branchbyte2 = self.code.bytecode[self.pc + 2] as u16;
 
         ((branchbyte1 << 8) | branchbyte2) as i16
     }
 
     pub fn get_four_bytes_ahead(&self) -> i32 {
-        let byte1 = self.bytecode_ref[self.pc + 1] as u32;
-        let byte2 = self.bytecode_ref[self.pc + 2] as u32;
-        let byte3 = self.bytecode_ref[self.pc + 3] as u32;
-        let byte4 = self.bytecode_ref[self.pc + 4] as u32;
+        let byte1 = self.code.bytecode[self.pc + 1] as u32;
+        let byte2 = self.code.bytecode[self.pc + 2] as u32;
+        let byte3 = self.code.bytecode[self.pc + 3] as u32;
+        let byte4 = self.code.bytecode[self.pc + 4] as u32;
 
         ((byte1 << 24) | (byte2 << 16) | (byte3 << 8) | byte4) as i32
     }
@@ -480,15 +568,15 @@ impl StackFrame {
     }
 
     pub fn line_numbers(&self) -> &BTreeMap<u16, u16> {
-        &self.line_numbers
+        &self.code.line_numbers
     }
 
     pub fn exception_table(&self) -> &Arc<ExceptionTable> {
-        &self.exception_table
+        &self.code.exception_table
     }
 
     pub fn method_name(&self) -> &str {
-        &self.method_name
+        &self.code.method_name
     }
 
     /// Returns the exception program counter (ex_pc) if it is set, otherwise returns the current program counter (pc).
@@ -502,15 +590,15 @@ impl Display for StackFrame {
         write!(
             f,
             r#"StackFrame {{ method_name: "{}", pc: {}, ex_pc: {:?}, locals: {:?}, operand_stack: {:?}, bytecode_ref: {:?}, current_class_name: "{}", line_numbers: {:?}, exception_table: {:?} }}"#,
-            self.method_name,
+            self.code.method_name,
             self.pc,
             self.ex_pc,
             self.locals,
             self.operand_stack,
-            self.bytecode_ref,
-            self.current_class_name,
-            self.line_numbers,
-            self.exception_table,
+            self.code.bytecode,
+            self.code.class_name,
+            self.code.line_numbers,
+            self.code.exception_table,
         )
     }
 }

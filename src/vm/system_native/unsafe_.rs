@@ -360,7 +360,7 @@ fn get_int_via_object(obj_ref: i32, offset: i64) -> Result<i32> {
             Ok(get_field_raw_value(obj_ref, offset)?[0])
         }
     } else {
-        todo!("implement get_int for null object");
+        get_int_raw(offset)
     }
 }
 
@@ -373,8 +373,7 @@ pub(crate) fn get_int_volatile(this: i32, obj_ref: i32, offset: i64) -> Result<i
 // todo: thread-safety - not volatile
 /// `jdk.internal.misc.Unsafe.getBooleanVolatile(Ljava/lang/Object;J)Z`
 pub(crate) fn get_boolean_volatile(this: i32, obj_ref: i32, offset: i64) -> Result<bool> {
-    let ret = get_int(this, obj_ref, offset)?;
-    Ok(ret != 0)
+    get_boolean(this, obj_ref, offset)
 }
 
 /// `jdk.internal.misc.Unsafe.getLong(Ljava/lang/Object;J)J`
@@ -833,4 +832,194 @@ pub(crate) fn set_memory0(
     }
 
     Ok(())
+}
+
+// Floating-point and boolean accessors are bit-for-bit views of the integer ones, and the
+// volatile/acquire forms reuse the plain ones: every heap access already goes through the heap's
+// synchronized storage, and raw-memory accesses are aligned word accesses.
+
+/// `jdk.internal.misc.Unsafe.getBoolean(Ljava/lang/Object;J)Z`
+pub(crate) fn get_boolean(this: i32, obj_ref: i32, offset: i64) -> Result<bool> {
+    Ok(get_byte(this, obj_ref, offset)? != 0)
+}
+
+/// `jdk.internal.misc.Unsafe.putBoolean(Ljava/lang/Object;JZ)V`
+pub(crate) fn put_boolean(this: i32, obj_ref: i32, offset: i64, x: bool) -> Result<()> {
+    put_byte(this, obj_ref, offset, x as i8)
+}
+
+/// `jdk.internal.misc.Unsafe.getFloat(Ljava/lang/Object;J)F`
+pub(crate) fn get_float(this: i32, obj_ref: i32, offset: i64) -> Result<f32> {
+    Ok(f32::from_bits(get_int(this, obj_ref, offset)? as u32))
+}
+
+/// `jdk.internal.misc.Unsafe.putFloat(Ljava/lang/Object;JF)V`
+pub(crate) fn put_float(this: i32, obj_ref: i32, offset: i64, x: f32) -> Result<()> {
+    put_int(this, obj_ref, offset, x.to_bits() as i32)
+}
+
+/// `jdk.internal.misc.Unsafe.getDouble(Ljava/lang/Object;J)D`
+pub(crate) fn get_double(this: i32, obj_ref: i32, offset: i64) -> Result<f64> {
+    Ok(f64::from_bits(get_long(this, obj_ref, offset)? as u64))
+}
+
+/// `jdk.internal.misc.Unsafe.putDouble(Ljava/lang/Object;JD)V`
+pub(crate) fn put_double(this: i32, obj_ref: i32, offset: i64, x: f64) -> Result<()> {
+    put_long(this, obj_ref, offset, x.to_bits() as i64)
+}
+
+/// `jdk.internal.misc.Unsafe.getByteVolatile(Ljava/lang/Object;J)B`
+pub(crate) fn get_byte_volatile(this: i32, obj_ref: i32, offset: i64) -> Result<i8> {
+    get_byte(this, obj_ref, offset)
+}
+
+/// `jdk.internal.misc.Unsafe.getShortVolatile(Ljava/lang/Object;J)S`
+pub(crate) fn get_short_volatile(this: i32, obj_ref: i32, offset: i64) -> Result<i16> {
+    get_short(this, obj_ref, offset)
+}
+
+/// `jdk.internal.misc.Unsafe.getCharVolatile(Ljava/lang/Object;J)C`
+pub(crate) fn get_char_volatile(this: i32, obj_ref: i32, offset: i64) -> Result<u16> {
+    get_char(this, obj_ref, offset)
+}
+
+/// `jdk.internal.misc.Unsafe.getFloatVolatile(Ljava/lang/Object;J)F`
+pub(crate) fn get_float_volatile(this: i32, obj_ref: i32, offset: i64) -> Result<f32> {
+    get_float(this, obj_ref, offset)
+}
+
+/// `jdk.internal.misc.Unsafe.getDoubleVolatile(Ljava/lang/Object;J)D`
+pub(crate) fn get_double_volatile(this: i32, obj_ref: i32, offset: i64) -> Result<f64> {
+    get_double(this, obj_ref, offset)
+}
+
+/// `jdk.internal.misc.Unsafe.putBooleanVolatile(Ljava/lang/Object;JZ)V`
+pub(crate) fn put_boolean_volatile(this: i32, obj_ref: i32, offset: i64, x: bool) -> Result<()> {
+    put_boolean(this, obj_ref, offset, x)
+}
+
+/// `jdk.internal.misc.Unsafe.putByteVolatile(Ljava/lang/Object;JB)V`
+pub(crate) fn put_byte_volatile(this: i32, obj_ref: i32, offset: i64, x: i8) -> Result<()> {
+    put_byte(this, obj_ref, offset, x)
+}
+
+/// `jdk.internal.misc.Unsafe.putShortVolatile(Ljava/lang/Object;JS)V`
+pub(crate) fn put_short_volatile(this: i32, obj_ref: i32, offset: i64, x: i16) -> Result<()> {
+    put_short(this, obj_ref, offset, x)
+}
+
+/// `jdk.internal.misc.Unsafe.putCharVolatile(Ljava/lang/Object;JC)V`
+pub(crate) fn put_char_volatile(this: i32, obj_ref: i32, offset: i64, x: u16) -> Result<()> {
+    put_char(this, obj_ref, offset, x)
+}
+
+/// `jdk.internal.misc.Unsafe.putLongVolatile(Ljava/lang/Object;JJ)V`
+pub(crate) fn put_long_volatile(this: i32, obj_ref: i32, offset: i64, x: i64) -> Result<()> {
+    put_long(this, obj_ref, offset, x)
+}
+
+/// `jdk.internal.misc.Unsafe.putFloatVolatile(Ljava/lang/Object;JF)V`
+pub(crate) fn put_float_volatile(this: i32, obj_ref: i32, offset: i64, x: f32) -> Result<()> {
+    put_float(this, obj_ref, offset, x)
+}
+
+/// `jdk.internal.misc.Unsafe.putDoubleVolatile(Ljava/lang/Object;JD)V`
+pub(crate) fn put_double_volatile(this: i32, obj_ref: i32, offset: i64, x: f64) -> Result<()> {
+    put_double(this, obj_ref, offset, x)
+}
+
+/// `jdk.internal.misc.Unsafe.reallocateMemory0(JJ)J`
+pub(crate) fn reallocate_memory0(this: i32, address: i64, bytes: i64) -> Result<i64> {
+    if address == 0 {
+        return allocate_memory0(this, bytes);
+    }
+    if bytes == 0 {
+        free_memory0(this, address)?;
+        return Ok(0);
+    }
+    let old_size = ALLOCATIONS.get(&address).map(|size| *size).ok_or_else(|| {
+        Error::new_native("reallocateMemory0 of memory not from allocateMemory0")
+    })?;
+    let new_address = allocate_memory0(this, bytes)?;
+    let copied = old_size.min(bytes as usize);
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            address as usize as *const u8,
+            new_address as usize as *mut u8,
+            copied,
+        )
+    };
+    free_memory0(this, address)?;
+    Ok(new_address)
+}
+
+/// `jdk.internal.misc.Unsafe.allocateInstance(Ljava/lang/Class;)Ljava/lang/Object;`
+///
+/// An instance with default field values and no constructor run, after initializing the class.
+pub(crate) fn allocate_instance(_this: i32, class_ref: i32) -> Result<i32> {
+    use crate::vm::exception::pending_helpers::java_exception;
+    if class_ref == 0 {
+        return Err(java_exception(
+            "java/lang/NullPointerException",
+            "class is null",
+        ));
+    }
+    let class = crate::vm::helper::klass(class_ref)?;
+    let name = class.this_class_name().to_owned();
+    if name.starts_with('[')
+        || class.is_interface()
+        || class
+            .class_modifiers()
+            .contains(jclassmodel::modifiers::ClassModifier::Abstract)
+        || is_primitive_name(&name)
+    {
+        return Err(java_exception(
+            "java/lang/InstantiationException",
+            &name.replace('/', "."),
+        ));
+    }
+    crate::vm::execution_engine::static_init::StaticInit::initialize(&name)?;
+    let instance = crate::vm::method_area::method_area::with_method_area(|method_area| {
+        method_area.create_instance_with_default_fields(&name)
+    })?;
+    let mut destination = crate::vm::stack::rooted_slots::RootedSlots::new();
+    HEAP.create_instance(instance, &mut destination)
+}
+
+fn is_primitive_name(name: &str) -> bool {
+    matches!(
+        name,
+        "int" | "long" | "short" | "byte" | "char" | "boolean" | "float" | "double" | "void"
+    )
+}
+
+/// `jdk.internal.misc.Unsafe.throwException(Ljava/lang/Throwable;)V`
+pub(crate) fn throw_exception(_this: i32, throwable: i32) -> Result<()> {
+    if throwable == 0 {
+        return Err(crate::vm::exception::pending_helpers::java_exception(
+            "java/lang/NullPointerException",
+            "throwable is null",
+        ));
+    }
+    Err(Error::uncaught_exception(
+        crate::vm::stack::slot::Slot::Ref(throwable),
+    ))
+}
+
+/// `jdk.internal.misc.Unsafe.getLoadAverage0([DI)I`
+pub(crate) fn get_load_average0(_this: i32, loadavg: i32, nelems: i32) -> Result<i32> {
+    if cfg!(windows) {
+        // Windows has no load average; HotSpot reports it as unavailable.
+        return Ok(-1);
+    }
+    let Ok(load) = sysinfo::System::load_average() else {
+        return Ok(-1);
+    };
+    let values = [load.one, load.five, load.fifteen];
+    let count = (nelems.clamp(0, 3)) as usize;
+    for (index, value) in values.iter().take(count).enumerate() {
+        let bits = value.to_bits() as i64;
+        HEAP.set_array_value(loadavg, index as i32, crate::vm::helper::i64_to_vec(bits))?;
+    }
+    Ok(count as i32)
 }

@@ -306,7 +306,7 @@ fn build_lookup_for_class(current_class_name: &str) -> Result<i32> {
     StaticInit::initialize_java_class(&lookup_klass)?;
     let impl_lookup = lookup_klass
         .static_field("IMPL_LOOKUP")
-        .ok_or(Error::new_execution("Error getting IMPL_LOOKUP field"))?;
+        .ok_or_else(|| Error::new_execution("Error getting IMPL_LOOKUP field"))?;
 
     let impl_lookup_ref = impl_lookup.raw_value()?[0];
 

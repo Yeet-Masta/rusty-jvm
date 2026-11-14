@@ -158,6 +158,15 @@ fn collect_during_opcode_lookup(
 
     let dead = HEAP.create_array("[I", 0, &mut RootedSlots::new()).unwrap();
     safepoint::attach();
+    // The claimed class is already published; force the claim path so the opcode really waits.
+    struct ForceClaimPath;
+    impl Drop for ForceClaimPath {
+        fn drop(&mut self) {
+            super::FORCE_CLAIM_PATH.store(false, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+    super::FORCE_CLAIM_PATH.store(true, std::sync::atomic::Ordering::Relaxed);
+    let _force_claim_path = ForceClaimPath;
     let claim = CLASSES.loading.claim(claimed);
     let (published, publication) = channel();
     let worker = std::thread::spawn(move || {
@@ -285,4 +294,30 @@ fn gc_ref_transfer_getfield_keeps_receiver_and_result_during_class_claim_wait() 
         Slot::Ref(value),
         &[operand, value],
     );
+}
+
+/// Lookups of published classes run on every interpreted call and field access; they must not
+/// take the per-name claim, or all Java threads serialize on it (fork/join regression).
+#[test]
+fn published_class_lookup_does_not_wait_for_claim() {
+    let _serial = safepoint::tests::SERIAL.lock().unwrap();
+    crate::vm::gc::test_allocations::bootstrap_oom();
+    let claim = CLASSES.loading.claim(OBJECT);
+    let (done, finished) = channel();
+    let worker = std::thread::spawn(move || {
+        let found = CLASSES
+            .get(OBJECT)
+            .map(|class| class.this_class_name().to_string())
+            .map_err(|error| error.to_string());
+        done.send(()).unwrap();
+        found
+    });
+    let returned = finished.recv_timeout(Duration::from_secs(5));
+    drop(claim);
+    let found = worker.join().unwrap();
+    assert!(
+        returned.is_ok(),
+        "published class lookup waited for the claim"
+    );
+    assert_eq!(found.unwrap(), OBJECT);
 }

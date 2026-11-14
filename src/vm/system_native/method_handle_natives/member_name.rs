@@ -63,6 +63,15 @@ impl MemberName {
         Ok(())
     }
 
+    /// Points `clazz` at the class that declares the resolved member, as HotSpot does, so that
+    /// later queries (`staticFieldBase`, `getDeclaringClass`) see the holder, not the class the
+    /// lookup started from.
+    pub fn propagate_clazz(&mut self, class_name: &str, mirror_ref: i32) -> Result<()> {
+        HEAP.set_object_field_value(self.member_name_ref, MEMBER_NAME, "clazz", vec![mirror_ref])?;
+        self.class_name = class_name.to_owned();
+        Ok(())
+    }
+
     pub fn propagate_method(&mut self, method: ResolvedMethodName) -> Result<()> {
         self.method = Some(method);
 

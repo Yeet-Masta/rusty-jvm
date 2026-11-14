@@ -82,15 +82,20 @@ pub(super) extern "system" fn new_object_array(
         return std::ptr::null_mut();
     }
 
-    if HEAP
-        .get_instance_name(clazz_ref)
-        .expect("Invalid class reference")
-        != "java/lang/Class"
-    {
-        panic!("Class reference is not a Class"); // OpenJDK crashes here, why we shouldn't
+    // HotSpot crashes on a non-Class element class; report it as an InternalError instead.
+    if HEAP.get_instance_name(clazz_ref).ok().as_deref() != Some("java/lang/Class") {
+        crate::vm::jni::utils::set_pending_internal_error(
+            "NewObjectArray: element class is not a java.lang.Class",
+        );
+        return std::ptr::null_mut();
     }
-
-    let klass = klass(clazz_ref).expect("Failed to get class from reference");
+    let klass = match klass(clazz_ref) {
+        Ok(klass) => klass,
+        Err(error) => {
+            crate::vm::jni::utils::set_pending_vm_error(&error);
+            return std::ptr::null_mut();
+        }
+    };
     let class_name = klass.this_class_name();
     let type_name = if class_name.starts_with("[") {
         format!("[{class_name}")

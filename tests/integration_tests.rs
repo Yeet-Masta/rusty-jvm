@@ -2610,6 +2610,62 @@ instance int set:    7
     );
 }
 
+/// Contended `synchronized` plus a producer/consumer that mixes `wait`, `notify` and `notifyAll`.
+/// Guards against a thread that starts waiting after a notification consuming it (lost wakeup).
+#[test]
+fn should_handle_contended_monitors_and_wait_notify_slowtest() {
+    assert_success(
+        "samples.concurrency.monitorcontention.MonitorContentionExample",
+        r#"counter: 160000 (expected 160000)
+consumed sum: 31996000 (expected 31996000)
+reentrant depth: 50
+"#,
+    );
+}
+
+#[test]
+fn should_support_typed_reflective_array_accessors() {
+    assert_success(
+        "samples.reflection.reflectarrayaccessors.ReflectArrayAccessorsExample",
+        r#"boolean: true [false, true]
+byte: -7 widened to long -7
+char: Z as int 90
+short: 300 as float 300.0
+long: 1099511627776 as double 1.099511627776E12
+float: 2.5
+double: [1.25, 3.0]
+byte into long[]: 9
+setLong on int[]: IllegalArgumentException
+getByte on int[]: IllegalArgumentException
+out of bounds: null
+cube: 2x3x4 corner=42
+grid: [[null, hi], [null, null]]
+nested: 2 1 null
+negative: -1
+"#,
+    );
+}
+
+#[test]
+fn should_dispatch_interface_and_unreflected_method_handles() {
+    assert_success(
+        "samples.reflection.methodhandledispatch.MethodHandleDispatchExample",
+        r#"square area: 9.0
+circle area: 12.0
+Square with area 4.0
+round thing, r=1.0
+animal sound: ...
+dog sound: woof
+dog kind: animal
+unreflected interface: 25.0
+count via getter: 42
+count via field: 42
+label via getter: updated
+caught NullPointerException
+"#,
+    );
+}
+
 #[test]
 fn should_work_with_method_handle() {
     assert_success(
@@ -3262,7 +3318,7 @@ Caught as Throwable: java.lang.RuntimeException: Exception in try. cause=null st
 Uncaught exception in try, finally still executes: try-finally
 
 Running case: ExceptionFromNativeMethod
-Caught as IOException: java.io.FileNotFoundException: {ERROR_TEXT}. cause=null stackTrace=[java.io.FileOutputStream.open0(Native Method), java.io.FileOutputStream.open(FileOutputStream.java:255), java.io.FileOutputStream.<init>(FileOutputStream.java:210), java.io.FileOutputStream.<init>(FileOutputStream.java:120), java.io.FileWriter.<init>(FileWriter.java:67), samples.javacore.exceptionexample.ExceptionFromNativeMethod.open(ExceptionExample.java:231), samples.javacore.exceptionexample.ExceptionFromNativeMethod.runImpl(ExceptionExample.java:224), samples.javacore.exceptionexample.Case.run(ExceptionExample.java:32), samples.javacore.exceptionexample.ExceptionExample.main(ExceptionExample.java:21)] suppressed=[]
+Caught as IOException: java.io.FileNotFoundException: {ERROR_TEXT}. cause=null stackTrace=[java.base/java.io.FileOutputStream.open0(Native Method), java.base/java.io.FileOutputStream.open(FileOutputStream.java:255), java.base/java.io.FileOutputStream.<init>(FileOutputStream.java:210), java.base/java.io.FileOutputStream.<init>(FileOutputStream.java:120), java.base/java.io.FileWriter.<init>(FileWriter.java:67), samples.javacore.exceptionexample.ExceptionFromNativeMethod.open(ExceptionExample.java:231), samples.javacore.exceptionexample.ExceptionFromNativeMethod.runImpl(ExceptionExample.java:224), samples.javacore.exceptionexample.Case.run(ExceptionExample.java:32), samples.javacore.exceptionexample.ExceptionExample.main(ExceptionExample.java:21)] suppressed=[]
 
 "#.replace("{ERROR_TEXT}", expected_error_text).as_str(),
     );
@@ -3295,42 +3351,10 @@ fn should_start_trace_at_call_site_when_fill_in_stack_trace_called_explicitly() 
 #[test]
 fn should_print_info_about_unhandled_exception() {
     const ENTRY: &str = "samples.javacore.unhandledexception.UnhandledExceptionExample";
-    // `String`'s line numbers differ between JDK releases, so take them from the reference JVM's
-    // trace (which can't be compared as a whole: unlike ours, it prefixes frames with module names)
-    let reference_stderr = utils::run_reference_jvm(&[], ENTRY).stderr;
-    let string_line = |method: &str| {
-        Regex::new(&format!(
-            r"java\.lang\.String\.{method}\(String\.java:(\d+)\)"
-        ))
-        .unwrap()
-        .captures(&reference_stderr)
-        .unwrap_or_else(|| panic!("No String.{method} frame in: {reference_stderr}"))[1]
-            .to_string()
-    };
-    let check_bounds_line = string_line("checkBoundsBeginEnd");
-    let substring_line = string_line("substring");
-    utils::assert_failure_with_stderr(
-        ENTRY,
-        r#""#,
-        &format!(
-            r#"Exception in thread "main" java.lang.StringIndexOutOfBoundsException: Range [2, 1) out of bounds for length 5
-	at jdk.internal.util.Preconditions$1.apply(Preconditions.java:55)
-	at jdk.internal.util.Preconditions$1.apply(Preconditions.java:52)
-	at jdk.internal.util.Preconditions$4.apply(Preconditions.java:213)
-	at jdk.internal.util.Preconditions$4.apply(Preconditions.java:210)
-	at jdk.internal.util.Preconditions.outOfBounds(Preconditions.java:98)
-	at jdk.internal.util.Preconditions.outOfBoundsCheckFromToIndex(Preconditions.java:112)
-	at jdk.internal.util.Preconditions.checkFromToIndex(Preconditions.java:349)
-	at java.lang.String.checkBoundsBeginEnd(String.java:{check_bounds_line})
-	at java.lang.String.substring(String.java:{substring_line})
-	at samples.javacore.unhandledexception.UnhandledExceptionExample.fun3(UnhandledExceptionExample.java:18)
-	at samples.javacore.unhandledexception.UnhandledExceptionExample.fun2(UnhandledExceptionExample.java:13)
-	at samples.javacore.unhandledexception.UnhandledExceptionExample.fun1(UnhandledExceptionExample.java:9)
-	at samples.javacore.unhandledexception.UnhandledExceptionExample.main(UnhandledExceptionExample.java:5)
-
-"#
-        ),
-    );
+    // The uncaught-exception report, module prefixes (`java.base/`) and JDK line numbers included,
+    // must match the reference JVM's byte for byte.
+    let reference = utils::run_reference_jvm(&[], ENTRY);
+    utils::assert_failure_with_stderr(ENTRY, &reference.stdout, &reference.stderr);
 }
 
 #[test]

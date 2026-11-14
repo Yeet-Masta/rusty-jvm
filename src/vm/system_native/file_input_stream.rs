@@ -70,6 +70,15 @@ pub(crate) fn available0(obj_ref: i32) -> Result<i32> {
     let Some(mut file) = get_by_raw_id(obj_ref, FileInputStream)? else {
         return Ok(0);
     };
+    // Pipes, sockets and terminals cannot seek: ask the kernel how many bytes are buffered, as
+    // HotSpot's `handleAvailable` does with FIONREAD.
+    #[cfg(unix)]
+    if file.metadata().map(|m| !m.is_file()).unwrap_or(true) {
+        use std::os::fd::AsRawFd;
+        let mut pending: nix::libc::c_int = 0;
+        let rc = unsafe { nix::libc::ioctl(file.as_raw_fd(), nix::libc::FIONREAD, &mut pending) };
+        return Ok(if rc == 0 { pending.max(0) } else { 0 });
+    }
     let current_pos = match file.stream_position() {
         Ok(p) => p,
         Err(e) => {

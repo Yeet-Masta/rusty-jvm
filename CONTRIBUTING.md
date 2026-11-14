@@ -12,6 +12,7 @@ This guide explains how to build the project, run the tests, and extend the VM w
 - [Adding an integration test](#adding-an-integration-test)
   - [Step 1 - Write the Java program](#step-1---write-the-java-program)
   - [Step 2 - Add the test function](#step-2---add-the-test-function)
+- [Writing GC-safe VM code](#writing-gc-safe-vm-code)
 - [Project structure](#project-structure)
 
 ---
@@ -103,6 +104,32 @@ name and asserts that stdout equals the expected string.
 
 ---
 
+## Writing GC-safe VM code
+
+The heap is managed by a precise, stop-the-world mark-sweep collector (see
+[docs/garbage_collection.md](docs/garbage_collection.md)). A collection can run at any safepoint,
+so VM code that holds heap references (`i32` refs) in Rust locals must follow these rules:
+
+- **Root what you hold.** A reference that lives only in a Rust local is invisible to the
+  collector. Allocate into a `RootedSlots` destination created *before* the allocation, or keep
+  temporaries alive with `JavaThread::hold_temp_roots` for the span that needs them.
+- **Never block while Running.** Wrap blocking I/O, sleeps and other waits in
+  `safepoint::blocking(|| ...)` so a collection can proceed without this thread.
+- **Lock VM mutexes through the safepoint helpers.** Use `safepoint::lock` / `safepoint::wait`
+  instead of `Mutex::lock` / `Condvar::wait`, so a thread waiting for a lock does not stall a
+  safepoint held by the lock owner.
+- **Keep hot paths lock-free.** The interpreter calls into class lookup, allocation and frame
+  management on almost every bytecode; a global lock there serializes all Java threads. Check an
+  already-published state first and only fall back to a claim or lock on the slow path.
+- **Map allocation failures precisely.** Only real exhaustion (`AllocError::Capacity`,
+  `HostAllocation`, `IdentityExhausted`, `Arithmetic`) becomes `OutOfMemoryError`; anything else is
+  a VM bug and surfaces as `InternalError`.
+
+For stress testing, run a test with `-XX:+GCStressAtSafepoints`, which collects at every safepoint
+poll and quickly exposes unrooted references.
+
+---
+
 ## Project structure
 
 ```
@@ -112,6 +139,8 @@ rusty-jvm/
 │   └── vm/
 │       ├── execution_engine/ # Bytecode interpreter & opcode processors
 │       ├── heap/             # Object and array storage
+│       ├── gc/               # Mark-sweep collector, roots, heap budget (-Xmx)
+│       ├── safepoint/        # Safepoint coordinator and thread-state transitions
 │       ├── method_area/      # Class loading, vtable, method resolution
 │       ├── stack/            # Operand stack and call frames
 │       ├── jni/              # JNI ABI bridge

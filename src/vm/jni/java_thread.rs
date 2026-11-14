@@ -285,7 +285,7 @@ impl JavaThread {
                 .collect()
         });
         refs.extend(RootedSlots::root_refs());
-        refs.extend(crate::vm::jni::handles::local_roots());
+        Self::with_jni_frames(|frames| refs.extend(frames.local_targets()));
         Self::with_jni_leases(|leases| refs.extend(leases.iter().map(|lease| lease.target)));
         refs
     }
@@ -341,8 +341,22 @@ impl JavaThread {
     /// pops the segment on drop, keeping the chain correct across native re-entries and unwinding.
     pub(crate) fn register_stack_frames(stack_frames: &mut StackFrames) -> StackFramesGuard {
         let segment = stack_frames as *mut StackFrames;
-        JAVA_THREAD.with(|t| t.stack_frames.borrow_mut().push(segment));
+        JAVA_THREAD.with(|t| {
+            let mut segments = t.stack_frames.borrow_mut();
+            // SAFETY: registered segments outlive their guards (see `with_top_frames_mut`).
+            let base = segments
+                .last()
+                .map(|&outer| unsafe { (*outer).depth() })
+                .unwrap_or(0);
+            stack_frames.set_base_depth(base);
+            segments.push(segment);
+        });
         StackFramesGuard { segment }
+    }
+
+    /// Interpreter segments (nested `Engine::execute` loops) registered on the calling thread.
+    pub(crate) fn segment_count() -> usize {
+        JAVA_THREAD.with(|t| t.stack_frames.borrow().len())
     }
 
     /// Invokes `f` with a mutable reference to the **newest** (top) `StackFrames` segment of the

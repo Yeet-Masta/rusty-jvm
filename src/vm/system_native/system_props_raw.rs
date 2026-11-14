@@ -35,9 +35,7 @@ pub(crate) fn vm_properties() -> Result<i32> {
 fn get_platform_properties() -> Result<Vec<Option<String>>> {
     Ok(OVERRIDDEN_PLATFORM_PROPERTIES
         .get()
-        .ok_or(Error::new_execution(
-            "Failed to get OVERRIDDEN_PLATFORM_PROPERTIES",
-        ))?
+        .ok_or_else(|| Error::new_execution("Failed to get OVERRIDDEN_PLATFORM_PROPERTIES"))?
         .iter()
         .map(|(_key, value)| value.clone())
         .collect())
@@ -46,9 +44,7 @@ fn get_platform_properties() -> Result<Vec<Option<String>>> {
 fn get_vm_properties() -> Result<Vec<String>> {
     Ok(OVERRIDDEN_VM_PROPERTIES
         .get()
-        .ok_or(Error::new_execution(
-            "Failed to get OVERRIDDEN_VM_PROPERTIES",
-        ))?
+        .ok_or_else(|| Error::new_execution("Failed to get OVERRIDDEN_VM_PROPERTIES"))?
         .iter()
         .flat_map(|(key, value)| vec![key.clone(), value.clone()])
         .collect())

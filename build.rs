@@ -12,6 +12,7 @@ fn main() -> anyhow::Result<()> {
         .file("src/vm/jni/variadic.c")
         .compile("jni_variadic");
     println!("cargo:rerun-if-changed=src/vm/jni/variadic.c");
+    build_jvm_shim()?;
     let manifest_dir = env::var("CARGO_MANIFEST_DIR")?;
     let target_dir = env::var("CARGO_TARGET_DIR").unwrap_or_else(|_| "target".into());
     let target = env::var("TARGET")?;
@@ -367,4 +368,59 @@ fn copy_lib_jar_to_test_dir(path: &Path) -> anyhow::Result<String> {
         .with_context(|| format!("failed to copy {}", source.display()))?;
 
     Ok(destination.display().to_string())
+}
+
+/// Builds `src/vm/jvm_shim` into a shared library named like HotSpot's VM library (`jvm.dll`,
+/// `libjvm.so`, `libjvm.dylib`) at `$OUT_DIR/jvm_shim_lib`; the VM embeds it and loads it before
+/// any JDK native library so their `JVM_*` imports resolve (see `src/vm/jvm_shim.rs`).
+fn build_jvm_shim() -> anyhow::Result<()> {
+    println!("cargo:rerun-if-changed=src/vm/jvm_shim/jvm_shim.c");
+    println!("cargo:rerun-if-changed=src/vm/jvm_shim/jvm_forwarders.inc");
+    let out_dir = PathBuf::from(env::var("OUT_DIR")?);
+    let target = env::var("TARGET")?;
+    let source = PathBuf::from(env::var("CARGO_MANIFEST_DIR")?).join("src/vm/jvm_shim/jvm_shim.c");
+    let tool = cc::Build::new().opt_level(2).get_compiler();
+    let mut command = tool.to_command();
+    command.current_dir(&out_dir);
+    let built = if tool.is_like_msvc() {
+        let dll = out_dir.join("jvm.dll");
+        command
+            .args(["/nologo", "/LD", "/O2", "/W3"])
+            .arg(&source)
+            .arg(format!("/Fe{}", dll.display()))
+            .arg(format!("/Fo{}\\", out_dir.display()));
+        dll
+    } else if target.contains("apple") {
+        let dylib = out_dir.join("libjvm.dylib");
+        command
+            .args(["-dynamiclib", "-O2", "-fPIC", "-fvisibility=hidden"])
+            .args(["-install_name", "@rpath/libjvm.dylib", "-o"])
+            .arg(&dylib)
+            .arg(&source);
+        dylib
+    } else {
+        let so = out_dir.join("libjvm.so");
+        command
+            .args(["-shared", "-O2", "-fPIC", "-fvisibility=hidden"])
+            .arg("-Wl,-soname,libjvm.so")
+            .arg("-o")
+            .arg(&so)
+            .arg(&source)
+            .arg("-lpthread");
+        so
+    };
+    let output = command
+        .output()
+        .with_context(|| format!("failed to run the C compiler for the JVM shim: {command:?}"))?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "building the JVM shim failed: {command:?}
+{}
+{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    fs::copy(&built, out_dir.join("jvm_shim_lib"))?;
+    Ok(())
 }

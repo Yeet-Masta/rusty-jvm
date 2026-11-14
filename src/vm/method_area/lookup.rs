@@ -313,6 +313,16 @@ fn lookup_for_static_field_in_class(
     class_name: &str,
     field_name: &str,
 ) -> Result<Option<(String, Arc<FieldValue>)>> {
+    if let Some(field) = klass.static_field(field_name) {
+        return Ok(Some((class_name.to_string(), Arc::clone(&field))));
+    }
+    // JVMS 5.4.3.2: direct superinterfaces (recursively) come before the superclass, e.g.
+    // `AESCrypt` reads `AES_KEYSIZES` declared in the interface `AESConstants`.
+    for interface_name in klass.interfaces() {
+        if let Some(found) = lookup_for_static_field(interface_name, field_name)? {
+            return Ok(Some(found));
+        }
+    }
     match klass.static_field(field_name) {
         Some(field) => Ok(Some((class_name.to_string(), Arc::clone(&field)))),
         None => match klass.parent() {

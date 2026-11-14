@@ -19,6 +19,12 @@ use tracing::trace;
 
 pub(crate) static CLASSES: LazyLock<LoadedClasses> = LazyLock::new(LoadedClasses::default);
 
+/// Test-only: route lookups of published classes through the per-name claim, so tests can hold a
+/// claim to stop an opcode mid-lookup and check what it keeps rooted while it waits.
+#[cfg(test)]
+pub(super) static FORCE_CLAIM_PATH: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 #[derive(Debug, Default)]
 pub(crate) struct LoadedClasses {
     loading: super::class_loading::Loading,
@@ -77,6 +83,19 @@ impl LoadedClasses {
             .ok_or_else(|| Error::new_execution("Class mirror is not published"))
     }
     /// Checks if class is already loaded
+    /// Every published class, copied out so callers can inspect them without holding the map.
+    pub(crate) fn snapshot(&self) -> Vec<Arc<JavaClass>> {
+        self.id_index
+            .iter()
+            .map(|entry| Arc::clone(&entry.klass))
+            .collect()
+    }
+
+    /// How many classes have been published (array and primitive classes included).
+    pub fn loaded_count(&self) -> usize {
+        self.loaded_classes.len()
+    }
+
     pub fn is_loaded(&self, fully_qualified_class_name: &str) -> bool {
         let fully_qualified_class_name = undecorate(fully_qualified_class_name);
         self.loaded_classes.contains_key(fully_qualified_class_name)
@@ -121,6 +140,9 @@ impl LoadedClasses {
         fully_qualified_class_name: &str,
         load: impl FnOnce() -> Result<Arc<JavaClass>>,
     ) -> Result<(usize, String, Arc<JavaClass>)> {
+        if let Some(published) = self.get_published(fully_qualified_class_name) {
+            return Ok(published);
+        }
         {
             // Wait for an in-flight publication, but never own the name while loading:
             // load_class_file can enter Java's per-name class-loading monitor.
@@ -131,6 +153,21 @@ impl LoadedClasses {
         }
 
         self.insert_klass(load()?, None)
+    }
+
+    /// Lock-free fast path for the common case of an already published class. The mirror is
+    /// published last (through a `OnceLock`), so a present mirror means publication finished and
+    /// no claim is needed; otherwise fall back to waiting on the per-name claim.
+    fn get_published(
+        &self,
+        fully_qualified_class_name: &str,
+    ) -> Option<(usize, String, Arc<JavaClass>)> {
+        #[cfg(test)]
+        if FORCE_CLAIM_PATH.load(Ordering::Relaxed) {
+            return None;
+        }
+        self.get_full_impl(fully_qualified_class_name)
+            .filter(|(_, _, klass)| klass.mirror_ref_if_present().is_some())
     }
 
     fn get_full_impl(
@@ -156,6 +193,9 @@ impl LoadedClasses {
         class_loader_ref: Option<i32>,
     ) -> Result<(usize, String, Arc<JavaClass>)> {
         let fully_qualified_class_name = klass.this_class_name();
+        if let Some(published) = self.get_published(fully_qualified_class_name) {
+            return Ok(published);
+        }
         {
             let _claim = self.loading.claim(fully_qualified_class_name);
             if let Some((id, key, klass)) = self.get_full_impl(fully_qualified_class_name) {

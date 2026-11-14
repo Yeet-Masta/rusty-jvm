@@ -194,7 +194,7 @@ fn set_pending_error(exception_class: &str, message: &str) {
     set_pending_throwable(exception_class, Some(message));
 }
 
-fn set_pending_throwable(exception_class: &str, message: Option<&str>) {
+pub(super) fn set_pending_throwable(exception_class: &str, message: Option<&str>) {
     let log_message = message.unwrap_or("<no message>");
     // First-wins semantics: if an exception is already pending, preserve it and
     // do nothing, like OpenJDK does. This must never panic — `set_pending_throwable` is reachable from

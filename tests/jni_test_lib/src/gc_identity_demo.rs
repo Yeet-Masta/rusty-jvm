@@ -200,15 +200,14 @@ pub extern "system" fn Java_samples_gc_GcJniIdentityDemo_capacity(
         } else {
             (jni.EnsureLocalCapacity)(env, jint::MAX)
         };
-        let throwable = (jni.ExceptionOccurred)(env);
-        let intact = status < 0
-            && !throwable.is_null()
+        let refused_quietly = status < 0 && !(jni.ExceptionCheck)(env);
+        let intact = refused_quietly
             && matches!(
                 (jni.GetObjectRefType)(env, local),
                 jobjectRefType::JNILocalRefType
             );
         (jni.ExceptionClear)(env);
-        let result = (jni.PopLocalFrame)(env, throwable);
+        let result = (jni.PopLocalFrame)(env, local);
         if intact {
             result
         } else {

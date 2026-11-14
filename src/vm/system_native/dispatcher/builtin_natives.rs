@@ -6,8 +6,8 @@ use crate::vm::method_area::lookup::lookup_method;
 use crate::vm::system_native as sn;
 #[allow(unused_imports)]
 use jni_sys::{
-    jarray, jboolean, jbyte, jbyteArray, jchar, jclass, jdouble, jfloat, jint, jlong, jobject,
-    jobjectArray, jshort, jstring, JNIEnv,
+    jarray, jboolean, jbyte, jbyteArray, jchar, jcharArray, jclass, jdouble, jdoubleArray, jfloat,
+    jint, jintArray, jlong, jlongArray, jobject, jobjectArray, jshort, jstring, JNIEnv,
 };
 use std::collections::HashMap;
 use std::ffi::c_void;
@@ -187,14 +187,36 @@ jni_types! {
     unix_file_attrs           : ref   | i32  | jobject      | "Lsun/nio/fs/UnixFileAttributes;";
     first_file                : ref   | i32  | jobject      | "Lsun/nio/fs/WindowsNativeDispatcher$FirstFile;";
     volume_info               : ref   | i32  | jobject      | "Lsun/nio/fs/WindowsNativeDispatcher$VolumeInformation;";
+    executable                : ref   | i32  | jobject      | "Ljava/lang/reflect/Executable;";
+    memory_usage              : ref   | i32  | jobject      | "Ljava/lang/management/MemoryUsage;";
+    sensor                    : ref   | i32  | jobject      | "Lsun/management/Sensor;";
+    gc_mxbean                 : ref   | i32  | jobject      | "Ljava/lang/management/GarbageCollectorMXBean;";
+    ext_gc_mxbean             : ref   | i32  | jobject      | "Lcom/sun/management/GarbageCollectorMXBean;";
+    gc_info                   : ref   | i32  | jobject      | "Lcom/sun/management/GcInfo;";
+    stack_trace_element       : ref   | i32  | jobject      | "Ljava/lang/StackTraceElement;";
+    stack_frame_info          : ref   | i32  | jobject      | "Ljava/lang/StackFrameInfo;";
+    continuation_scope        : ref   | i32  | jobject      | "Ljdk/internal/vm/ContinuationScope;";
+    continuation              : ref   | i32  | jobject      | "Ljdk/internal/vm/Continuation;";
 
     // arrays
     byte_array                : ref   | i32  | jbyteArray   | "[B";
+    int_array                 : ref   | i32  | jintArray    | "[I";
+    double_array              : ref   | i32  | jdoubleArray | "[D";
     class_object_array        : ref   | i32  | jobjectArray | "[Ljava/lang/Class;";
     object_array              : ref   | i32  | jobjectArray | "[Ljava/lang/Object;";
     stack_trace_element_array : ref   | i32  | jobjectArray | "[Ljava/lang/StackTraceElement;";
     string_array              : ref   | i32  | jobjectArray | "[Ljava/lang/String;";
     constructor_object_array  : ref   | i32  | jobjectArray | "[Ljava/lang/reflect/Constructor;";
+    record_component_array    : ref   | i32  | jobjectArray | "[Ljava/lang/reflect/RecordComponent;";
+    parameter_array           : ref   | i32  | jobjectArray | "[Ljava/lang/reflect/Parameter;";
+    long_array                : ref   | i32  | jlongArray   | "[J";
+    char_array                : ref   | i32  | jcharArray   | "[C";
+    memory_usage_array        : ref   | i32  | jobjectArray | "[Ljava/lang/management/MemoryUsage;";
+    flag_array                : ref   | i32  | jobjectArray | "[Lcom/sun/management/internal/Flag;";
+    dcmd_info_array           : ref   | i32  | jobjectArray | "[Lcom/sun/management/internal/DiagnosticCommandInfo;";
+    thread_array              : ref   | i32  | jobjectArray | "[Ljava/lang/Thread;";
+    memory_pool_array         : ref   | i32  | jobjectArray | "[Ljava/lang/management/MemoryPoolMXBean;";
+    memory_manager_array      : ref   | i32  | jobjectArray | "[Ljava/lang/management/MemoryManagerMXBean;";
     field_object_array        : ref   | i32  | jobjectArray | "[Ljava/lang/reflect/Field;";
     method_object_array       : ref   | i32  | jobjectArray | "[Ljava/lang/reflect/Method;";
     network_interface_array   : ref   | i32  | jobjectArray | "[Ljava/net/NetworkInterface;";
@@ -440,6 +462,12 @@ builtin_natives! {
     "java/lang/Class": instance fn getConstantPool() -> constant_pool => sn::class::get_constant_pool;
     "java/lang/Class": instance fn getNestHost0() -> class => sn::class::get_nest_host0;
     "java/lang/Class": instance fn isRecord0() -> boolean => sn::class::is_record0;
+    "java/lang/Class": instance fn getRecordComponents0() -> record_component_array => sn::class::get_record_components0;
+    "java/lang/Class": instance fn getNestMembers0() -> class_object_array => sn::class::get_nest_members0;
+    "java/lang/Class": instance fn getDeclaredClasses0() -> class_object_array => sn::class::get_declared_classes0;
+    "java/lang/Class": instance fn getClassAccessFlagsRaw0() -> int => sn::class::get_class_access_flags_raw0;
+    "java/lang/Class": instance fn getClassFileVersion0() -> int => sn::class::get_class_file_version0;
+    "java/lang/Class": instance fn getRawTypeAnnotations() -> byte_array => sn::class::get_raw_type_annotations;
 
     "java/lang/ClassLoader": static fn registerNatives() -> void => sn::class_loader::register_natives; // todo: implement me
     "java/lang/ClassLoader": static fn defineClass0(cl: class_loader, lookup: class, name: string, buf: byte_array, off: int, len: int, pd: protection_domain, init: boolean, flags: int, class_data: object) -> class => sn::class_loader::define_class0;
@@ -453,6 +481,7 @@ builtin_natives! {
     "java/lang/Double": static fn longBitsToDouble(l: long) -> double => sn::double::long_bits_to_double;
 
     "java/lang/Float": static fn floatToRawIntBits(f: float) -> int => sn::float::float_to_raw_int_bits;
+    "java/lang/Float": static fn intBitsToFloat(bits: int) -> float => sn::float::int_bits_to_float;
 
     "java/lang/Module": static fn addReads0(from: module, to: module) -> void => sn::module::add_reads0; // todo: implement me?
     "java/lang/Module": static fn defineModule0(module: module, is_open: boolean, version: string, location: string, pns: object_array) -> void => sn::module::define_module0;
@@ -477,6 +506,12 @@ builtin_natives! {
     "java/lang/Shutdown": static fn beforeHalt() -> void => sn::shutdown::before_halt; // todo: implement me
     "java/lang/Shutdown": static fn halt0(status: int) -> void => sn::shutdown::halt0; // fixme: by doing this we skip destructors and other shutdown hooks, later it might be an issue
 
+    "java/lang/StackTraceElement": static fn initStackTraceElement(element: stack_trace_element, sfi: stack_frame_info) -> void => sn::stack_walk::init_stack_trace_element;
+    "java/lang/StackFrameInfo": instance fn expandStackFrameInfo() -> void => sn::stack_walk::expand_stack_frame_info;
+    "java/lang/StackStreamFactory": static fn checkStackWalkModes() -> boolean => sn::stack_walk::check_stack_walk_modes;
+    "java/lang/StackStreamFactory$AbstractStackWalker": instance fn callStackWalk(mode: int, skip_frames: int, cont_scope: continuation_scope, cont: continuation, buffer_size: int, start_index: int, frames: object_array) -> object => sn::stack_walk::call_stack_walk;
+    "java/lang/StackStreamFactory$AbstractStackWalker": instance fn fetchStackFrames(mode: int, anchor: long, last_batch_frame_count: int, buffer_size: int, start_index: int, frames: object_array) -> int => sn::stack_walk::fetch_stack_frames;
+    "java/lang/StackStreamFactory$AbstractStackWalker": instance fn setContinuation(anchor: long, frames: object_array, cont: continuation) -> void => sn::stack_walk::set_continuation;
     "java/lang/StackTraceElement": static fn initStackTraceElements(elements: stack_trace_element_array, x: object, depth: int) -> void => sn::stack_trace_element::init_stack_trace_elements;
 
     "java/lang/String": instance fn intern() -> string => sn::string::intern;
@@ -506,6 +541,7 @@ builtin_natives! {
     "java/lang/Thread": instance fn interrupt0() -> void => sn::thread::interrupt0;
     "java/lang/Thread": instance fn getStackTrace0() -> object => sn::thread::get_stack_trace0; // JDK 25-26
     "java/lang/Thread": instance fn getStackTrace0() -> stack_trace_element_array => sn::thread::get_stack_trace0; // JDK 27+
+    "java/lang/Thread": static fn setNativeName(name: string) -> void => sn::thread::set_native_name;
     "java/lang/Thread": static fn clearInterruptEvent() -> void => sn::thread::clear_interrupt_event;
     "java/lang/Thread": instance fn start0() -> void => sn::thread::start0;
 
@@ -533,12 +569,120 @@ builtin_natives! {
     "java/lang/ref/Reference": static fn getAndClearReferencePendingList() -> reference => sn::reference::get_and_clear_reference_pending_list;
     "java/lang/ref/Reference": static fn hasReferencePendingList() -> boolean => sn::reference::has_reference_pending_list;
 
+    "sun/management/VMManagementImpl": static fn getVersion0() -> string => sn::management::get_version0;
+    "sun/management/VMManagementImpl": static fn initOptionalSupportFields() -> void => sn::management::init_optional_support_fields;
+    "sun/management/VMManagementImpl": instance fn isThreadContentionMonitoringEnabled() -> boolean => sn::management::is_thread_contention_monitoring_enabled;
+    "sun/management/VMManagementImpl": instance fn isThreadCpuTimeEnabled() -> boolean => sn::management::is_thread_cpu_time_enabled;
+    "sun/management/VMManagementImpl": instance fn isThreadAllocatedMemoryEnabled() -> boolean => sn::management::is_thread_allocated_memory_enabled;
+    "sun/management/VMManagementImpl": instance fn getTotalClassCount() -> long => sn::management::get_total_class_count;
+    "sun/management/VMManagementImpl": instance fn getUnloadedClassCount() -> long => sn::management::get_unloaded_class_count;
+    "sun/management/VMManagementImpl": instance fn getVerboseClass() -> boolean => sn::management::get_verbose_class;
+    "sun/management/VMManagementImpl": instance fn getVerboseGC() -> boolean => sn::management::get_verbose_gc;
+    "sun/management/VMManagementImpl": instance fn getProcessId() -> int => sn::management::get_process_id;
+    "sun/management/VMManagementImpl": instance fn getVmArguments0() -> string_array => sn::management::get_vm_arguments0;
+    "sun/management/VMManagementImpl": instance fn getStartupTime() -> long => sn::management::get_startup_time;
+    "sun/management/VMManagementImpl": instance fn getUptime0() -> long => sn::management::get_uptime0;
+    "sun/management/VMManagementImpl": instance fn getAvailableProcessors() -> int => sn::management::get_available_processors;
+    "sun/management/VMManagementImpl": instance fn getTotalThreadCount() -> long => sn::management::get_total_thread_count;
+    "sun/management/VMManagementImpl": instance fn getLiveThreadCount() -> int => sn::management::get_live_thread_count;
+    "sun/management/VMManagementImpl": instance fn getPeakThreadCount() -> int => sn::management::get_peak_thread_count;
+    "sun/management/VMManagementImpl": instance fn getDaemonThreadCount() -> int => sn::management::get_daemon_thread_count;
+    "sun/management/VMManagementImpl": instance fn getTotalCompileTime() -> long => sn::management::zero_counter;
+    "sun/management/VMManagementImpl": instance fn getSafepointCount() -> long => sn::management::zero_counter;
+    "sun/management/VMManagementImpl": instance fn getTotalSafepointTime() -> long => sn::management::zero_counter;
+    "sun/management/VMManagementImpl": instance fn getSafepointSyncTime() -> long => sn::management::zero_counter;
+    "sun/management/VMManagementImpl": instance fn getTotalApplicationNonStoppedTime() -> long => sn::management::zero_counter;
+    "sun/management/VMManagementImpl": instance fn getLoadedClassSize() -> long => sn::management::zero_counter;
+    "sun/management/VMManagementImpl": instance fn getUnloadedClassSize() -> long => sn::management::zero_counter;
+    "sun/management/VMManagementImpl": instance fn getClassLoadingTime() -> long => sn::management::zero_counter;
+    "sun/management/VMManagementImpl": instance fn getMethodDataSize() -> long => sn::management::zero_counter;
+    "sun/management/VMManagementImpl": instance fn getInitializedClassCount() -> long => sn::management::zero_counter;
+    "sun/management/VMManagementImpl": instance fn getClassInitializationTime() -> long => sn::management::zero_counter;
+    "sun/management/VMManagementImpl": instance fn getClassVerificationTime() -> long => sn::management::zero_counter;
+    "sun/management/ThreadImpl": static fn getThreads() -> thread_array => sn::management::get_threads;
+    "sun/management/ThreadImpl": static fn getThreadTotalCpuTime0(id: long) -> long => sn::management::get_thread_total_cpu_time0;
+    "sun/management/ThreadImpl": static fn getThreadUserCpuTime0(id: long) -> long => sn::management::get_thread_user_cpu_time0;
+    "sun/management/ThreadImpl": static fn getThreadTotalCpuTime1(ids: long_array, times: long_array) -> void => sn::management::get_thread_total_cpu_time1;
+    "sun/management/ThreadImpl": static fn getThreadUserCpuTime1(ids: long_array, times: long_array) -> void => sn::management::get_thread_user_cpu_time1;
+    "sun/management/ThreadImpl": static fn getThreadAllocatedMemory0(id: long) -> long => sn::management::get_thread_allocated_memory0;
+    "sun/management/ThreadImpl": static fn getThreadAllocatedMemory1(ids: long_array, sizes: long_array) -> void => sn::management::get_thread_allocated_memory1;
+    "sun/management/ThreadImpl": static fn getTotalThreadAllocatedMemory() -> long => sn::management::get_total_thread_allocated_memory;
+    "sun/management/ThreadImpl": static fn setThreadCpuTimeEnabled0(enabled: boolean) -> void => sn::management::set_thread_cpu_time_enabled0;
+    "sun/management/ThreadImpl": static fn setThreadContentionMonitoringEnabled0(enabled: boolean) -> void => sn::management::set_thread_contention_monitoring_enabled0;
+    "sun/management/ThreadImpl": static fn setThreadAllocatedMemoryEnabled0(enabled: boolean) -> void => sn::management::set_thread_allocated_memory_enabled0;
+    "sun/management/ThreadImpl": static fn findDeadlockedThreads0() -> thread_array => sn::management::find_deadlocked_threads0;
+    "sun/management/ThreadImpl": static fn findMonitorDeadlockedThreads0() -> thread_array => sn::management::find_deadlocked_threads0;
+    "sun/management/ThreadImpl": static fn resetPeakThreadCount0() -> void => sn::management::reset_peak_thread_count0;
+    "sun/management/ThreadImpl": static fn resetContentionTimes0(id: long) -> void => sn::management::reset_contention_times0;
+    "sun/management/HotspotThread": instance fn getInternalThreadCount() -> int => sn::management::get_internal_thread_count;
+    "sun/management/HotspotThread": instance fn getInternalThreadTimes0(names: string_array, times: long_array) -> int => sn::management::get_internal_thread_times0;
+    "sun/management/MemoryImpl": instance fn getMemoryUsage0(heap: boolean) -> memory_usage => sn::management::get_memory_usage0;
+    "sun/management/MemoryImpl": static fn getMemoryPools0() -> memory_pool_array => sn::management::get_memory_pools0;
+    "sun/management/MemoryImpl": static fn getMemoryManagers0() -> memory_manager_array => sn::management::get_memory_managers0;
+    "sun/management/MemoryImpl": instance fn setVerboseGC(value: boolean) -> void => sn::management::set_verbose_gc;
+    "sun/management/ClassLoadingImpl": instance fn setVerboseClass(value: boolean) -> void => sn::management::set_verbose_class;
+    "sun/management/MemoryManagerImpl": instance fn getMemoryPools0() -> memory_pool_array => sn::management::manager_get_memory_pools0;
+    "sun/management/MemoryPoolImpl": instance fn getMemoryManagers0() -> memory_manager_array => sn::management::pool_get_memory_managers0;
+    "sun/management/MemoryPoolImpl": instance fn getUsage0() -> memory_usage => sn::management::pool_get_usage0;
+    "sun/management/MemoryPoolImpl": instance fn getPeakUsage0() -> memory_usage => sn::management::pool_get_peak_usage0;
+    "sun/management/MemoryPoolImpl": instance fn getCollectionUsage0() -> memory_usage => sn::management::pool_get_collection_usage0;
+    "sun/management/MemoryPoolImpl": instance fn resetPeakUsage0() -> void => sn::management::pool_reset_peak_usage0;
+    "sun/management/MemoryPoolImpl": instance fn setUsageThreshold0(current: long, new_threshold: long) -> void => sn::management::pool_set_threshold0;
+    "sun/management/MemoryPoolImpl": instance fn setCollectionThreshold0(current: long, new_threshold: long) -> void => sn::management::pool_set_threshold0;
+    "sun/management/MemoryPoolImpl": instance fn setPoolUsageSensor(s: sensor) -> void => sn::management::pool_set_sensor;
+    "sun/management/MemoryPoolImpl": instance fn setPoolCollectionSensor(s: sensor) -> void => sn::management::pool_set_sensor;
+    "sun/management/GarbageCollectorImpl": instance fn getCollectionCount() -> long => sn::management::get_collection_count;
+    "sun/management/GarbageCollectorImpl": instance fn getCollectionTime() -> long => sn::management::get_collection_time;
+    "com/sun/management/internal/OperatingSystemImpl": static fn initialize0() -> void => sn::management_ext::os_initialize0;
+    "com/sun/management/internal/OperatingSystemImpl": instance fn getCommittedVirtualMemorySize0() -> long => sn::management_ext::get_committed_virtual_memory_size0;
+    "com/sun/management/internal/OperatingSystemImpl": instance fn getTotalMemorySize0() -> long => sn::management_ext::get_total_memory_size0;
+    "com/sun/management/internal/OperatingSystemImpl": instance fn getFreeMemorySize0() -> long => sn::management_ext::get_free_memory_size0;
+    "com/sun/management/internal/OperatingSystemImpl": instance fn getTotalSwapSpaceSize0() -> long => sn::management_ext::get_total_swap_space_size0;
+    "com/sun/management/internal/OperatingSystemImpl": instance fn getFreeSwapSpaceSize0() -> long => sn::management_ext::get_free_swap_space_size0;
+    "com/sun/management/internal/OperatingSystemImpl": instance fn getProcessCpuTime0() -> long => sn::management_ext::get_process_cpu_time0;
+    "com/sun/management/internal/OperatingSystemImpl": instance fn getCpuLoad0() -> double => sn::management_ext::get_cpu_load0;
+    "com/sun/management/internal/OperatingSystemImpl": instance fn getProcessCpuLoad0() -> double => sn::management_ext::get_process_cpu_load0;
+    "com/sun/management/internal/OperatingSystemImpl": instance fn getHostConfiguredCpuCount0() -> int => sn::management_ext::get_host_configured_cpu_count0;
+    "com/sun/management/internal/OperatingSystemImpl": instance fn getHostOnlineCpuCount0() -> int => sn::management_ext::get_host_online_cpu_count0;
+    "com/sun/management/internal/OperatingSystemImpl": instance fn getHostTotalCpuTicks0() -> long => sn::management_ext::get_host_total_cpu_ticks0;
+    "com/sun/management/internal/OperatingSystemImpl": instance fn getOpenFileDescriptorCount0() -> long => sn::management_ext::get_open_file_descriptor_count0;
+    "com/sun/management/internal/OperatingSystemImpl": instance fn getMaxFileDescriptorCount0() -> long => sn::management_ext::get_max_file_descriptor_count0;
+    "com/sun/management/internal/OperatingSystemImpl": instance fn getSingleCpuLoad0(cpu: int) -> double => sn::management_ext::get_single_cpu_load0;
+    "com/sun/management/internal/GcInfoBuilder": instance fn getNumGcExtAttributes(gc: gc_mxbean) -> int => sn::management_ext::get_num_gc_ext_attributes;
+    "com/sun/management/internal/GcInfoBuilder": instance fn fillGcAttributeInfo(gc: gc_mxbean, n: int, names: string_array, types: char_array, descriptions: string_array) -> void => sn::management_ext::fill_gc_attribute_info;
+    "com/sun/management/internal/GcInfoBuilder": instance fn getLastGcInfo0(gc: gc_mxbean, n: int, values: object_array, types: char_array, before: memory_usage_array, after: memory_usage_array) -> gc_info => sn::management_ext::get_last_gc_info0;
+    "com/sun/management/internal/GarbageCollectorExtImpl": instance fn setNotificationEnabled(gc: ext_gc_mxbean, enabled: boolean) -> void => sn::management_ext::gc_set_notification_enabled;
+    "com/sun/management/internal/Flag": static fn initialize() -> void => sn::management_ext::flag_initialize;
+    "com/sun/management/internal/Flag": static fn getAllFlagNames() -> string_array => sn::management_ext::get_all_flag_names;
+    "com/sun/management/internal/Flag": static fn getFlags(names: string_array, flags: flag_array, count: int) -> int => sn::management_ext::get_flags;
+    "com/sun/management/internal/Flag": static fn getInternalFlagCount() -> int => sn::management_ext::get_internal_flag_count;
+    "com/sun/management/internal/DiagnosticCommandImpl": instance fn setNotificationEnabled(enabled: boolean) -> void => sn::management_ext::dcmd_set_notification_enabled;
+    "com/sun/management/internal/DiagnosticCommandImpl": instance fn getDiagnosticCommands() -> string_array => sn::management_ext::get_diagnostic_commands;
+    "com/sun/management/internal/DiagnosticCommandImpl": instance fn getDiagnosticCommandInfo(commands: string_array) -> dcmd_info_array => sn::management_ext::get_diagnostic_command_info;
+    "java/lang/reflect/Executable": instance fn getParameters0() -> parameter_array => sn::reflect_executable::get_parameters0;
+    "java/lang/reflect/Executable": instance fn getTypeAnnotationBytes0() -> byte_array => sn::reflect_executable::get_type_annotation_bytes0;
+    "java/lang/reflect/Field": instance fn getTypeAnnotationBytes0() -> byte_array => sn::reflect_executable::get_type_annotation_bytes0;
     "java/lang/reflect/Array": static fn newArray(component_type: class, length: int) -> object => sn::reflect_array::new_array;
     "java/lang/reflect/Array": static fn getLength(array: object) -> int => sn::reflect_array::get_length;
     "java/lang/reflect/Array": static fn get(array: object, index: int) -> object => sn::reflect_array::get;
     "java/lang/reflect/Array": static fn getInt(array: object, index: int) -> int => sn::reflect_array::get_int;
     "java/lang/reflect/Array": static fn set(array: object, index: int, value: object) -> void => sn::reflect_array::set;
     "java/lang/reflect/Array": static fn setInt(array: object, index: int, value: int) -> void => sn::reflect_array::set_int;
+    "java/lang/reflect/Array": static fn getBoolean(array: object, index: int) -> boolean => sn::reflect_array::get_boolean;
+    "java/lang/reflect/Array": static fn setBoolean(array: object, index: int, value: boolean) -> void => sn::reflect_array::set_boolean;
+    "java/lang/reflect/Array": static fn getByte(array: object, index: int) -> byte => sn::reflect_array::get_byte;
+    "java/lang/reflect/Array": static fn setByte(array: object, index: int, value: byte) -> void => sn::reflect_array::set_byte;
+    "java/lang/reflect/Array": static fn getChar(array: object, index: int) -> char => sn::reflect_array::get_char;
+    "java/lang/reflect/Array": static fn setChar(array: object, index: int, value: char) -> void => sn::reflect_array::set_char;
+    "java/lang/reflect/Array": static fn getShort(array: object, index: int) -> short => sn::reflect_array::get_short;
+    "java/lang/reflect/Array": static fn setShort(array: object, index: int, value: short) -> void => sn::reflect_array::set_short;
+    "java/lang/reflect/Array": static fn getLong(array: object, index: int) -> long => sn::reflect_array::get_long;
+    "java/lang/reflect/Array": static fn setLong(array: object, index: int, value: long) -> void => sn::reflect_array::set_long;
+    "java/lang/reflect/Array": static fn getFloat(array: object, index: int) -> float => sn::reflect_array::get_float;
+    "java/lang/reflect/Array": static fn setFloat(array: object, index: int, value: float) -> void => sn::reflect_array::set_float;
+    "java/lang/reflect/Array": static fn getDouble(array: object, index: int) -> double => sn::reflect_array::get_double;
+    "java/lang/reflect/Array": static fn setDouble(array: object, index: int, value: double) -> void => sn::reflect_array::set_double;
+    "java/lang/reflect/Array": static fn multiNewArray(component_type: class, dimensions: int_array) -> object => sn::reflect_array::multi_new_array;
 
     "java/io/FileDescriptor": static fn initIDs() -> void => sn::file_descriptor::init_ids; // todo: implement me
     "java/io/FileDescriptor": static fn getHandle(fd: int) -> long => sn::file_descriptor::get_handle;
@@ -597,19 +741,39 @@ builtin_natives! {
     "java/util/TimeZone": static fn getSystemTimeZoneID(java_home: string) -> string => sn::time_zone::get_system_time_zone_id;
 
     "java/util/zip/CRC32": static fn updateBytes0(crc: int, b: byte_array, off: int, len: int) -> int => sn::zip::crc32::updatebytes0;
+    "java/util/zip/CRC32": static fn update(crc: int, b: int) -> int => sn::zip::crc32::update;
+    "java/util/zip/CRC32": static fn updateByteBuffer0(crc: int, address: long, off: int, len: int) -> int => sn::zip::crc32::update_byte_buffer0;
+    "java/util/zip/Adler32": static fn update(adler: int, b: int) -> int => sn::zip::crc32::adler32_update;
+    "java/util/zip/Adler32": static fn updateBytes(adler: int, b: byte_array, off: int, len: int) -> int => sn::zip::crc32::adler32_update_bytes;
+    "java/util/zip/Adler32": static fn updateByteBuffer(adler: int, address: long, off: int, len: int) -> int => sn::zip::crc32::adler32_update_byte_buffer;
 
     "java/util/zip/Deflater": static fn init(level: int, strategy: int, nowrap: boolean) -> long => sn::zip::deflater::init;
     "java/util/zip/Deflater": instance fn deflateBytesBytes(addr: long, inpt: byte_array, ioff: int, ilen: int, outpt: byte_array, ooff: int, olen: int, flush: int, params: int) -> long => sn::zip::deflater::deflate_bytes_bytes;
     "java/util/zip/Deflater": static fn end(addr: long) -> void => sn::zip::deflater::end;
+    "java/util/zip/Deflater": instance fn deflateBytesBuffer(addr: long, inpt: byte_array, ioff: int, ilen: int, oaddr: long, olen: int, flush: int, params: int) -> long => sn::zip::deflater::deflate_bytes_buffer;
+    "java/util/zip/Deflater": instance fn deflateBufferBytes(addr: long, iaddr: long, ilen: int, outpt: byte_array, ooff: int, olen: int, flush: int, params: int) -> long => sn::zip::deflater::deflate_buffer_bytes;
+    "java/util/zip/Deflater": instance fn deflateBufferBuffer(addr: long, iaddr: long, ilen: int, oaddr: long, olen: int, flush: int, params: int) -> long => sn::zip::deflater::deflate_buffer_buffer;
+    "java/util/zip/Deflater": static fn getAdler(addr: long) -> int => sn::zip::deflater::get_adler;
+    "java/util/zip/Deflater": static fn reset(addr: long) -> void => sn::zip::deflater::reset;
+    "java/util/zip/Deflater": static fn setDictionary(addr: long, b: byte_array, off: int, len: int) -> void => sn::zip::deflater::set_dictionary;
+    "java/util/zip/Deflater": static fn setDictionaryBuffer(addr: long, buf: long, len: int) -> void => sn::zip::deflater::set_dictionary_buffer;
 
     "java/util/zip/Inflater": static fn initIDs() -> void => sn::zip::inflater::init_ids; // todo: implement me
     "java/util/zip/Inflater": static fn init(nowrap: boolean) -> long => sn::zip::inflater::init;
     "java/util/zip/Inflater": instance fn inflateBytesBytes(addr: long, inpt: byte_array, ioff: int, ilen: int, outpt: byte_array, ooff: int, olen: int) -> long => sn::zip::inflater::inflate_bytes_bytes;
     "java/util/zip/Inflater": static fn end(addr: long) -> void => sn::zip::inflater::end;
     "java/util/zip/Inflater": static fn reset(addr: long) -> void => sn::zip::inflater::reset;
+    "java/util/zip/Inflater": instance fn inflateBytesBuffer(addr: long, inpt: byte_array, ioff: int, ilen: int, oaddr: long, olen: int) -> long => sn::zip::inflater::inflate_bytes_buffer;
+    "java/util/zip/Inflater": instance fn inflateBufferBytes(addr: long, iaddr: long, ilen: int, outpt: byte_array, ooff: int, olen: int) -> long => sn::zip::inflater::inflate_buffer_bytes;
+    "java/util/zip/Inflater": instance fn inflateBufferBuffer(addr: long, iaddr: long, ilen: int, oaddr: long, olen: int) -> long => sn::zip::inflater::inflate_buffer_buffer;
+    "java/util/zip/Inflater": static fn getAdler(addr: long) -> int => sn::zip::inflater::get_adler;
+    "java/util/zip/Inflater": static fn setDictionary(addr: long, b: byte_array, off: int, len: int) -> void => sn::zip::inflater::set_dictionary;
+    "java/util/zip/Inflater": static fn setDictionaryBuffer(addr: long, buf: long, len: int) -> void => sn::zip::inflater::set_dictionary_buffer;
 
     "jdk/internal/jimage/NativeImageBuffer": instance fn getNativeMap(name: string) -> byte_buffer => sn::native_image_buffer::get_native_map;
 
+    "jdk/internal/loader/BootLoader": static fn getSystemPackageNames() -> string_array => sn::bootloader::get_system_package_names;
+    "jdk/internal/loader/BootLoader": static fn getSystemPackageLocation(name: string) -> string => sn::bootloader::get_system_package_location;
     "jdk/internal/loader/BootLoader": static fn setBootLoaderUnnamedModule0(m: module) -> void => sn::bootloader::set_bootloader_unnamed_module0;
 
     "jdk/internal/loader/NativeLibraries": static fn findBuiltinLib(name: string) -> string => sn::native_libraries::find_builtin_lib;
@@ -663,6 +827,28 @@ builtin_natives! {
     "jdk/internal/misc/Unsafe": instance fn putInt(obj: object, offset: long, x: int) -> void => sn::unsafe_::put_int;
     "jdk/internal/misc/Unsafe": instance fn putIntVolatile(obj: object, offset: long, x: int) -> void => sn::unsafe_::put_int_volatile;
     "jdk/internal/misc/Unsafe": instance fn putLong(obj: object, offset: long, x: long) -> void => sn::unsafe_::put_long;
+    "jdk/internal/misc/Unsafe": instance fn getBoolean(obj: object, offset: long) -> boolean => sn::unsafe_::get_boolean;
+    "jdk/internal/misc/Unsafe": instance fn getFloat(obj: object, offset: long) -> float => sn::unsafe_::get_float;
+    "jdk/internal/misc/Unsafe": instance fn getDouble(obj: object, offset: long) -> double => sn::unsafe_::get_double;
+    "jdk/internal/misc/Unsafe": instance fn getByteVolatile(obj: object, offset: long) -> byte => sn::unsafe_::get_byte_volatile;
+    "jdk/internal/misc/Unsafe": instance fn getShortVolatile(obj: object, offset: long) -> short => sn::unsafe_::get_short_volatile;
+    "jdk/internal/misc/Unsafe": instance fn getCharVolatile(obj: object, offset: long) -> char => sn::unsafe_::get_char_volatile;
+    "jdk/internal/misc/Unsafe": instance fn getFloatVolatile(obj: object, offset: long) -> float => sn::unsafe_::get_float_volatile;
+    "jdk/internal/misc/Unsafe": instance fn getDoubleVolatile(obj: object, offset: long) -> double => sn::unsafe_::get_double_volatile;
+    "jdk/internal/misc/Unsafe": instance fn putBoolean(obj: object, offset: long, x: boolean) -> void => sn::unsafe_::put_boolean;
+    "jdk/internal/misc/Unsafe": instance fn putFloat(obj: object, offset: long, x: float) -> void => sn::unsafe_::put_float;
+    "jdk/internal/misc/Unsafe": instance fn putDouble(obj: object, offset: long, x: double) -> void => sn::unsafe_::put_double;
+    "jdk/internal/misc/Unsafe": instance fn putBooleanVolatile(obj: object, offset: long, x: boolean) -> void => sn::unsafe_::put_boolean_volatile;
+    "jdk/internal/misc/Unsafe": instance fn putByteVolatile(obj: object, offset: long, x: byte) -> void => sn::unsafe_::put_byte_volatile;
+    "jdk/internal/misc/Unsafe": instance fn putShortVolatile(obj: object, offset: long, x: short) -> void => sn::unsafe_::put_short_volatile;
+    "jdk/internal/misc/Unsafe": instance fn putCharVolatile(obj: object, offset: long, x: char) -> void => sn::unsafe_::put_char_volatile;
+    "jdk/internal/misc/Unsafe": instance fn putLongVolatile(obj: object, offset: long, x: long) -> void => sn::unsafe_::put_long_volatile;
+    "jdk/internal/misc/Unsafe": instance fn putFloatVolatile(obj: object, offset: long, x: float) -> void => sn::unsafe_::put_float_volatile;
+    "jdk/internal/misc/Unsafe": instance fn putDoubleVolatile(obj: object, offset: long, x: double) -> void => sn::unsafe_::put_double_volatile;
+    "jdk/internal/misc/Unsafe": instance fn reallocateMemory0(address: long, bytes: long) -> long => sn::unsafe_::reallocate_memory0;
+    "jdk/internal/misc/Unsafe": instance fn allocateInstance(cls: class) -> object => sn::unsafe_::allocate_instance;
+    "jdk/internal/misc/Unsafe": instance fn throwException(throwable: throwable) -> void => sn::unsafe_::throw_exception;
+    "jdk/internal/misc/Unsafe": instance fn getLoadAverage0(loadavg: double_array, nelems: int) -> int => sn::unsafe_::get_load_average0;
     "jdk/internal/misc/Unsafe": instance fn ensureClassInitialized0(clazz: class) -> void => sn::unsafe_::ensure_class_initialized0;
     "jdk/internal/misc/Unsafe": instance fn shouldBeInitialized0(clazz: class) -> boolean => sn::unsafe_::should_be_initialized0;
     "jdk/internal/misc/Unsafe": instance fn copyMemory0(src: object, srcOffset: long, dest: object, destOffset: long, bytes: long) -> void => sn::unsafe_::copy_memory0;
@@ -673,6 +859,7 @@ builtin_natives! {
 
     "jdk/internal/misc/VM": static fn initialize() -> void => sn::vm::initialize; // todo: implement me
     "jdk/internal/misc/VM": static fn getNanoTimeAdjustment(offset_in_seconds: long) -> long => sn::vm::get_nano_time_adjustment;
+    "jdk/internal/misc/VM": static fn latestUserDefinedLoader0() -> class_loader => sn::vm::latest_user_defined_loader0;
 
     "jdk/internal/perf/Perf": static fn registerNatives() -> void => sn::perf::register_natives; // todo: implement me
     "jdk/internal/perf/Perf": instance fn createLong(name: string, var: int, units: int, value: long) -> byte_buffer => sn::perf::create_long;
@@ -681,6 +868,15 @@ builtin_natives! {
     "jdk/internal/reflect/ConstantPool": instance fn getUTF8At0(cp: object, index: int) -> string => sn::constant_pool::get_utf8_at0_with_oop; // JDK 25
     "jdk/internal/reflect/ConstantPool": instance fn getSize0(cp: object) -> int => sn::constant_pool::get_size0_with_oop; // JDK 25
     "jdk/internal/reflect/ConstantPool": instance fn getTagAt0(cp: object, index: int) -> byte => sn::constant_pool::get_tag_at0_with_oop; // JDK 25
+    "jdk/internal/reflect/ConstantPool": instance fn getIntAt0(cp: object, index: int) -> int => sn::constant_pool::get_int_at0; // JDK 25
+    "jdk/internal/reflect/ConstantPool": instance fn getLongAt0(cp: object, index: int) -> long => sn::constant_pool::get_long_at0; // JDK 25
+    "jdk/internal/reflect/ConstantPool": instance fn getFloatAt0(cp: object, index: int) -> float => sn::constant_pool::get_float_at0; // JDK 25
+    "jdk/internal/reflect/ConstantPool": instance fn getDoubleAt0(cp: object, index: int) -> double => sn::constant_pool::get_double_at0; // JDK 25
+    "jdk/internal/reflect/ConstantPool": instance fn getStringAt0(cp: object, index: int) -> string => sn::constant_pool::get_string_at0; // JDK 25
+    "jdk/internal/reflect/ConstantPool": instance fn getClassAt0(cp: object, index: int) -> class => sn::constant_pool::get_class_at0; // JDK 25
+    "jdk/internal/reflect/ConstantPool": instance fn getClassAtIfLoaded0(cp: object, index: int) -> class => sn::constant_pool::get_class_at_if_loaded0; // JDK 25
+    "jdk/internal/reflect/ConstantPool": instance fn getMemberRefInfoAt0(cp: object, index: int) -> string_array => sn::constant_pool::get_member_ref_info_at0; // JDK 25
+    "jdk/internal/reflect/ConstantPool": instance fn getNameAndTypeRefInfoAt0(cp: object, index: int) -> string_array => sn::constant_pool::get_name_and_type_ref_info_at0; // JDK 25
     "jdk/internal/reflect/ConstantPool": instance fn getUTF8At0(index: int) -> string => sn::constant_pool::get_utf8_at0; // JDK 26+
     "jdk/internal/reflect/ConstantPool": instance fn getSize0() -> int => sn::constant_pool::get_size0; // JDK 26+
     "jdk/internal/reflect/ConstantPool": instance fn getTagAt0(index: int) -> byte => sn::constant_pool::get_tag_at0; // JDK 26+
@@ -754,6 +950,13 @@ builtin_natives! {
     "sun/nio/ch/UnixFileDispatcherImpl": static fn map0(fd: file_descriptor, prot: int, pos: long, len: long, is_sync: boolean) -> long => sn::platform_file_dispatcher::map0;
     "sun/nio/ch/UnixFileDispatcherImpl": static fn isOther0(fd: file_descriptor) -> boolean => sn::platform_file_dispatcher::is_other0;
     "sun/nio/ch/UnixFileDispatcherImpl": static fn seek0(fd: file_descriptor, off: long) -> long => sn::platform_file_dispatcher::seek0;
+    "sun/nio/ch/UnixFileDispatcherImpl": static fn available0(fd: file_descriptor) -> int => sn::platform_file_dispatcher::unix::available0;
+    "sun/nio/ch/UnixFileDispatcherImpl": static fn pwrite0(fd: file_descriptor, address: long, len: int, pos: long) -> int => sn::platform_file_dispatcher::unix::pwrite0;
+    "sun/nio/ch/UnixFileDispatcherImpl": static fn readv0(fd: file_descriptor, address: long, len: int) -> long => sn::platform_file_dispatcher::unix::readv0;
+    "sun/nio/ch/UnixFileDispatcherImpl": static fn writev0(fd: file_descriptor, address: long, len: int) -> long => sn::platform_file_dispatcher::unix::writev0;
+    "sun/nio/ch/UnixFileDispatcherImpl": static fn force0(fd: file_descriptor, metadata: boolean) -> int => sn::platform_file_dispatcher::unix::force0;
+    "sun/nio/ch/UnixFileDispatcherImpl": static fn lock0(fd: file_descriptor, block: boolean, pos: long, size: long, shared: boolean) -> int => sn::platform_file_dispatcher::unix::lock0;
+    "sun/nio/ch/UnixFileDispatcherImpl": static fn release0(fd: file_descriptor, pos: long, size: long) -> void => sn::platform_file_dispatcher::unix::release0;
     }
 
     #[cfg(windows)]
@@ -769,6 +972,13 @@ builtin_natives! {
     "sun/nio/ch/FileDispatcherImpl": static fn isOther0(fd: file_descriptor) -> boolean => sn::platform_file_dispatcher::is_other0;
     "sun/nio/ch/FileDispatcherImpl": static fn seek0(fd: file_descriptor, off: long) -> long => sn::platform_file_dispatcher::seek0;
     "sun/nio/ch/FileDispatcherImpl": static fn duplicateHandle(handle: long) -> long => sn::platform_file_dispatcher::win::duplicate_handle;
+    "sun/nio/ch/FileDispatcherImpl": static fn available0(fd: file_descriptor) -> int => sn::platform_file_dispatcher::win::available0;
+    "sun/nio/ch/FileDispatcherImpl": static fn pwrite0(fd: file_descriptor, address: long, len: int, pos: long) -> int => sn::platform_file_dispatcher::win::pwrite0;
+    "sun/nio/ch/FileDispatcherImpl": static fn readv0(fd: file_descriptor, address: long, len: int) -> long => sn::platform_file_dispatcher::win::readv0;
+    "sun/nio/ch/FileDispatcherImpl": static fn writev0(fd: file_descriptor, address: long, len: int, append: boolean) -> long => sn::platform_file_dispatcher::win::writev0;
+    "sun/nio/ch/FileDispatcherImpl": static fn force0(fd: file_descriptor, metadata: boolean) -> int => sn::platform_file_dispatcher::win::force0;
+    "sun/nio/ch/FileDispatcherImpl": static fn lock0(fd: file_descriptor, block: boolean, pos: long, size: long, shared: boolean) -> int => sn::platform_file_dispatcher::win::lock0;
+    "sun/nio/ch/FileDispatcherImpl": static fn release0(fd: file_descriptor, pos: long, size: long) -> void => sn::platform_file_dispatcher::win::release0;
     }
 
     #[cfg(unix)]
@@ -861,7 +1071,7 @@ pub(super) fn find_builtin_native(method_signature: &str) -> Option<i64> {
     BUILTIN_NATIVE_TABLE.get(method_signature).copied()
 }
 
-/// Built-in natives that only some of the supported JDK releases declare (added, removed, turned
+/// Built-in natives that only some of the supported JDK releases or platforms declare (added, removed, turned
 /// into plain Java, or with a changed signature). Every variant is registered, so whichever one the
 /// running JDK declares resolves; the others are simply never looked up.
 const RELEASE_SPECIFIC_NATIVES: &[(&str, &str)] = &[
@@ -878,6 +1088,14 @@ const RELEASE_SPECIFIC_NATIVES: &[(&str, &str)] = &[
     ("sun/nio/fs/UnixNativeDispatcher", "fstatat0"),
     ("sun/nio/fs/WindowsNativeDispatcher", "initIDs"),
     ("sun/nio/fs/WindowsNativeDispatcher", "init"),
+    // Declared only by the Linux/macOS JDK:
+    ("java/lang/Thread", "setNativeName"),
+    ("com/sun/management/internal/OperatingSystemImpl", "getHostConfiguredCpuCount0"),
+    ("com/sun/management/internal/OperatingSystemImpl", "getHostOnlineCpuCount0"),
+    ("com/sun/management/internal/OperatingSystemImpl", "getHostTotalCpuTicks0"),
+    ("com/sun/management/internal/OperatingSystemImpl", "getOpenFileDescriptorCount0"),
+    ("com/sun/management/internal/OperatingSystemImpl", "getMaxFileDescriptorCount0"),
+    ("com/sun/management/internal/OperatingSystemImpl", "getSingleCpuLoad0"),
 ];
 
 /// Verifies that every built-in native declared in [`builtin_natives!`] matches a

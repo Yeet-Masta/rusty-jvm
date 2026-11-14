@@ -8,8 +8,10 @@
 //! identifies the owning Java thread.
 //!
 //! `wait`/`notify` use a single `Condvar` shared by the entry set (threads blocked acquiring) and
-//! the wait set (threads in `Object.wait`): notifications are counted in `to_wake`, and every waiter
-//! re-checks its condition on wake, so a broadcast that also disturbs the entry set is merely
+//! the wait set (threads in `Object.wait`). Each waiter holds a ticket in an ordered wait set, and
+//! `notify` marks the oldest ticket, so a notification reaches only a thread that was already
+//! waiting when it was issued (a thread that starts waiting later cannot consume it). Every waiter
+//! re-checks its own ticket on wake, so a broadcast that also disturbs the entry set is merely
 //! inefficient, never incorrect. Spurious wakeups are permitted by the `Object.wait` contract.
 
 use crate::vm::error::Result;
@@ -22,6 +24,7 @@ use crate::vm::safepoint;
 use crate::vm::threads::{self, thread_status};
 use dashmap::DashMap;
 use parking_lot::{Condvar, Mutex};
+use std::collections::{HashSet, VecDeque};
 use std::sync::{Arc, LazyLock};
 use std::thread::ThreadId;
 use std::time::{Duration, Instant};
@@ -39,8 +42,12 @@ struct MonitorState {
     entrants: u32,
     /// Number of threads currently in `Object.wait` on this monitor.
     waiters: u32,
-    /// Outstanding wake tokens produced by `notify`/`notifyAll` and consumed by waiters.
-    to_wake: u32,
+    /// Tickets of threads in `Object.wait` that have not been notified yet, oldest first.
+    wait_set: VecDeque<u64>,
+    /// Tickets selected by `notify`/`notifyAll` whose threads have not returned yet.
+    notified: HashSet<u64>,
+    /// Next wait ticket.
+    next_ticket: u64,
 }
 
 struct ObjectMonitor {
@@ -123,12 +130,29 @@ fn monitor_for(obj_ref: i32) -> Arc<ObjectMonitor> {
                     count: 0,
                     entrants: 0,
                     waiters: 0,
-                    to_wake: 0,
+                    wait_set: VecDeque::new(),
+                    notified: HashSet::new(),
+                    next_ticket: 0,
                 }),
                 cv: Condvar::new(),
             })
         })
         .clone()
+}
+
+/// Spin/yield attempts a contended `monitorenter` makes before parking.
+const SPIN_ROUNDS: u32 = 10;
+
+/// Wakes threads after the monitor became free. With no `Object.wait` waiters, everything asleep on
+/// the condvar wants ownership and any one of them can take it, so wake one instead of all (which
+/// stampedes every blocked thread for a single handoff). Waiters share the condvar, so with any
+/// present wake all, and each re-checks its own condition.
+fn wake_after_release(m: &ObjectMonitor, s: &MonitorState) {
+    if s.waiters == 0 {
+        m.cv.notify_one();
+    } else {
+        m.cv.notify_all();
+    }
 }
 
 /// `monitorenter`: acquire the object's monitor, blocking until it is free; reentrant for the
@@ -142,6 +166,23 @@ pub(crate) fn enter(obj_ref: i32) {
     let contended = s.owner.is_some() && s.owner != Some(tid);
     if contended {
         threads::set_current_thread_status(thread_status::BLOCKED);
+        // Short critical sections are the common case: spin briefly before parking, as HotSpot
+        // does, instead of paying a safepoint transition and an OS sleep/wake for every handoff.
+        // Bounded, and without holding the state lock, so a safepoint is not held up.
+        for round in 0..SPIN_ROUNDS {
+            if s.owner.is_none() {
+                break;
+            }
+            drop(s);
+            if round < SPIN_ROUNDS / 2 {
+                for _ in 0..(32u32 << round) {
+                    std::hint::spin_loop();
+                }
+            } else {
+                std::thread::yield_now();
+            }
+            s = safepoint::lock(&m.state);
+        }
     }
     while s.owner.is_some() && s.owner != Some(tid) {
         s = safepoint::wait(&m.cv, &m.state, s);
@@ -173,7 +214,7 @@ pub(crate) fn exit(obj_ref: i32) -> Result<()> {
     s.count -= 1;
     if s.count == 0 {
         s.owner = None;
-        m.cv.notify_all();
+        wake_after_release(&m, &s);
     }
     drop(s);
     JavaThread::unroot_monitor(obj_ref);
@@ -195,7 +236,7 @@ pub(crate) fn exit_synchronized_method(obj_ref: i32) -> bool {
     s.count -= 1;
     if s.count == 0 {
         s.owner = None;
-        m.cv.notify_all();
+        wake_after_release(&m, &s);
     }
     drop(s);
     JavaThread::unroot_monitor_if_present(obj_ref);
@@ -226,6 +267,9 @@ pub(crate) fn wait(obj_ref: i32, timeout_millis: i64) -> Result<()> {
     s.owner = None;
     s.count = 0;
     s.waiters += 1;
+    let ticket = s.next_ticket;
+    s.next_ticket += 1;
+    s.wait_set.push_back(ticket);
     m.cv.notify_all(); // hand the monitor to the entry set
 
     // Publish which monitor we wait on so interrupt0 can target it. Registered/unregistered under
@@ -244,8 +288,7 @@ pub(crate) fn wait(obj_ref: i32, timeout_millis: i64) -> Result<()> {
         .then(|| Instant::now() + Duration::from_millis(timeout_millis as u64));
     let mut interrupted = false;
     loop {
-        if s.to_wake > 0 {
-            s.to_wake -= 1;
+        if s.notified.remove(&ticket) {
             break;
         }
         if take_current_interrupt() {
@@ -263,12 +306,16 @@ pub(crate) fn wait(obj_ref: i32, timeout_millis: i64) -> Result<()> {
                 }
                 let (guard, timeout) = safepoint::wait_for(&m.cv, &m.state, s, dl - now);
                 s = guard;
-                if timeout.timed_out() && s.to_wake == 0 {
+                if timeout.timed_out() && !s.notified.contains(&ticket) {
                     break;
                 }
             }
         }
     }
+    // Leaving by timeout or interrupt: withdraw the ticket. A notification that raced with it is
+    // dropped, as `Object.wait` permits.
+    s.wait_set.retain(|waiting| *waiting != ticket);
+    s.notified.remove(&ticket);
     s.waiters -= 1;
     if let Some(thread_ref) = JavaThread::current_thread() {
         WAIT_TARGETS.remove(&thread_ref);
@@ -323,8 +370,8 @@ pub(crate) fn notify(obj_ref: i32) -> Result<()> {
             "current thread is not the owner of the monitor",
         );
     }
-    if s.to_wake < s.waiters {
-        s.to_wake += 1;
+    if let Some(ticket) = s.wait_set.pop_front() {
+        s.notified.insert(ticket);
         m.cv.notify_all();
     }
     Ok(())
@@ -341,9 +388,17 @@ pub(crate) fn notify_all(obj_ref: i32) -> Result<()> {
             "current thread is not the owner of the monitor",
         );
     }
-    s.to_wake = s.waiters;
+    notify_every_waiter(&mut s);
     m.cv.notify_all();
     Ok(())
+}
+
+/// Selects every thread currently in the wait set.
+fn notify_every_waiter(s: &mut MonitorState) {
+    let MonitorState {
+        wait_set, notified, ..
+    } = s;
+    notified.extend(wait_set.drain(..));
 }
 
 /// `Thread.holdsLock`: whether the calling thread owns the object's monitor.
@@ -373,7 +428,7 @@ pub(crate) fn wake_all_on_exit(obj_ref: i32) {
     s.entrants -= 1;
     s.owner = Some(tid);
     s.count = 1;
-    s.to_wake = s.waiters;
+    notify_every_waiter(&mut s);
     m.cv.notify_all();
     // release
     s.count = 0;

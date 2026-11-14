@@ -71,3 +71,31 @@ mod tests {
         assert_ne!(nano_time_adjustment(NOW, seconds + max - 1), -1);
     }
 }
+
+/// `jdk.internal.misc.VM.latestUserDefinedLoader0()Ljava/lang/ClassLoader;`
+///
+/// The defining loader of the nearest class on the current thread's stack that was loaded by
+/// neither the bootstrap nor the platform class loader (as HotSpot's `JVM_LatestUserDefinedLoader`),
+/// or null. `ObjectInputStream` resolves classes in the stream with it.
+pub(crate) fn latest_user_defined_loader0() -> Result<i32> {
+    use crate::vm::heap::heap::HEAP;
+    use crate::vm::jni::java_thread::JavaThread;
+    use crate::vm::method_area::loaded_classes::CLASSES;
+
+    let class_names = JavaThread::with_frames(|frames| {
+        frames
+            .map(|frame| frame.current_class_name().to_owned())
+            .collect::<Vec<_>>()
+    })?;
+    for name in class_names {
+        let mirror = CLASSES.class_mirror_ref(&name)?;
+        let loader = HEAP.get_object_field_value(mirror, "java/lang/Class", "classLoader")?[0];
+        if loader != 0
+            && HEAP.get_instance_name(loader)?
+                != "jdk/internal/loader/ClassLoaders$PlatformClassLoader"
+        {
+            return Ok(loader);
+        }
+    }
+    Ok(0)
+}

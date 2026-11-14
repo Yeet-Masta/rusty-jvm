@@ -9,6 +9,7 @@ use crate::vm::method_area::loaded_classes::CLASSES;
 use crate::vm::stack::rooted_slots::RootedSlots;
 use crate::vm::stack::slot::Slot;
 use crate::vm::stack::stack_frame::StackFrames;
+use crate::vm::stack::stack_limit;
 use crate::vm::system_native::dispatcher::invoke::invoke as invoke_native;
 use crate::vm::system_native::dispatcher::polymorphic::invoke_polymorphic;
 use jdescriptor::{MethodDescriptor, TypeDescriptor};
@@ -31,26 +32,38 @@ pub(crate) fn invoke(
     java_method: Arc<JavaMethod>,
     class_name: &str,
 ) -> Result<()> {
-    let _arguments = JavaThread::hold_temp_roots(method_args.to_vec());
     let (method_name, descriptor) = full_signature.split_once(':').ok_or_else(|| {
         Error::new_execution(&format!("full_signature {full_signature} must contain ':'"))
     })?;
-    let call_site;
-    let effective_type = match signature_origin {
-        SignatureOrigin::CallSite => {
-            call_site = descriptor.parse::<MethodDescriptor>()?;
-            &call_site
-        }
-        SignatureOrigin::EffectiveMethodType(method_type) => method_type,
-    };
     let is_static = java_method.is_static();
     let is_polymorphic = java_method.is_polymorphic_signature();
+    // Only a polymorphic call's argument types come from its call site; every other call uses the
+    // method's own descriptor and cached reference mask, so the hot path parses and allocates
+    // nothing here.
+    let call_site;
     let argument_type = if is_polymorphic {
-        effective_type
+        match signature_origin {
+            SignatureOrigin::CallSite => {
+                call_site = descriptor.parse::<MethodDescriptor>()?;
+                &call_site
+            }
+            SignatureOrigin::EffectiveMethodType(method_type) => method_type,
+        }
     } else {
         java_method.get_method_descriptor()
     };
-    validate_arg_slots(&ref_arg_chunks(argument_type, !is_static)?, method_args)?;
+    if is_polymorphic {
+        validate_arg_slots(&ref_arg_chunks(argument_type, !is_static)?, method_args)?;
+    } else {
+        validate_arg_slots(java_method.arg_ref_chunks()?, method_args)?;
+    }
+
+    // An interpreted callee's arguments move into its frame below with no safepoint or allocation
+    // in between. A native call can block, call back into Java and allocate before it returns,
+    // so its arguments need a root scope of their own.
+    let _arguments = java_method
+        .is_native()
+        .then(|| JavaThread::hold_temp_roots(method_args.to_vec()));
 
     let mut native_monitor = if java_method.is_native() && java_method.is_synchronized() {
         Some(SynchronizedNativeMonitor::enter(&java_method, method_args)?)
@@ -63,13 +76,23 @@ pub(crate) fn invoke(
         let mut destination = RootedSlots::new();
         let result = if is_polymorphic {
             // These intrinsics access the caller's segment directly; no synthetic frame.
-            invoke_polymorphic(class_name, method_name, method_args, &mut destination)
+            invoke_polymorphic(
+                class_name,
+                method_name,
+                method_args,
+                argument_type,
+                &mut destination,
+            )
         } else {
-            let full_native_signature = format!("{class_name}:{full_signature}");
+            // JNI binds a native by the class that declares it, not the class named at the call
+            // site: `FileDispatcherImpl.closeIntFD` is `Java_sun_nio_ch_UnixFileDispatcherImpl_..`.
+            let declaring_class = java_method.class_name();
+            let full_native_signature = format!("{declaring_class}:{full_signature}");
             trace!("<Calling native method> -> {full_native_signature} ({method_args:?})");
             stack_frames.new_frame(java_method.new_native_stack_frame(method_args.to_vec()));
             let result = invoke_native(
                 &full_native_signature,
+                class_name,
                 method_args,
                 is_static,
                 &mut destination,
@@ -103,6 +126,9 @@ pub(crate) fn invoke(
             publish_result(stack_frames, &destination, argument_type.return_type())?;
         }
     } else {
+        if stack_limit::would_overflow(stack_frames) {
+            return stack_limit::throw_stack_overflow(stack_frames);
+        }
         let mut next_frame = java_method.new_stack_frame()?;
         for (index, &slot) in method_args.iter().enumerate() {
             next_frame.set_local(index, slot);

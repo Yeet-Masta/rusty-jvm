@@ -111,7 +111,14 @@ impl Trace {
 /// One attempt, with skipped-cycle policy for ANY snapshot/preflight/trace failure.
 /// Dropping an incomplete Operation opens the coordinator without reporting a
 /// successful epoch. No retry loop can spin on a lock held by a Safe thread.
+/// Completed collections and the wall time they took, for `GarbageCollectorMXBean`.
+pub(crate) static COLLECTION_COUNT: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub(crate) static COLLECTION_NANOS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 pub(crate) fn collect(cause: Cause) -> Option<Stats> {
+    let started = std::time::Instant::now();
     let owner = safepoint::current()?;
     let operation = COORDINATOR.request_collection_for(
         owner,
@@ -132,6 +139,11 @@ pub(crate) fn collect(cause: Cause) -> Option<Stats> {
                 "[gc] {:?}: {} -> {} objects, reclaimed={} bytes, pending={}, scratch<={} bytes",
                 cause, stats.before, stats.live, stats.reclaimed, stats.discovered, stats.scratch_bytes);
             operation.complete();
+            COLLECTION_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            COLLECTION_NANOS.fetch_add(
+                started.elapsed().as_nanos() as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
             Some(stats)
         }
         Err(error) => {

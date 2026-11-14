@@ -275,14 +275,22 @@ pub(crate) fn global_roots() -> Result<Vec<i32>> {
     Ok(roots)
 }
 
+/// The calling thread's JNI local roots, which its frames hold without the handle table.
+#[cfg(test)]
 pub(crate) fn local_roots() -> Vec<i32> {
-    let owner = thread::current().id();
-    table()
-        .records
-        .values()
-        .filter(|record| record.owner_thread == Some(owner))
-        .map(|record| record.target)
-        .collect()
+    JavaThread::with_jni_frames(|frames| frames.local_targets().collect())
+}
+
+/// Makes the next token allocation fail as if the token space were exhausted, until `restore`
+/// gives back what this returns.
+#[cfg(test)]
+pub(crate) fn exhaust_tokens_for_test() -> Option<usize> {
+    table().next.take()
+}
+
+#[cfg(test)]
+pub(crate) fn restore_tokens_for_test(next: Option<usize>) {
+    table().next = next;
 }
 
 #[cfg(test)]

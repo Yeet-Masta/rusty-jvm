@@ -7,6 +7,8 @@ mod gc;
 mod heap;
 mod helper;
 mod jni;
+mod jvm_interface;
+mod jvm_shim;
 mod launcher;
 mod method_area;
 mod monitor;
@@ -42,6 +44,9 @@ use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::{fmt, EnvFilter};
 
 pub(crate) static PLATFORM_CLASSLOADER_REF: OnceLock<i32> = OnceLock::new();
+/// Modules the boot loader defines (`ModuleLoaderMap.bootModules()`). Set once the module system
+/// is up; until then every runtime-image class is defined by the boot loader.
+pub(crate) static BOOT_MODULES: OnceLock<std::collections::HashSet<String>> = OnceLock::new();
 pub(crate) static SYSTEM_CLASSLOADER_REF: OnceLock<i32> = OnceLock::new();
 
 /// Launches the Rusty Java Virtual Machine with the given arguments.
@@ -52,9 +57,16 @@ pub(crate) static SYSTEM_CLASSLOADER_REF: OnceLock<i32> = OnceLock::new();
 ///
 /// * `arguments` - The arguments for the Java program.
 /// * `java_home` - The path to the Java home directory.
+/// Native stack size for the thread that runs `main` (and every Java thread).
+pub const VM_THREAD_STACK_BYTES: usize = stack::stack_limit::NATIVE_STACK_BYTES;
+
 pub fn run(arguments: &Arguments, java_home: &Path) -> Result<()> {
     safepoint::attach();
     gc::install(arguments)?;
+    stack::stack_limit::configure(arguments.jvm_options());
+    system_native::management::init(arguments);
+    // Before any JDK native library is loaded, so their `JVM_*` imports resolve to it.
+    jvm_shim::install();
     JAVA_HOME
         .set(java_home.to_path_buf())
         .map_err(|e| Error::new_execution(&format!("JAVA_HOME already set: {e:?}")))?;
@@ -164,6 +176,19 @@ fn prelude() -> Result<()> {
 
     init()?;
 
+    // HotSpot's preallocated heap-exhaustion error reads "Java heap space". The emergency
+    // instance is created before `String` can be constructed, so its message is attached here;
+    // the interned string stays reachable through the constant-string pool.
+    if let Some(oom_ref) = jni::handles::emergency_oom_ref() {
+        let message_ref = StringPoolHelper::get_string("Java heap space")?;
+        crate::vm::heap::heap::HEAP.set_object_field_value(
+            oom_ref,
+            "java/lang/Throwable",
+            "detailMessage",
+            vec![message_ref],
+        )?;
+    }
+
     Ok(())
 }
 
@@ -171,7 +196,9 @@ fn init_logger() -> Result<()> {
     use tracing_subscriber::filter::filter_fn;
     use tracing_subscriber::layer::Layer;
 
+    // VM diagnostics never share stdout with the program, as in HotSpot.
     let fmt_layer = fmt::layer()
+        .with_writer(std::io::stderr)
         .with_target(false)
         .without_time()
         .with_ansi(false)
@@ -266,6 +293,27 @@ fn init() -> Result<()> {
                 .value(),
         )
         .map_err(|_e| Error::new_execution("value already set"))?;
+    // From here on, classes of platform and application modules in the runtime image are defined by
+    // their own loaders (HotSpot's per-module loader map), so a module's classes all agree on it.
+    let boot_modules = Executor::invoke_static_method(
+        "jdk/internal/module/ModuleLoaderMap",
+        "bootModules:()Ljava/util/Set;",
+        &[],
+    )?[0]
+        .value();
+    let separator = StringPoolHelper::get_string(",")?;
+    let joined = Executor::invoke_static_method(
+        "java/lang/String",
+        "join:(Ljava/lang/CharSequence;Ljava/lang/Iterable;)Ljava/lang/String;",
+        &[
+            StackValueKind::Ref(separator),
+            StackValueKind::Ref(boot_modules),
+        ],
+    )?[0]
+        .value();
+    let joined = crate::vm::system_native::string::get_utf8_string_by_ref(joined)?;
+    let _ = BOOT_MODULES.set(joined.split(',').map(str::to_string).collect());
+
     SYSTEM_CLASSLOADER_REF
         .set(
             Executor::invoke_static_method(
