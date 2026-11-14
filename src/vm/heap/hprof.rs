@@ -553,16 +553,13 @@ fn write_instance<W: Write>(
     // Field values: the object's own class first, then each superclass in turn.
     for (class_key, fields) in instance.field_groups().iter().rev() {
         let types = field_types
-            .get(class_key.as_str())
+            .get(class_key)
             .ok_or_else(|| invalid("an instance has fields of an undumped class"))?;
         if types.len() != fields.len() {
             return Err(invalid("an instance disagrees with its class's fields"));
         }
-        for (field, basic_type) in fields.values().zip(types) {
-            let slots = field
-                .try_raw_value()
-                .ok_or_else(|| invalid("an instance field is locked"))?;
-            basic_type.write_slots(&slots, out);
+        for (words, basic_type) in fields.iter().zip(types) {
+            basic_type.write_slots(words, out);
         }
     }
     let length = (out.len() - length_at - 4) as u32;

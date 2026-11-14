@@ -57,7 +57,7 @@ fn reference(heap: &Heap, kind: &str, target: i32) -> i32 {
     );
     let object = heap
         .create_instance(
-            InstancePlan::new(usize::MAX, Arc::new(storage), layout).unwrap(),
+            InstancePlan::new(usize::MAX, &storage, layout).unwrap(),
             &mut RootedSlots::new(),
         )
         .unwrap();

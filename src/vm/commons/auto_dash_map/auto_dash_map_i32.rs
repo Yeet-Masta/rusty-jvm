@@ -5,19 +5,45 @@ use dashmap::mapref::one::{Ref, RefMut};
 use dashmap::DashMap;
 use serde::ser::SerializeMap;
 use serde::Serialize;
+use std::hash::{BuildHasherDefault, Hasher};
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::Arc;
 
+/// Hashes an `i32` key with one multiplication. Keys are heap references handed out in sequence,
+/// and every bytecode that touches an object looks one up, so the default SipHash is far too
+/// costly here. The multiplier spreads the key over the high bits, which pick the shard, while
+/// the low bits, which pick the bucket, stay distinct for neighbouring keys.
+#[derive(Clone, Copy, Default)]
+pub struct KeyHasher(u64);
+
+impl Hasher for KeyHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        for byte in bytes {
+            self.0 = (self.0 ^ u64::from(*byte)).wrapping_mul(0x0000_0100_0000_01B3);
+        }
+    }
+
+    fn write_i32(&mut self, key: i32) {
+        self.0 = u64::from(key as u32).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    }
+}
+
+type KeyHash = BuildHasherDefault<KeyHasher>;
+
 #[derive(Debug)]
 pub struct AutoDashMapI32<V> {
-    map: DashMap<i32, V>,
+    map: DashMap<i32, V, KeyHash>,
     counter: Arc<AtomicI32>,
 }
 
 impl<V> AutoDashMapI32<V> {
     /// Weakly consistent, like any `DashMap` iteration: entries added or removed meanwhile may
     /// or may not be seen.
-    pub(crate) fn iter(&self) -> dashmap::iter::Iter<'_, i32, V> {
+    pub(crate) fn iter(&self) -> dashmap::iter::Iter<'_, i32, V, KeyHash> {
         self.map.iter()
     }
 
@@ -71,7 +97,7 @@ impl<V> AutoDashMap<V> for AutoDashMapI32<V> {
 
     fn new(start_from: Self::Key) -> Self {
         Self {
-            map: DashMap::new(),
+            map: DashMap::default(),
             counter: Arc::new(AtomicI32::new(start_from)),
         }
     }

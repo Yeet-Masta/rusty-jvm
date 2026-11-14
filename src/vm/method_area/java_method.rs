@@ -138,6 +138,7 @@ impl JavaMethod {
                 class_name: Arc::clone(&self.class_name),
                 line_numbers: Arc::clone(context.line_numbers()),
                 exception_table: Arc::clone(context.exception_table()),
+                klass: Default::default(),
             })
         });
         let mut frame = StackFrame::from_code(

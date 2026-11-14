@@ -20,7 +20,7 @@ fn gc_budget_exact_equality_commits_and_publishes_root() {
     let mut destination = RootedSlots::new();
     let reference = heap.create_array("[I", 2, &mut destination).unwrap();
     let admission = heap.admission.lock();
-    assert_eq!(CHARGE_POLICY_VERSION, 1);
+    assert_eq!(CHARGE_POLICY_VERSION, 2);
     assert_eq!(admission.budget.used, charge());
     assert_eq!(admission.budget.reserved, 0);
     assert_eq!(destination[0], Slot::Ref(reference));

@@ -1,7 +1,8 @@
 use crate::vm::error::{Error, Result};
 use crate::vm::execution_engine::common::last_frame_mut;
 use crate::vm::execution_engine::opcode::*;
-use crate::vm::method_area::method_area::{with_method_area, MethodArea};
+use crate::vm::method_area::java_class::JavaClass;
+use crate::vm::method_area::method_area::with_method_area;
 use crate::vm::stack::slot::Slot;
 use crate::vm::stack::stack_frame::{StackFrame, StackFrames};
 use crate::vm::stack::stack_value::StackValue;
@@ -11,6 +12,7 @@ use tracing::trace;
 pub(crate) fn process(
     code: u8,
     current_class_name: &str,
+    klass: Option<&JavaClass>,
     stack_frames: &mut StackFrames,
 ) -> Result<()> {
     let stack_frame = last_frame_mut(stack_frames)?;
@@ -45,7 +47,7 @@ pub(crate) fn process(
             |stack_frame| stack_frame.extract_two_bytes() as i32,
             "SIPUSH",
         ),
-        LDC | LDC_W | LDC2_W => handle_ldc_cases(stack_frame, code, current_class_name),
+        LDC | LDC_W | LDC2_W => handle_ldc_cases(stack_frame, code, current_class_name, klass),
         _ => Err(Error::new_execution(&format!(
             "Unknown constant opcode: {}",
             code
@@ -72,54 +74,54 @@ fn handle_push<T: StackValue + Display + Copy>(
     Ok(())
 }
 
+/// `ldc`, `ldc_w` and `ldc2_w`. A constant is resolved once per class and constant pool index;
+/// after that it comes straight from the class, tagged in bit 32 when it is a reference.
 fn handle_ldc_cases(
     stack_frame: &mut StackFrame,
     code: u8,
     current_class_name: &str,
+    klass: Option<&JavaClass>,
 ) -> Result<()> {
-    match code {
-        LDC | LDC_W => {
-            let extract_func = if code == LDC {
-                |sf: &mut StackFrame| sf.extract_one_byte() as u16
-            } else {
-                |sf: &mut StackFrame| sf.extract_two_bytes() as u16
-            };
-
-            handle_ldc_generic(
-                stack_frame,
-                extract_func,
-                |method_area, class_name, index| method_area.resolve_ldc(class_name, index),
-                current_class_name,
-                if code == LDC { "LDC" } else { "LDC_W" },
-            )
-        }
-        LDC2_W => handle_ldc_generic(
-            stack_frame,
-            |sf| sf.extract_two_bytes() as u16,
-            |method_area, class_name, index| method_area.resolve_ldc2_w(class_name, index),
-            current_class_name,
-            "LDC2_W",
-        ),
-        _ => unreachable!(),
+    const REFERENCE: i64 = 1 << 32;
+    let cpoolindex = if code == LDC {
+        stack_frame.extract_one_byte() as u16
+    } else {
+        stack_frame.extract_two_bytes() as u16
+    };
+    let cached = klass.and_then(|klass| klass.cached_constant(cpoolindex));
+    if code == LDC2_W {
+        let value = match cached {
+            Some(value) => value,
+            None => {
+                let value = with_method_area(|method_area| {
+                    method_area.resolve_ldc2_w(current_class_name, cpoolindex)
+                })?;
+                if let Some(klass) = klass {
+                    klass.cache_constant(cpoolindex, value);
+                }
+                value
+            }
+        };
+        stack_frame.push(value)?;
+        trace!("LDC2_W -> cpoolindex={cpoolindex}, value={value}");
+    } else {
+        let slot = match cached {
+            Some(bits) if bits & REFERENCE != 0 => Slot::Ref(bits as i32),
+            Some(bits) => Slot::Value(bits as i32),
+            None => {
+                let slot = with_method_area(|method_area| {
+                    method_area.resolve_ldc(current_class_name, cpoolindex)
+                })?;
+                if let Some(klass) = klass {
+                    let tag = if slot.is_ref() { REFERENCE } else { 0 };
+                    klass.cache_constant(cpoolindex, tag | i64::from(slot.value() as u32));
+                }
+                slot
+            }
+        };
+        stack_frame.push(slot)?;
+        trace!("LDC -> cpoolindex={cpoolindex}, value={slot}");
     }
-}
-
-fn handle_ldc_generic<T: StackValue + Display + Copy>(
-    stack_frame: &mut StackFrame,
-    extractor: impl FnOnce(&mut StackFrame) -> u16,
-    resolver: impl FnOnce(&MethodArea, &str, u16) -> Result<T>,
-    current_class_name: &str,
-    name: &str,
-) -> Result<()> {
-    let cpoolindex = extractor(stack_frame);
-
-    let value =
-        with_method_area(|method_area| resolver(method_area, current_class_name, cpoolindex))?;
-
-    stack_frame.push(value)?;
-
     stack_frame.incr_pc();
-    trace!("{name} -> cpoolindex={cpoolindex}, value={value}");
-
     Ok(())
 }

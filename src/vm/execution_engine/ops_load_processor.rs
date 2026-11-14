@@ -1,8 +1,7 @@
 use crate::vm::error::{Error, Result};
-use crate::vm::exception::helpers::check_array_access;
+use crate::vm::exception::helpers::load_array_element;
 use crate::vm::execution_engine::common::last_frame_mut;
 use crate::vm::execution_engine::opcode::*;
-use crate::vm::heap::heap::HEAP;
 use crate::vm::stack::slot::Slot;
 use crate::vm::stack::stack_frame::{StackFrame, StackFrames};
 use crate::vm::stack::stack_value::StackValue;
@@ -82,15 +81,10 @@ fn handle_ref_array_load(stack_frames: &mut StackFrames) -> Result<()> {
         let arrayref = stack_frame.pop();
         (arrayref, index)
     };
-    if !check_array_access(arrayref, index, stack_frames)? {
+    let Some(words) = load_array_element(arrayref, index, stack_frames)? else {
         return Ok(());
-    }
-    let raw_value = HEAP.get_array_value(arrayref, index)?;
-    let value = Slot::Ref(*raw_value.first().ok_or_else(|| {
-        Error::new_execution(&format!(
-            "AALOAD -> no value at index {index} of array {arrayref}"
-        ))
-    })?);
+    };
+    let value = Slot::Ref(words[0]);
 
     let stack_frame = last_frame_mut(stack_frames)?;
     stack_frame.push(value)?;
@@ -110,12 +104,10 @@ fn handle_array_load<T: StackValue + Display + Copy>(
         let arrayref = stack_frame.pop();
         (arrayref, index)
     };
-    if !check_array_access(arrayref, index, stack_frames)? {
+    let Some(words) = load_array_element(arrayref, index, stack_frames)? else {
         return Ok(());
-    }
-    let raw_value = HEAP.get_array_value(arrayref, index)?;
-
-    let value: T = T::from_vec(&raw_value);
+    };
+    let value: T = T::from_vec(&words);
     let stack_frame = last_frame_mut(stack_frames)?;
     stack_frame.push(value)?;
     stack_frame.incr_pc();

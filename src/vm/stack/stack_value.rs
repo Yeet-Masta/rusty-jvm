@@ -67,6 +67,13 @@ pub trait StackValue {
 
     fn from_vec(v: &[i32]) -> Self;
     fn to_vec(&self) -> Vec<i32>;
+
+    /// [`Self::to_vec`] without the allocation: the value's JVM words, the second one zero for a
+    /// single-word value.
+    fn to_words(&self) -> [i32; 2] {
+        let words = self.to_vec();
+        [words[0], words.get(1).copied().unwrap_or(0)]
+    }
 }
 
 impl StackValue for i32 {
@@ -92,6 +99,10 @@ impl StackValue for i32 {
 
     fn to_vec(&self) -> Vec<i32> {
         vec![*self]
+    }
+
+    fn to_words(&self) -> [i32; 2] {
+        [*self, 0]
     }
 }
 
@@ -186,6 +197,10 @@ impl StackValue for i64 {
     fn to_vec(&self) -> Vec<i32> {
         i64_to_vec(*self)
     }
+
+    fn to_words(&self) -> [i32; 2] {
+        [(*self >> 32) as i32, *self as i32]
+    }
 }
 
 impl StackValue for f32 {
@@ -215,6 +230,10 @@ impl StackValue for f32 {
     fn to_vec(&self) -> Vec<i32> {
         vec![self.to_bits() as i32]
     }
+
+    fn to_words(&self) -> [i32; 2] {
+        [self.to_bits() as i32, 0]
+    }
 }
 
 impl StackValue for f64 {
@@ -243,5 +262,9 @@ impl StackValue for f64 {
 
     fn to_vec(&self) -> Vec<i32> {
         StackValue::to_vec(&(self.to_bits() as i64))
+    }
+
+    fn to_words(&self) -> [i32; 2] {
+        StackValue::to_words(&(self.to_bits() as i64))
     }
 }

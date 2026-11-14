@@ -2,14 +2,16 @@ use crate::vm::error::{Error, Result};
 use crate::vm::exception::class_cast::throw_class_cast_exception;
 use crate::vm::exception::common::throw_exception_with_ref;
 use crate::vm::exception::helpers::throw_null_pointer_exception;
-use crate::vm::execution_engine::common::{last_frame_mut, push_typed, store_ex_pc};
+use crate::vm::execution_engine::common::{last_frame_mut, push_words, store_ex_pc};
 use crate::vm::execution_engine::invoker::{invoke, SignatureOrigin};
 use crate::vm::execution_engine::opcode::*;
 use crate::vm::execution_engine::static_init::StaticInit;
 use crate::vm::heap::heap::HEAP;
-use crate::vm::helper::{argument_length, get_length};
+use crate::vm::helper::{argument_length, get_length, is_reference};
 use crate::vm::method_area::instance_checker::InstanceChecker;
-use crate::vm::method_area::java_class::{JavaClass, MemberRef, MemberRefKind};
+use crate::vm::method_area::java_class::{
+    InstanceField, JavaClass, MemberRef, MemberRefKind, StaticField,
+};
 use crate::vm::method_area::java_method::JavaMethod;
 use crate::vm::method_area::loaded_classes::CLASSES;
 use crate::vm::method_area::lookup;
@@ -32,128 +34,93 @@ pub(crate) fn process(
     match code {
         GETSTATIC => {
             let stack_frame = last_frame_mut(stack_frames)?;
-            let field = get_field_info(stack_frame, current_class)?;
-            let (class_name, field_name) = (&field.class_name, &field.name);
+            let member = get_field_info(stack_frame, current_class)?;
+            let field = static_field(member)?;
+            StaticInit::initialize_java_class(&field.holder)?;
 
-            let (fields_class_name, field) =
-                lookup::lookup_for_static_field(&class_name, &field_name)?.ok_or_else(|| {
-                    Error::new_constant_pool(&format!(
-                        "Static field {class_name}.{field_name} not found"
-                    ))
-                })?;
-
-            StaticInit::initialize(&fields_class_name)?;
-
-            let klass = CLASSES.get(&fields_class_name)?;
-            let field_info = klass
-                .field_info(&field_name)
-                .ok_or_else(|| Error::new_execution("Error getting field info"))?;
-            push_typed(
-                stack_frame,
-                field_info.type_descriptor(),
-                &field.raw_value()?,
-            )?;
+            let words = field.value.words()?;
+            push_words(stack_frame, words, field.wide, field.reference)?;
 
             stack_frame.incr_pc();
             trace!(
-                "GETSTATIC -> {class_name}.{field_name} is {:?}",
-                field.raw_value()
+                "GETSTATIC -> {}.{} is {words:?}",
+                member.class_name,
+                member.name
             );
         }
         PUTSTATIC => {
             let stack_frame = last_frame_mut(stack_frames)?;
-            let field = get_field_info(stack_frame, current_class)?;
-            let (class_name, field_name) = (&field.class_name, &field.name);
+            let member = get_field_info(stack_frame, current_class)?;
+            let field = static_field(member)?;
+            // The operands stay on the stack, and so rooted, while the class initializes.
+            StaticInit::initialize_java_class(&field.holder)?;
 
-            let (fields_class_name, field_value) =
-                lookup::lookup_for_static_field(&class_name, &field_name)?.ok_or_else(|| {
-                    Error::new_constant_pool(&format!(
-                        "Static field {class_name}.{field_name} not found"
-                    ))
-                })?;
-
-            let klass = CLASSES.get(&fields_class_name)?;
-            let field_info = klass
-                .field_info(&field_name)
-                .ok_or_else(|| Error::new_execution("Error getting field info"))?;
-            let len = get_length(field_info.type_descriptor())?;
-
-            StaticInit::initialize(&fields_class_name)?;
-
-            let mut value = Vec::with_capacity(len as usize);
-            for _ in 0..len {
-                value.push(stack_frame.pop());
-            }
-
-            field_value.set_raw_value(value.clone())?;
+            let words = pop_words(stack_frame, field.wide);
+            field.value.set_words(words)?;
 
             stack_frame.incr_pc();
-            trace!("PUTSTATIC -> {class_name}.{field_name} = {value:?}");
+            trace!(
+                "PUTSTATIC -> {}.{} = {words:?}",
+                member.class_name,
+                member.name
+            );
         }
         GETFIELD => {
-            let field;
-            let (class_name, field_name, type_descriptor, objectref) = {
+            let (member, field, objectref) = {
                 let stack_frame = last_frame_mut(stack_frames)?;
-                field = get_field_info(stack_frame, current_class)?;
-                let (class_name, field_name) = (&field.class_name, &field.name);
+                let member = get_field_info(stack_frame, current_class)?;
                 // Metadata lookup can wait for class publication and cross a GC stop.
-                // Keep the receiver on the frame until it completes, and do not
-                // leave the raw field result unrooted across another lookup.
-                let type_descriptor =
-                    lookup::lookup_for_field_descriptor(&class_name, &field_name).ok_or_else(
-                        || {
-                            Error::new_constant_pool(&format!(
-                                "Error getting type descriptor for {class_name}.{field_name}"
-                            ))
-                        },
-                    )?;
-                let objectref = stack_frame.pop();
-                (class_name, field_name, type_descriptor, objectref)
+                // Keep the receiver on the frame until it completes.
+                let field = instance_field(member)?;
+                let objectref: i32 = stack_frame.pop();
+                (member, field, objectref)
             };
-
-            let value = HEAP.get_object_field_value_throwing(
-                objectref,
-                class_name.as_str(),
-                field_name.as_str(),
-                stack_frames,
-            )?;
-
-            let Some(value) = value else { return Ok(()) };
-
-            let stack_frame = last_frame_mut(stack_frames)?;
-            push_typed(stack_frame, &type_descriptor, &value)?;
-
-            stack_frame.incr_pc();
-            trace!("GETFIELD -> objectref={objectref}, class_name={class_name}, field_name={field_name}, value={value:?}");
-        }
-        PUTFIELD => {
-            let stack_frame = last_frame_mut(stack_frames)?;
-            let field = get_field_info(stack_frame, current_class)?;
-            let (class_name, field_name) = (&field.class_name, &field.name);
-            let type_descriptor = lookup::lookup_for_field_descriptor(&class_name, &field_name)
-                .ok_or_else(|| {
-                    Error::new_constant_pool(&format!(
-                        "Error getting type descriptor for {class_name}.{field_name}"
-                    ))
-                })?;
-            let len = get_length(&type_descriptor)?;
-
-            let mut value = Vec::with_capacity(len as usize);
-            for _ in 0..len {
-                value.push(stack_frame.pop());
+            if objectref == 0 {
+                throw_null_pointer_exception(stack_frames)?;
+                return Ok(());
             }
 
-            let objectref = stack_frame.pop();
+            let words =
+                HEAP.read_field(objectref, &member.class_name, &member.name, &field.position)?;
 
-            HEAP.set_object_field_value(
+            let stack_frame = last_frame_mut(stack_frames)?;
+            push_words(stack_frame, words, field.wide, field.reference)?;
+
+            stack_frame.incr_pc();
+            trace!(
+                "GETFIELD -> objectref={objectref}, class_name={}, field_name={}, value={words:?}",
+                member.class_name,
+                member.name
+            );
+        }
+        PUTFIELD => {
+            let (member, field, words, objectref) = {
+                let stack_frame = last_frame_mut(stack_frames)?;
+                let member = get_field_info(stack_frame, current_class)?;
+                let field = instance_field(member)?;
+                let words = pop_words(stack_frame, field.wide);
+                let objectref: i32 = stack_frame.pop();
+                (member, field, words, objectref)
+            };
+            if objectref == 0 {
+                throw_null_pointer_exception(stack_frames)?;
+                return Ok(());
+            }
+
+            HEAP.write_field(
                 objectref,
-                class_name.as_str(),
-                field_name.as_str(),
-                value.clone(),
+                &member.class_name,
+                &member.name,
+                &field.position,
+                words,
             )?;
 
-            trace!("PUTFIELD -> objectref={objectref}, class_name={class_name}, field_name={field_name} value={value:?}");
-            stack_frame.incr_pc();
+            trace!(
+                "PUTFIELD -> objectref={objectref}, class_name={}, field_name={} value={words:?}",
+                member.class_name,
+                member.name
+            );
+            last_frame_mut(stack_frames)?.incr_pc();
         }
         INVOKEVIRTUAL => {
             store_ex_pc(stack_frames)?;
@@ -595,6 +562,61 @@ fn get_class_name_and_signature<'a>(
     stack_frame.incr_pc();
 
     current_class.member_ref(kind, index)
+}
+
+/// Pops a field value off the operand stack as JVM words: the high word of a wide value is on top.
+fn pop_words(stack_frame: &mut StackFrame, wide: bool) -> [i32; 2] {
+    let first: i32 = stack_frame.pop();
+    if wide {
+        [first, stack_frame.pop()]
+    } else {
+        [first, 0]
+    }
+}
+
+/// The static field a `getstatic`/`putstatic` site refers to, resolved on first use.
+fn static_field(member: &MemberRef) -> Result<&StaticField> {
+    if let Some(resolved) = member.static_field.get() {
+        return Ok(resolved);
+    }
+    let (class_name, field_name) = (&member.class_name, &member.name);
+    let (holder_name, value) = lookup::lookup_for_static_field(class_name, field_name)?
+        .ok_or_else(|| {
+            Error::new_constant_pool(&format!("Static field {class_name}.{field_name} not found"))
+        })?;
+    let holder = CLASSES.get(&holder_name)?;
+    let descriptor = holder
+        .field_info(field_name)
+        .ok_or_else(|| Error::new_execution("Error getting field info"))?
+        .type_descriptor()
+        .clone();
+    let resolved = StaticField {
+        holder,
+        value,
+        wide: get_length(&descriptor)? == 2,
+        reference: is_reference(&descriptor),
+    };
+    Ok(member.static_field.get_or_init(|| resolved))
+}
+
+/// The instance field a `getfield`/`putfield` site refers to, resolved on first use.
+fn instance_field(member: &MemberRef) -> Result<&InstanceField> {
+    if let Some(resolved) = member.instance_field.get() {
+        return Ok(resolved);
+    }
+    let (class_name, field_name) = (&member.class_name, &member.name);
+    let descriptor =
+        lookup::lookup_for_field_descriptor(class_name, field_name).ok_or_else(|| {
+            Error::new_constant_pool(&format!(
+                "Error getting type descriptor for {class_name}.{field_name}"
+            ))
+        })?;
+    let resolved = InstanceField {
+        wide: get_length(&descriptor)? == 2,
+        reference: is_reference(&descriptor),
+        position: std::sync::OnceLock::new(),
+    };
+    Ok(member.instance_field.get_or_init(|| resolved))
 }
 
 fn get_field_info<'a>(

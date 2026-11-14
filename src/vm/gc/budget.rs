@@ -1,8 +1,8 @@
 //! Policy-v1 managed storage accounting. This is not an RSS measurement.
 use std::fmt;
 
-pub(crate) const CHARGE_POLICY_VERSION: u32 = 1;
-const _: () = assert!(CHARGE_POLICY_VERSION == 1);
+pub(crate) const CHARGE_POLICY_VERSION: u32 = 2;
+const _: () = assert!(CHARGE_POLICY_VERSION == 2);
 
 /// Small, inline failures: creating or propagating one never allocates.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

@@ -1,44 +1,179 @@
 use crate::vm::error::{Error, Result};
 use crate::vm::gc::budget::{copy_slice, copy_string, AllocError, AllocResult};
 #[cfg(test)]
+use crate::vm::gc::layout::InstanceFields;
+use crate::vm::gc::layout::InstanceLayout;
+#[cfg(test)]
 use crate::vm::gc::layout::References;
-use crate::vm::gc::layout::{InstanceFields, InstanceLayout};
 use crate::vm::gc::references::{Reference, REFERENCE};
 use crate::vm::heap::charge;
-use crate::vm::heap::construction::{copy_fields, ArrayLayout};
+use crate::vm::heap::construction::ArrayLayout;
 use crate::vm::heap::java_instance::JavaInstance::{Base, Class};
-use crate::vm::method_area::field::FieldValue;
 use crate::vm::method_area::java_class::JavaClass;
 use crate::vm::method_area::loaded_classes::CLASSES;
 use derive_new::new;
 use getset::CopyGetters;
 use indexmap::IndexMap;
 use serde::Serialize;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicI32, Ordering};
+use std::sync::{Arc, OnceLock};
 
 pub type ClassName = String;
 pub type FieldNameType = String;
 
-#[derive(Debug, Serialize, Clone)]
+/// An object's state: its class and its field values.
+///
+/// The values are words in the order of the class's [`InstanceLayout`], one per field and two
+/// for a `long` or `double` (high word first). Which word belongs to which field is class
+/// metadata, so an object owns a single allocation however deep its class hierarchy is.
+///
+/// The words are atomics so that the collector can update reference links through a shared
+/// borrow. They add no synchronization of their own: readers hold the heap entry's shared lock
+/// and writers its exclusive one.
+#[derive(Debug)]
 pub(crate) struct JavaInstanceBase {
     klass_id: usize,
-    fields: IndexMap<ClassName, IndexMap<FieldNameType, FieldValue>>,
-    #[serde(skip)]
+    slots: Box<[AtomicI32]>,
     layout: Arc<InstanceLayout>,
 }
 
 impl JavaInstanceBase {
+    /// An instance holding the values of `fields`, which must match `layout`.
+    #[cfg(test)]
     pub(crate) fn new(
         klass_id: usize,
         fields: InstanceFields,
         layout: Arc<InstanceLayout>,
     ) -> Result<Self> {
-        layout.validate(&fields)?;
+        let image = layout.flatten(&fields)?;
+        Self::from_words(klass_id, image.iter().copied(), image.len(), layout)
+    }
+
+    /// A new instance with the class's default field values, which the layout must have seen.
+    pub(crate) fn with_defaults(klass_id: usize, layout: Arc<InstanceLayout>) -> Result<Self> {
+        let image = layout.cached_defaults().ok_or(AllocError::InvalidLayout)?;
+        let slots = Self::slots(image.iter().copied(), image.len())?;
         Ok(Self {
             klass_id,
-            fields,
+            slots,
             layout,
         })
+    }
+
+    fn from_words(
+        klass_id: usize,
+        words: impl Iterator<Item = i32>,
+        count: usize,
+        layout: Arc<InstanceLayout>,
+    ) -> Result<Self> {
+        if count != layout.words() {
+            return Err(AllocError::InvalidLayout.into());
+        }
+        Ok(Self {
+            klass_id,
+            slots: Self::slots(words, count)?,
+            layout,
+        })
+    }
+
+    fn slots(words: impl Iterator<Item = i32>, count: usize) -> AllocResult<Box<[AtomicI32]>> {
+        let mut slots = Vec::new();
+        slots
+            .try_reserve_exact(count)
+            .map_err(|_| AllocError::HostAllocation)?;
+        slots.extend(words.map(AtomicI32::new));
+        Ok(slots.into_boxed_slice())
+    }
+
+    fn try_clone(&self) -> Result<Self> {
+        Self::from_words(
+            self.klass_id,
+            self.slots.iter().map(|slot| slot.load(Ordering::Relaxed)),
+            self.slots.len(),
+            Arc::clone(&self.layout),
+        )
+    }
+
+    fn word(&self, offset: usize) -> Option<i32> {
+        Some(self.slots.get(offset)?.load(Ordering::Relaxed))
+    }
+
+    /// The words of the field at `offset`, the second one zero unless the field is wide.
+    fn read(&self, offset: usize, width: usize) -> Option<[i32; 2]> {
+        let first = self.word(offset)?;
+        Some(if width == 2 {
+            [first, self.word(offset + 1)?]
+        } else {
+            [first, 0]
+        })
+    }
+
+    fn write(&self, offset: usize, width: usize, words: [i32; 2]) -> Option<()> {
+        self.slots.get(offset)?.store(words[0], Ordering::Relaxed);
+        if width == 2 {
+            self.slots
+                .get(offset + 1)?
+                .store(words[1], Ordering::Relaxed);
+        }
+        Some(())
+    }
+
+    /// Where a `getfield`/`putfield` site's field is, from the site's cache when it has been
+    /// there before.
+    fn position(
+        &self,
+        class_name: &str,
+        field_name: &str,
+        position: &OnceLock<(u32, u32)>,
+    ) -> Option<(usize, usize)> {
+        if let Some(&(offset, width)) = position.get() {
+            return Some((offset as usize, width as usize));
+        }
+        let (offset, width) = self.layout.locate(class_name, field_name)?;
+        let _ = position.set((offset as u32, width as u32));
+        Some((offset, width))
+    }
+}
+
+impl Clone for JavaInstanceBase {
+    fn clone(&self) -> Self {
+        Self {
+            klass_id: self.klass_id,
+            slots: self
+                .slots
+                .iter()
+                .map(|slot| AtomicI32::new(slot.load(Ordering::Relaxed)))
+                .collect(),
+            layout: Arc::clone(&self.layout),
+        }
+    }
+}
+
+/// Field values keyed by declaring class and field name, for the diagnostic JSON heap dump.
+impl Serialize for JavaInstanceBase {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let mut fields: IndexMap<&str, IndexMap<&str, Vec<i32>>> = IndexMap::new();
+        let names = self.layout.names();
+        for ((class, names), (_, positions)) in names.zip(self.layout.segments()) {
+            let values = names
+                .zip(positions)
+                .map(|(name, (offset, width))| {
+                    let words = (offset..offset + width)
+                        .filter_map(|at| self.word(at))
+                        .collect();
+                    (name, words)
+                })
+                .collect();
+            fields.insert(class, values);
+        }
+        let mut state = serializer.serialize_struct("JavaInstanceBase", 2)?;
+        state.serialize_field("klass_id", &self.klass_id)?;
+        state.serialize_field("fields", &fields)?;
+        state.end()
     }
 }
 
@@ -153,6 +288,73 @@ impl Array {
             }
         }
         Ok(result)
+    }
+
+    /// Bytes per element, from the second character of a one-dimensional primitive array's name.
+    fn element_width(&self) -> usize {
+        match self.type_name.as_bytes() {
+            [_, b'B' | b'Z'] => 1,
+            [_, b'C' | b'S'] => 2,
+            [_, b'J' | b'D'] => 8,
+            _ => 4,
+        }
+    }
+
+    /// The element at `index` as JVM words (a wide value is high word, then low word), or the
+    /// array's length when `index` is outside it.
+    pub(crate) fn load(&self, index: i32) -> std::result::Result<[i32; 2], i32> {
+        let width = self.element_width();
+        let length = self.data.len() / width;
+        if index < 0 || index as usize >= length {
+            return Err(length as i32);
+        }
+        let at = index as usize * width;
+        let source = &self.data[at..at + width];
+        Ok(match width {
+            1 => [source[0] as i8 as i32, 0],
+            2 => {
+                let bytes = [source[0], source[1]];
+                if self.type_name.as_bytes()[1] == b'C' {
+                    [u16::from_ne_bytes(bytes) as i32, 0]
+                } else {
+                    [i16::from_ne_bytes(bytes) as i32, 0]
+                }
+            }
+            4 => [
+                i32::from_ne_bytes([source[0], source[1], source[2], source[3]]),
+                0,
+            ],
+            _ => {
+                let mut bytes = [0u8; 8];
+                bytes.copy_from_slice(source);
+                let value = i64::from_ne_bytes(bytes);
+                [(value >> 32) as i32, value as i32]
+            }
+        })
+    }
+
+    /// Stores JVM words (as [`Self::load`] returns them) at `index`, or returns the array's
+    /// length when `index` is outside it.
+    pub(crate) fn store(&mut self, index: i32, words: [i32; 2]) -> std::result::Result<(), i32> {
+        let width = self.element_width();
+        let length = self.data.len() / width;
+        if index < 0 || index as usize >= length {
+            return Err(length as i32);
+        }
+        let at = index as usize * width;
+        let target = &mut self.data[at..at + width];
+        if width == 8 {
+            let value = (i64::from(words[0]) << 32) | i64::from(words[1] as u32);
+            target.copy_from_slice(&value.to_ne_bytes());
+        } else {
+            let bytes = words[0].to_ne_bytes();
+            target.copy_from_slice(if cfg!(target_endian = "big") {
+                &bytes[4 - width..]
+            } else {
+                &bytes[..width]
+            });
+        }
+        Ok(())
     }
 
     pub fn get_value(&self, index: i32) -> Result<Vec<i32>> {
@@ -289,14 +491,14 @@ pub(crate) enum HeapValue {
 impl HeapValue {
     pub(super) fn planned_charge(&self) -> AllocResult<u64> {
         match self {
-            Self::Object(instance) => charge::fields(&instance.get_instance().fields, true),
+            Self::Object(instance) => charge::instance(instance.get_instance().slots.len()),
             Self::Arr(array) => charge::array(array.type_name.len(), array.data.len()),
         }
     }
 
     pub(super) fn charge(&self) -> AllocResult<u64> {
         match self {
-            Self::Object(instance) => charge::fields(&instance.get_instance().fields, false),
+            Self::Object(instance) => charge::instance(instance.get_instance().slots.len()),
             Self::Arr(array) => charge::array(array.type_name.capacity(), array.data.capacity()),
         }
     }
@@ -305,12 +507,7 @@ impl HeapValue {
         Ok(match self {
             Self::Arr(array) => Self::Arr(array.try_clone()?),
             Self::Object(instance) => {
-                let source = instance.get_instance();
-                let base = JavaInstanceBase::new(
-                    source.klass_id,
-                    copy_fields(&source.fields)?,
-                    Arc::clone(&source.layout),
-                )?;
+                let base = instance.get_instance().try_clone()?;
                 Self::Object(match instance {
                     Base(_) => Base(base),
                     Class(mirror) => Class(JavaInstanceClass::new(base, mirror.mirror_klass_id)),
@@ -327,7 +524,7 @@ impl JavaInstance {
         visit: impl FnMut(i32) -> Result<()>,
     ) -> Result<Option<Reference>> {
         let instance = self.get_instance();
-        let referent = instance.layout.visit_references(&instance.fields, visit)?;
+        let referent = instance.layout.visit_references(&instance.slots, visit)?;
         referent
             .map(|referent| {
                 Ok(Reference {
@@ -341,47 +538,35 @@ impl JavaInstance {
             .transpose()
     }
 
+    /// A `java.lang.ref.Reference` field of this object: its word offset.
+    fn reference_slot(&self, name: &str) -> Result<&AtomicI32> {
+        let instance = self.get_instance();
+        match instance.layout.locate(REFERENCE, name) {
+            Some((offset, 1)) => Ok(instance
+                .slots
+                .get(offset)
+                .ok_or(AllocError::InvalidLayout)?),
+            _ => Err(AllocError::InvalidLayout.into()),
+        }
+    }
+
     pub(crate) fn reference_field(&self, name: &str) -> Result<i32> {
-        self.get_instance()
-            .fields
-            .get(REFERENCE)
-            .and_then(|fields| fields.get(name))
-            .ok_or(AllocError::InvalidLayout)?
-            .reference_snapshot()
+        Ok(self.reference_slot(name)?.load(Ordering::Relaxed))
     }
 
     pub(crate) fn check_reference_field(&self, name: &str) -> Result<()> {
-        self.get_instance()
-            .fields
-            .get(REFERENCE)
-            .and_then(|fields| fields.get(name))
-            .ok_or(AllocError::InvalidLayout)?
-            .check_reference_writable()
+        self.reference_slot(name).map(|_| ())
     }
 
     pub(crate) fn set_reference_field(&self, name: &str, value: i32) -> Result<()> {
-        self.get_instance()
-            .fields
-            .get(REFERENCE)
-            .and_then(|fields| fields.get(name))
-            .ok_or(AllocError::InvalidLayout)?
-            .set_reference(value)
+        self.reference_slot(name)?.store(value, Ordering::Relaxed);
+        Ok(())
     }
-    #[cfg(test)]
-    pub(crate) fn corrupt_field_width_for_test(
-        &mut self,
-        class: &str,
-        field: &str,
-        value: Vec<i32>,
-    ) {
-        self.lookup_for_field_mut(class, field)
-            .unwrap()
-            .corrupt_width_for_test(value);
-    }
+
     #[cfg(test)]
     pub(crate) fn references(&self) -> Result<References> {
         let instance = self.get_instance();
-        instance.layout.references(&instance.fields)
+        instance.layout.references(&instance.slots)
     }
 
     pub fn set_field_value(
@@ -390,40 +575,61 @@ impl JavaInstance {
         field_name_type: &str,
         value: Vec<i32>,
     ) -> Result<()> {
-        self.lookup_for_field_mut(class_name, field_name_type)
-            .map(|v| v.set_raw_value(value))
+        let instance = self.get_instance();
+        let (offset, width) = instance
+            .layout
+            .locate(class_name, field_name_type)
             .ok_or_else(|| {
                 Error::new_execution(&format!(
                     "error setting value for instance field {class_name}.{field_name_type}"
                 ))
-            })?
+            })?;
+        if value.len() != width {
+            return Err(AllocError::InvalidLayout.into());
+        }
+        let words = [value[0], value.get(1).copied().unwrap_or(0)];
+        instance
+            .write(offset, width, words)
+            .ok_or_else(|| AllocError::InvalidLayout.into())
     }
 
     pub fn get_field_value(&self, class_name: &str, field_name_type: &str) -> Result<Vec<i32>> {
-        self.lookup_for_field(class_name, field_name_type)
-            .map(|v| v.raw_value())
-            .ok_or_else(|| {
-                Error::new_execution(&format!(
-                    "error getting instance field value {class_name}.{field_name_type}"
-                ))
-            })?
+        let instance = self.get_instance();
+        let words = instance
+            .layout
+            .locate(class_name, field_name_type)
+            .and_then(|(offset, width)| Some((instance.read(offset, width)?, width)));
+        match words {
+            Some((words, width)) => Ok(words[..width].to_vec()),
+            None => Err(Error::new_execution(&format!(
+                "error getting instance field value {class_name}.{field_name_type}"
+            ))),
+        }
     }
 
-    fn lookup_for_field(
+    /// Reads the field a `getfield` site names, as JVM words.
+    pub(crate) fn read_at(
         &self,
-        starting_from_class_name: &str,
-        field_name_type: &str,
-    ) -> Option<&FieldValue> {
+        class_name: &str,
+        field_name: &str,
+        position: &OnceLock<(u32, u32)>,
+    ) -> Option<[i32; 2]> {
         let instance = self.get_instance();
-        match instance.fields.get_index_of(starting_from_class_name) {
-            Some(start_index) => instance
-                .fields
-                .iter()
-                .take(start_index + 1)
-                .rev()
-                .find_map(|(_, map)| map.get(field_name_type)),
-            None => None,
-        }
+        let (offset, width) = instance.position(class_name, field_name, position)?;
+        instance.read(offset, width)
+    }
+
+    /// Writes the field a `putfield` site names. The caller holds the entry exclusively.
+    pub(crate) fn write_at(
+        &self,
+        class_name: &str,
+        field_name: &str,
+        position: &OnceLock<(u32, u32)>,
+        words: [i32; 2],
+    ) -> Option<()> {
+        let instance = self.get_instance();
+        let (offset, width) = instance.position(class_name, field_name, position)?;
+        instance.write(offset, width, words)
     }
 
     fn get_instance(&self) -> &JavaInstanceBase {
@@ -433,40 +639,24 @@ impl JavaInstance {
         }
     }
 
-    fn get_instance_mut(&mut self) -> &mut JavaInstanceBase {
-        match self {
-            Base(ref mut instance) => instance,
-            Class(ref mut class_instance) => &mut class_instance.instance,
-        }
-    }
-
-    fn lookup_for_field_mut(
-        &mut self,
-        starting_from_class_name: &str,
-        field_name_type: &str,
-    ) -> Option<&mut FieldValue> {
-        let instance = self.get_instance_mut();
-        match instance.fields.get_index_of(starting_from_class_name) {
-            Some(start_index) => instance
-                .fields
-                .iter_mut()
-                .take(start_index + 1)
-                .rev()
-                .find_map(|(_, map)| map.get_mut(field_name_type)),
-            None => None,
-        }
+    /// The object's field values grouped by declaring class, root class first.
+    pub(crate) fn field_groups(&self) -> Vec<(&str, Vec<[i32; 2]>)> {
+        let instance = self.get_instance();
+        instance
+            .layout
+            .segments()
+            .map(|(class, fields)| {
+                let values = fields
+                    .filter_map(|(offset, width)| instance.read(offset, width))
+                    .collect();
+                (class, values)
+            })
+            .collect()
     }
 
     pub fn klass(&self) -> Result<Arc<JavaClass>> {
         let instance = self.get_instance();
         CLASSES.get_by_id(instance.klass_id)
-    }
-
-    /// The object's fields grouped by declaring class, root class first.
-    pub(crate) fn field_groups(
-        &self,
-    ) -> &IndexMap<ClassName, IndexMap<FieldNameType, FieldValue>> {
-        &self.get_instance().fields
     }
 
     /// Id of the object's class in the class registry, without resolving the class.

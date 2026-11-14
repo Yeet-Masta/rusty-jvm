@@ -53,6 +53,24 @@ pub(crate) fn push_typed(
     push_slots(stack_frame, &typed_slots(type_descriptor, raw)?)
 }
 
+/// [`push_typed`] for a value already held as JVM words (high word first when `wide`), with the
+/// declared type reduced to the two facts that matter here.
+pub(crate) fn push_words(
+    stack_frame: &mut StackFrame,
+    words: [i32; 2],
+    wide: bool,
+    reference: bool,
+) -> Result<()> {
+    if wide {
+        stack_frame.push(Slot::Value(words[1]))?;
+        stack_frame.push(Slot::Value(words[0]))
+    } else if reference {
+        stack_frame.push(Slot::Ref(words[0]))
+    } else {
+        stack_frame.push(Slot::Value(words[0]))
+    }
+}
+
 /// Tags raw storage at a producer whose declared type is exact, never at a transfer.
 pub(crate) fn typed_slots(type_descriptor: &TypeDescriptor, raw: &[i32]) -> Result<Vec<Slot>> {
     let width = if matches!(type_descriptor, TypeDescriptor::Void) {

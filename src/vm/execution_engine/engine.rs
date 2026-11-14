@@ -81,7 +81,9 @@ impl Engine {
                     };
                     (frame.get_bytecode_byte(), span)
                 };
-                if (178u8..=201u8).contains(&code) && klass.is_none() {
+                if ((18u8..=20u8).contains(&code) || (178u8..=201u8).contains(&code))
+                    && klass.is_none()
+                {
                     klass = Some(Self::current_class(&stack_frames)?);
                 }
                 let class = class_name
@@ -93,7 +95,12 @@ impl Engine {
                 let result = (|| -> Result<()> {
                     match code {
                         0u8..=20u8 => {
-                            ops_constant_processor::process(code, class, &mut stack_frames)?;
+                            ops_constant_processor::process(
+                                code,
+                                class,
+                                klass.as_deref(),
+                                &mut stack_frames,
+                            )?;
                         }
                         21u8..=53u8 => {
                             ops_load_processor::process(code, &mut stack_frames)?;

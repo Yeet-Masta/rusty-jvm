@@ -127,6 +127,50 @@ impl Heap {
         }
     }
 
+    /// Reads the field a `getfield` site names, as JVM words.
+    pub(crate) fn read_field(
+        &self,
+        objectref: i32,
+        class_name: &str,
+        field_name: &str,
+        position: &std::sync::OnceLock<(u32, u32)>,
+    ) -> Result<[i32; 2]> {
+        let entry = self.data.get(objectref);
+        let words = match entry.as_deref() {
+            Some(Object(instance)) => instance.read_at(class_name, field_name, position),
+            _ => None,
+        };
+        match words {
+            Some(words) => Ok(words),
+            None => Err(Error::new_execution(&format!(
+                "error getting field value: objectref={objectref} class_name={class_name}, field_name_type={field_name}"
+            ))),
+        }
+    }
+
+    /// Writes the field a `putfield` site names. Under the entry's exclusive lock, like every
+    /// other field write, so that a compare-and-exchange on the same field stays atomic.
+    pub(crate) fn write_field(
+        &self,
+        objectref: i32,
+        class_name: &str,
+        field_name: &str,
+        position: &std::sync::OnceLock<(u32, u32)>,
+        words: [i32; 2],
+    ) -> Result<()> {
+        let mut entry = self.data.get_mut(objectref);
+        let written = match entry.as_deref_mut() {
+            Some(Object(instance)) => instance.write_at(class_name, field_name, position, words),
+            _ => None,
+        };
+        match written {
+            Some(()) => Ok(()),
+            None => Err(Error::new_execution(&format!(
+                "error setting value for instance field {class_name}.{field_name} of {objectref}"
+            ))),
+        }
+    }
+
     /// Atomically compares an object field's raw value against `expected` and, if they match, stores
     /// `new`. Returns `(old_value, swapped)`. The read-compare-write executes under a single entry
     /// lock, so this is a genuine compare-and-swap with respect to other threads — unlike a separate
@@ -218,21 +262,6 @@ impl Heap {
                 }
             })
             .ok_or_else(|| Error::new_execution(&format!("error getting field value: objectref={objectref} class_name={class_name}, field_name_type={field_name_type}")))
-    }
-
-    pub fn get_object_field_value_throwing(
-        &self,
-        objectref: i32,
-        class_name: &str,
-        field_name_type: &str,
-        stack_frames: &mut StackFrames,
-    ) -> Throws<Vec<i32>> {
-        if objectref == 0 {
-            bail_thrown!(throw_null_pointer_exception(stack_frames));
-        }
-
-        let result = self.get_object_field_value(objectref, class_name, field_name_type)?;
-        Ok(Some(result))
     }
 
     /// The class id of a non-array object, or `None` for an array. Unlike `get_instance_name` this
@@ -386,6 +415,33 @@ impl Heap {
                 Object(_) => None,
             })
             .ok_or_else(|| Error::new_execution(&format!("instance is not an array: {array_ref}")))
+    }
+
+    /// An array element as JVM words, or `Err(length)` when the index is out of bounds: the
+    /// bounds check and the read under a single lookup.
+    pub(crate) fn load_array_element(
+        &self,
+        arrayref: i32,
+        index: i32,
+    ) -> Result<std::result::Result<[i32; 2], i32>> {
+        match self.data.get(arrayref).as_deref() {
+            Some(Arr(array)) => Ok(array.load(index)),
+            _ => Err(Error::new_execution("error getting array value from heap")),
+        }
+    }
+
+    /// Stores an array element given as JVM words, or returns `Err(length)` when the index is
+    /// out of bounds.
+    pub(crate) fn store_array_element(
+        &self,
+        arrayref: i32,
+        index: i32,
+        words: [i32; 2],
+    ) -> Result<std::result::Result<(), i32>> {
+        match self.data.get_mut(arrayref).as_deref_mut() {
+            Some(Arr(array)) => Ok(array.store(index, words)),
+            _ => Err(Error::new_execution("error setting array value")),
+        }
     }
 
     pub(crate) fn get_array_value(&self, arrayref: i32, index: i32) -> Result<Vec<i32>> {

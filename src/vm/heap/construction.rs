@@ -1,29 +1,28 @@
 use super::charge;
 use super::java_instance::{JavaInstance, JavaInstanceBase, JavaInstanceClass};
 use crate::vm::error::Result;
-use crate::vm::gc::budget::{copy_string, AllocError, AllocResult};
+use crate::vm::gc::budget::{AllocError, AllocResult};
 use crate::vm::gc::layout::{InstanceFields, InstanceLayout};
-use indexmap::IndexMap;
 use std::sync::Arc;
 
-/// Shared class metadata only: no per-object maps, keys or field vectors yet.
+/// Shared class metadata only: nothing is allocated for the object until it is built.
 pub(crate) struct InstancePlan {
     klass_id: usize,
-    fields: Arc<InstanceFields>,
     layout: Arc<InstanceLayout>,
     mirror: Option<usize>,
 }
 
 impl InstancePlan {
+    /// `fields` are the class's default field values. They are checked against `layout` and
+    /// flattened the first time the layout is used; after that only the layout is consulted.
     pub(crate) fn new(
         klass_id: usize,
-        fields: Arc<InstanceFields>,
+        fields: &InstanceFields,
         layout: Arc<InstanceLayout>,
     ) -> Result<Self> {
-        layout.validate(&fields)?;
+        layout.defaults(fields)?;
         Ok(Self {
             klass_id,
-            fields,
             layout,
             mirror: None,
         })
@@ -35,34 +34,16 @@ impl InstancePlan {
     }
 
     pub(super) fn charge(&self) -> AllocResult<u64> {
-        charge::fields(&self.fields, true)
+        charge::instance(self.layout.words())
     }
 
     pub(super) fn build(self) -> Result<JavaInstance> {
-        let base = JavaInstanceBase::new(self.klass_id, copy_fields(&self.fields)?, self.layout)?;
+        let base = JavaInstanceBase::with_defaults(self.klass_id, self.layout)?;
         Ok(match self.mirror {
             Some(id) => JavaInstance::Class(JavaInstanceClass::new(base, id)),
             None => JavaInstance::Base(base),
         })
     }
-}
-
-pub(super) fn copy_fields(source: &InstanceFields) -> AllocResult<InstanceFields> {
-    let mut fields = IndexMap::new();
-    fields
-        .try_reserve_exact(source.len())
-        .map_err(|_| AllocError::HostAllocation)?;
-    for (class, values) in source {
-        let mut copied = IndexMap::new();
-        copied
-            .try_reserve_exact(values.len())
-            .map_err(|_| AllocError::HostAllocation)?;
-        for (name, value) in values {
-            copied.insert(copy_string(name)?, value.try_clone()?);
-        }
-        fields.insert(copy_string(class)?, copied);
-    }
-    Ok(fields)
 }
 
 /// A single array's implementation limit is independent of -Xmx. This prevents

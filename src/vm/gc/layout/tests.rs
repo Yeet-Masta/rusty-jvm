@@ -72,7 +72,7 @@ fn gc_roots_injected_layout_distinguishes_inherited_bare_names_and_clone_edges()
             &mut crate::vm::stack::rooted_slots::RootedSlots::new(),
         )
         .unwrap();
-    let plan = InstancePlan::new(usize::MAX, Arc::new(fields), layout).unwrap();
+    let plan = InstancePlan::new(usize::MAX, &fields, layout).unwrap();
     let reference = heap.create_instance(plan, &mut RootedSlots::new()).unwrap();
     heap.set_object_field_value(reference, "Parent", "value", vec![parent_edge])
         .unwrap();
@@ -146,16 +146,27 @@ fn gc_roots_incomplete_layout_rejects_construction_before_heap_publication() {
 }
 
 #[test]
-fn gc_roots_malformed_reference_width_aborts_instead_of_tracing_a_prefix() {
-    let segments = vec![metadata("Test", &[("reference", "Ljava/lang/Object;")])];
+fn gc_roots_field_writes_cannot_change_a_field_width() {
+    let segments = vec![metadata(
+        "Test",
+        &[("reference", "Ljava/lang/Object;"), ("wide", "J")],
+    )];
     let fields = storage(&segments);
     let layout = Arc::new(InstanceLayout::new(segments).unwrap());
     let mut object = JavaInstance::Base(JavaInstanceBase::new(0, fields, layout).unwrap());
-    // Production writes now reject width changes. Inject corrupt storage directly
-    // so this still verifies the scanner's independent fail-closed check.
-    object.corrupt_field_width_for_test("Test", "reference", vec![11, 22]);
 
-    assert!(object.references().is_err());
+    // A value of the wrong width is rejected, so the words after a field are never overwritten.
+    assert!(object
+        .set_field_value("Test", "reference", vec![11, 22])
+        .is_err());
+    assert!(object.set_field_value("Test", "wide", vec![11]).is_err());
+    object.set_field_value("Test", "wide", vec![5, 6]).unwrap();
+    object
+        .set_field_value("Test", "reference", vec![7])
+        .unwrap();
+
+    assert_eq!(object.get_field_value("Test", "wide").unwrap(), vec![5, 6]);
+    assert_eq!(object.references().unwrap().strong, vec![7]);
 }
 
 #[test]

@@ -36,19 +36,68 @@ pub fn check_array_access(
 
     let length = HEAP.get_array_len(array_ref)?;
     if index < 0 || index >= length {
-        // Same message as HotSpot, which the (int) constructor would not give
-        let message = format!("Index {index} out of bounds for length {length}");
-        let message = StringPoolHelper::create_string(&message)?;
-        construct_exception_and_throw(
-            "java/lang/ArrayIndexOutOfBoundsException",
-            "<init>:(Ljava/lang/String;)V",
-            &[StackValueKind::Ref(message[0].value())],
-            stack_frames,
-        )?;
+        throw_array_index_out_of_bounds(index, length, stack_frames)?;
         return Ok(false);
     }
 
     Ok(true)
+}
+
+fn throw_array_index_out_of_bounds(
+    index: i32,
+    length: i32,
+    stack_frames: &mut StackFrames,
+) -> Result<()> {
+    // Same message as HotSpot, which the (int) constructor would not give
+    let message = format!("Index {index} out of bounds for length {length}");
+    let message = StringPoolHelper::create_string(&message)?;
+    construct_exception_and_throw(
+        "java/lang/ArrayIndexOutOfBoundsException",
+        "<init>:(Ljava/lang/String;)V",
+        &[StackValueKind::Ref(message[0].value())],
+        stack_frames,
+    )
+}
+
+/// Reads an array element for an `xaload`, as JVM words. `None` means an exception was thrown
+/// instead: the array is null or the index is outside it.
+pub(crate) fn load_array_element(
+    array_ref: i32,
+    index: i32,
+    stack_frames: &mut StackFrames,
+) -> Result<Option<[i32; 2]>> {
+    if array_ref == 0 {
+        throw_null_pointer_exception(stack_frames)?;
+        return Ok(None);
+    }
+    match HEAP.load_array_element(array_ref, index)? {
+        Ok(words) => Ok(Some(words)),
+        Err(length) => {
+            throw_array_index_out_of_bounds(index, length, stack_frames)?;
+            Ok(None)
+        }
+    }
+}
+
+/// Writes an array element for a primitive `xastore`. `false` means an exception was thrown
+/// instead.
+pub(crate) fn store_array_element(
+    array_ref: i32,
+    index: i32,
+    words: [i32; 2],
+    stack_frames: &mut StackFrames,
+) -> Result<bool> {
+    if array_ref == 0 {
+        throw_null_pointer_exception(stack_frames)?;
+        return Ok(false);
+    }
+    match HEAP.store_array_element(array_ref, index, words)? {
+        Ok(()) => Ok(true),
+        Err(length) => {
+            throw_array_index_out_of_bounds(index, length, stack_frames)?;
+            Ok(false)
+        }
+    }
 }
 
 /// Checks that `value_ref` can be stored in the reference array `array_ref`, as `aastore` requires,

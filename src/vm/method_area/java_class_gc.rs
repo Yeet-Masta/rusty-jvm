@@ -68,7 +68,7 @@ impl JavaClass {
             .instance_layout
             .get()
             .ok_or_else(|| Error::new_execution("Instance layout was not published"))?;
-        InstancePlan::new(klass_id, Arc::clone(fields), Arc::clone(layout))
+        InstancePlan::new(klass_id, fields, Arc::clone(layout))
     }
 
     /// A published class may not have a mirror yet. Never claim publication, wait,

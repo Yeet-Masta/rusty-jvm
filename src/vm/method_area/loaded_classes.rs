@@ -1,3 +1,4 @@
+use crate::vm::commons::fast_hash::FastBuildHasher;
 use crate::vm::error::{Error, Result};
 use crate::vm::execution_engine::executor::Executor;
 use crate::vm::heap::construction::InstancePlan;
@@ -28,7 +29,7 @@ pub(super) static FORCE_CLAIM_PATH: std::sync::atomic::AtomicBool =
 #[derive(Debug, Default)]
 pub(crate) struct LoadedClasses {
     loading: super::class_loading::Loading,
-    loaded_classes: DashMap<String, Arc<ClassEntry>>,
+    loaded_classes: DashMap<String, Arc<ClassEntry>, FastBuildHasher>,
     id_index: DashMap<usize, Arc<ClassEntry>>,
     next_id: AtomicUsize,
 
@@ -111,6 +112,21 @@ impl LoadedClasses {
 
     /// Gets class by name, loading it if necessary
     pub fn get(&self, fully_qualified_class_name: &str) -> Result<Arc<JavaClass>> {
+        // A published class is by far the usual answer; give it without copying its key.
+        #[cfg(test)]
+        let fast = !FORCE_CLAIM_PATH.load(Ordering::Relaxed);
+        #[cfg(not(test))]
+        let fast = true;
+        if fast {
+            if let Some(entry) = self
+                .loaded_classes
+                .get(undecorate(fully_qualified_class_name))
+            {
+                if entry.klass.mirror_ref_if_present().is_some() {
+                    return Ok(Arc::clone(&entry.klass));
+                }
+            }
+        }
         self.get_full(fully_qualified_class_name)
             .map(|(_id, _key, klass)| klass)
     }

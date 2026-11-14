@@ -1,6 +1,6 @@
-# Managed heap accounting policy v1
+# Managed heap accounting policy v2
 
-The machine-readable version is `gc::budget::CHARGE_POLICY_VERSION = 1`, with a
+The machine-readable version is `gc::budget::CHARGE_POLICY_VERSION = 2`, with a
 compile-time assertion. Tasks 7 and 11 must use this policy rather than introduce
 independent formulas. A formula change requires an explicit version change.
 
@@ -15,14 +15,11 @@ estimate**, not allocator instrumentation.
   The 64-byte allowance estimates heap-table and recorded-charge-table entry
   overhead. It does not claim to measure DashMap shard/bucket allocations.
 - Array: `H + A(descriptor.capacity()) + A(data.capacity())`.
-- Object: `H + A(outer.capacity() * (S((String, IndexMap<String, FieldValue>)) + M))`,
-  plus, for each declaring-class segment,
-  `A(class_name.capacity()) + A(inner.capacity() * (S((String, FieldValue)) + M))`,
-  plus, for each field,
-  `A(field_name.capacity()) + A(value.capacity() * S(i32))`.
-  Here `M = 2 * S(usize) + 1` estimates the IndexMap hash/index bucket storage per
-  capacity slot. Field-vector headers and locks are already in the inline entry
-  size and are not counted twice.
+- Object: `H + A(words * S(i32))`, where `words` is one per field of the object's
+  class and its ancestors, two for a `long` or `double`. An object owns exactly
+  that one block of words; which word is which field is class metadata. (Policy
+  v1 charged a map entry and a name for every declaring class and every field,
+  which is how objects were stored then.)
 - Strong intern-map entry:
   `A(S((String, i32)) + 64) + A(key.capacity())`. Replacement of an existing key
   keeps that key's storage and charge. These permanent auxiliary charges are

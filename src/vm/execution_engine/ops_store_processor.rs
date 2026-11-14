@@ -1,5 +1,5 @@
 use crate::vm::error::{Error, Result};
-use crate::vm::exception::helpers::{check_array_access, check_array_store};
+use crate::vm::exception::helpers::{check_array_access, check_array_store, store_array_element};
 use crate::vm::execution_engine::common::last_frame_mut;
 use crate::vm::execution_engine::opcode::*;
 use crate::vm::heap::heap::HEAP;
@@ -84,11 +84,9 @@ fn handle_array_store<T: StackValue + Display + Copy>(
         let arrayref: i32 = stack_frame.pop();
         (arrayref, index, value)
     };
-    if !check_array_access(arrayref, index, stack_frames)? {
+    if !store_array_element(arrayref, index, value.to_words(), stack_frames)? {
         return Ok(());
     }
-    let raw_value = value.to_vec();
-    HEAP.set_array_value(arrayref, index, raw_value)?;
 
     let stack_frame = last_frame_mut(stack_frames)?;
     stack_frame.incr_pc();

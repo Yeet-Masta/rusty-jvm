@@ -1,7 +1,7 @@
 use crate::vm::error::Result;
 use crate::vm::execution_engine::executor::Executor;
 use crate::vm::execution_engine::string_pool_helper::StringPoolHelper;
-use crate::vm::gc::budget::{copy_slice, AllocError, AllocResult};
+use crate::vm::gc::budget::{AllocError, AllocResult};
 use crate::vm::heap::heap::HEAP;
 use crate::vm::helper::{clazz_ref, clazz_ref_seen_by, default_value};
 use crate::vm::jni::java_thread::JavaThread;
@@ -44,13 +44,6 @@ impl FieldValue {
         })
     }
 
-    pub(crate) fn try_clone(&self) -> AllocResult<Self> {
-        let value = self.value.read().map_err(|_| AllocError::InvalidLayout)?;
-        Ok(Self {
-            value: RwLock::new(copy_slice(&value)?),
-        })
-    }
-
     /// Read one typed reference during a quiescent scan. Contention or malformed
     /// storage aborts the scan; it must never wait for a stopped mutator.
     pub(crate) fn reference_snapshot(&self) -> Result<i32> {
@@ -60,33 +53,6 @@ impl FieldValue {
             .map_err(|_| AllocError::InvalidLayout)?;
         match value.as_slice() {
             [reference] => Ok(*reference),
-            _ => Err(AllocError::InvalidLayout.into()),
-        }
-    }
-
-    /// Whether [`Self::set_reference`] would succeed now, without writing.
-    pub(crate) fn check_reference_writable(&self) -> Result<()> {
-        let value = self
-            .value
-            .try_write()
-            .map_err(|_| AllocError::InvalidLayout)?;
-        match value.as_slice() {
-            [_] => Ok(()),
-            _ => Err(AllocError::InvalidLayout.into()),
-        }
-    }
-
-    /// Fixed-width collector write; the complete trace validates these slots first.
-    pub(crate) fn set_reference(&self, reference: i32) -> Result<()> {
-        let mut value = self
-            .value
-            .try_write()
-            .map_err(|_| AllocError::InvalidLayout)?;
-        match value.as_mut_slice() {
-            [slot] => {
-                *slot = reference;
-                Ok(())
-            }
             _ => Err(AllocError::InvalidLayout.into()),
         }
     }
@@ -113,6 +79,31 @@ impl FieldValue {
         self.value.try_read().ok().map(|guard| guard.clone())
     }
 
+    /// The value as JVM words without allocating: a wide value is high word then low word, a
+    /// single-word value leaves the second word zero.
+    pub(crate) fn words(&self) -> Result<[i32; 2]> {
+        let guard = self.value.read()?;
+        match guard.as_slice() {
+            [single] => Ok([*single, 0]),
+            [high, low] => Ok([*high, *low]),
+            _ => Err(AllocError::InvalidLayout.into()),
+        }
+    }
+
+    /// Stores JVM words as [`Self::words`] returns them, keeping the field's width.
+    pub(crate) fn set_words(&self, words: [i32; 2]) -> Result<()> {
+        let mut guard = self.value.write()?;
+        match guard.as_mut_slice() {
+            [single] => *single = words[0],
+            [high, low] => {
+                *high = words[0];
+                *low = words[1];
+            }
+            _ => return Err(AllocError::InvalidLayout.into()),
+        }
+        Ok(())
+    }
+
     pub fn raw_value(&self) -> Result<Vec<i32>> {
         let guard = self.value.read()?;
         Ok(guard.clone())
@@ -134,11 +125,6 @@ impl FieldValue {
             guard.copy_from_slice(new);
         }
         Ok((old, swapped))
-    }
-
-    #[cfg(test)]
-    pub(crate) fn corrupt_width_for_test(&self, value: Vec<i32>) {
-        *self.value.write().unwrap() = value;
     }
 }
 

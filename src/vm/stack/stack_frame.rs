@@ -29,14 +29,13 @@ pub(crate) struct StackFrame {
     synchronized_method: bool,
     synchronized_static: bool,
     synchronized_monitor: Option<i32>,
-    /// This frame's class, resolved from `current_class_name` on first use. Opcodes that consult
-    /// their own class (invokes, field access, `ldc`) then skip the by-name registry lookup.
-    klass: ClassCache,
 }
 
-/// Lazily resolved class of a frame; `Debug` prints a marker instead of the whole class.
+/// Lazily resolved class of a method; `Debug` prints a marker instead of the whole class.
 #[derive(Clone, Default)]
-struct ClassCache(std::sync::OnceLock<Arc<crate::vm::method_area::java_class::JavaClass>>);
+pub(crate) struct ClassCache(
+    std::sync::OnceLock<Arc<crate::vm::method_area::java_class::JavaClass>>,
+);
 
 impl std::fmt::Debug for ClassCache {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -56,6 +55,10 @@ pub(crate) struct FrameCode {
     pub(crate) class_name: Arc<String>,
     pub(crate) line_numbers: Arc<BTreeMap<u16, u16>>,
     pub(crate) exception_table: Arc<ExceptionTable>,
+    /// The method's class, resolved from `class_name` on first use. Opcodes that consult their
+    /// own class (invokes, field access, `ldc`) then skip the by-name registry lookup, in every
+    /// frame of the method.
+    pub(crate) klass: ClassCache,
 }
 
 impl FrameCode {
@@ -67,6 +70,7 @@ impl FrameCode {
             class_name,
             line_numbers: Arc::new(BTreeMap::new()),
             exception_table: Arc::new(ExceptionTable::new(Vec::new())),
+            klass: ClassCache::default(),
         }
     }
 }
@@ -265,6 +269,7 @@ impl StackFrame {
                 class_name: current_class_name,
                 line_numbers,
                 exception_table,
+                klass: ClassCache::default(),
             }),
             locals_size,
             stack_size,
@@ -283,7 +288,6 @@ impl StackFrame {
             synchronized_method: false,
             synchronized_static: false,
             synchronized_monitor: None,
-            klass: ClassCache::default(),
         }
     }
 
@@ -335,7 +339,6 @@ impl StackFrame {
             synchronized_method: false,
             synchronized_static: false,
             synchronized_monitor: None,
-            klass: ClassCache::default(),
         }
     }
 
@@ -367,15 +370,15 @@ impl StackFrame {
         &self.code.class_name
     }
 
-    /// The class this frame executes, resolved once per frame and then reused.
+    /// The class this frame executes, resolved once per method and then reused.
     pub(crate) fn current_class(
         &self,
     ) -> Result<Arc<crate::vm::method_area::java_class::JavaClass>> {
-        if let Some(klass) = self.klass.0.get() {
+        if let Some(klass) = self.code.klass.0.get() {
             return Ok(Arc::clone(klass));
         }
         let klass = crate::vm::method_area::loaded_classes::CLASSES.get(&self.code.class_name)?;
-        Ok(Arc::clone(self.klass.0.get_or_init(|| klass)))
+        Ok(Arc::clone(self.code.klass.0.get_or_init(|| klass)))
     }
 
     /// The shared class-name handle itself, for identity comparison without touching its count.

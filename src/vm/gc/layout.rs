@@ -6,11 +6,13 @@ use crate::vm::heap::java_instance::{ClassName, FieldNameType};
 use crate::vm::helper::{get_length, is_reference};
 use crate::vm::method_area::field::{FieldInfo, FieldValue};
 use indexmap::IndexMap;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicI32, Ordering};
+use std::sync::{Arc, OnceLock};
 
+/// A class's instance fields with their default values, grouped by declaring class, root class
+/// first. This is class metadata: an instance stores only the values, as words in this order.
 pub(crate) type InstanceFields = IndexMap<ClassName, IndexMap<FieldNameType, FieldValue>>;
 
-#[derive(Debug)]
 enum FieldKind {
     Value,
     Strong,
@@ -21,7 +23,8 @@ enum FieldKind {
 struct FieldLayout {
     name: String,
     width: usize,
-    kind: FieldKind,
+    /// Index of the field's first word in an instance.
+    offset: usize,
 }
 
 #[derive(Debug)]
@@ -30,12 +33,20 @@ struct SegmentLayout {
     fields: Box<[FieldLayout]>,
 }
 
-/// Shared by instances, including clones. Private boxed slices, no interior mutability,
-/// and no mutable accessors make publication irreversible.
+/// Shared by instances, including clones. Private boxed slices, no interior mutability
+/// beyond a write-once cache, and no mutable accessors make publication irreversible.
 #[derive(Debug)]
 pub(crate) struct InstanceLayout {
     segments: Box<[SegmentLayout]>,
     reference_kind: Kind,
+    /// Words an instance stores: one per field, two for a `long` or `double`.
+    words: usize,
+    /// Word offsets of the strong reference fields, in declaration order.
+    strong: Box<[u32]>,
+    /// Word offset of `java.lang.ref.Reference.referent`, when the class has it.
+    referent: Option<u32>,
+    /// The words of a new instance, taken once from the class's default field values.
+    defaults: OnceLock<Box<[i32]>>,
 }
 
 /// The collector must process the distinguished referent separately from strong closure.
@@ -56,6 +67,9 @@ impl InstanceLayout {
     ) -> Result<Self> {
         let mut layout = Vec::new();
         let mut reference_kind = Kind::Other;
+        let mut words = 0usize;
+        let mut strong = Vec::new();
+        let mut referent = None;
         for (declaring_class, fields) in segments {
             match declaring_class.as_str() {
                 references::REFERENCE => references::validate_fields(&fields)?,
@@ -82,11 +96,19 @@ impl InstanceLayout {
                 } else {
                     FieldKind::Value
                 };
+                let width = usize::try_from(get_length(descriptor)?)?;
+                let offset = u32::try_from(words).map_err(|_| AllocError::Capacity)?;
+                match kind {
+                    FieldKind::Value => {}
+                    FieldKind::Strong => strong.push(offset),
+                    FieldKind::Referent => referent = Some(offset),
+                }
                 slots.push(FieldLayout {
                     name: field.name().to_string(),
-                    width: usize::try_from(get_length(descriptor)?)?,
-                    kind,
+                    width,
+                    offset: words,
                 });
+                words = words.checked_add(width).ok_or(AllocError::Arithmetic)?;
             }
             layout.push(SegmentLayout {
                 declaring_class,
@@ -96,6 +118,10 @@ impl InstanceLayout {
         Ok(Self {
             segments: layout.into_boxed_slice(),
             reference_kind,
+            words,
+            strong: strong.into_boxed_slice(),
+            referent,
+            defaults: OnceLock::new(),
         })
     }
 
@@ -123,10 +149,90 @@ impl InstanceLayout {
         Ok(())
     }
 
+    /// Words an instance of this layout stores.
+    pub(crate) fn words(&self) -> usize {
+        self.words
+    }
+
+    /// The values of `fields`, which must match this layout, as an instance stores them.
+    pub(crate) fn flatten(&self, fields: &InstanceFields) -> Result<Box<[i32]>> {
+        self.validate(fields)?;
+        let mut image = Vec::new();
+        image
+            .try_reserve_exact(self.words)
+            .map_err(|_| AllocError::HostAllocation)?;
+        for values in fields.values() {
+            for value in values.values() {
+                image.extend(value.raw_value()?);
+            }
+        }
+        if image.len() != self.words {
+            return Err(AllocError::InvalidLayout.into());
+        }
+        Ok(image.into_boxed_slice())
+    }
+
+    /// The words of a new instance: the class's default values, flattened on first use.
+    pub(crate) fn defaults(&self, fields: &InstanceFields) -> Result<&[i32]> {
+        if let Some(image) = self.defaults.get() {
+            return Ok(image);
+        }
+        let image = self.flatten(fields)?;
+        Ok(self.defaults.get_or_init(|| image))
+    }
+
+    /// [`Self::defaults`] once it has been computed.
+    pub(crate) fn cached_defaults(&self) -> Option<&[i32]> {
+        self.defaults.get().map(|image| &**image)
+    }
+
+    /// Where the field `field_name` is as seen from `class_name`: declared by that class or,
+    /// failing that, by its nearest ancestor that has one. Returns the offset of its first word
+    /// and its width in words.
+    pub(crate) fn locate(&self, class_name: &str, field_name: &str) -> Option<(usize, usize)> {
+        let start = self
+            .segments
+            .iter()
+            .position(|segment| segment.declaring_class == class_name)?;
+        self.segments[..=start].iter().rev().find_map(|segment| {
+            segment
+                .fields
+                .iter()
+                .find(|field| field.name == field_name)
+                .map(|field| (field.offset, field.width))
+        })
+    }
+
+    /// Each declaring class, root first, with the `(offset, width)` of each of its fields.
+    pub(crate) fn segments(
+        &self,
+    ) -> impl DoubleEndedIterator<Item = (&str, impl Iterator<Item = (usize, usize)> + '_)> + '_
+    {
+        self.segments.iter().map(|segment| {
+            (
+                segment.declaring_class.as_str(),
+                segment
+                    .fields
+                    .iter()
+                    .map(|field| (field.offset, field.width)),
+            )
+        })
+    }
+
+    /// The field names of each declaring class, in layout order. For diagnostics.
+    pub(crate) fn names(&self) -> impl Iterator<Item = (&str, impl Iterator<Item = &str> + '_)> {
+        self.segments.iter().map(|segment| {
+            (
+                segment.declaring_class.as_str(),
+                segment.fields.iter().map(|field| field.name.as_str()),
+            )
+        })
+    }
+
     #[cfg(test)]
-    pub(crate) fn references(&self, fields: &InstanceFields) -> Result<References> {
+    pub(crate) fn references(&self, slots: &[AtomicI32]) -> Result<References> {
         let mut references = References::default();
-        references.referent = self.visit_references(fields, |reference| {
+        references.referent = self.visit_references(slots, |reference| {
             references.strong.push(reference);
             Ok(())
         })?;
@@ -141,38 +247,23 @@ impl InstanceLayout {
     /// IDs, and must not acquire another heap guard or reserve managed storage.
     pub(crate) fn visit_references(
         &self,
-        fields: &InstanceFields,
+        slots: &[AtomicI32],
         mut visit: impl FnMut(i32) -> Result<()>,
     ) -> Result<Option<i32>> {
-        let mut referent = None;
-        if self.segments.len() != fields.len() {
+        if slots.len() != self.words {
             return Err(AllocError::InvalidLayout.into());
         }
-        // validate() fixes both IndexMap orders before publication; field writes
-        // cannot add, remove or reorder keys. Walk that order without hashing the
-        // declaring class and field name again for every edge in every epoch.
-        for (segment, (_, values)) in self.segments.iter().zip(fields) {
-            if segment.fields.len() != values.len() {
-                return Err(AllocError::InvalidLayout.into());
-            }
-            for (slot, (_, value)) in segment.fields.iter().zip(values) {
-                match slot.kind {
-                    FieldKind::Value => {}
-                    FieldKind::Strong | FieldKind::Referent => {
-                        // Use the instance's materialized map, not lazy class metadata or
-                        // inherited lookup (which would confuse shadowed bare names).
-                        let value = value.reference_snapshot()?;
-                        match slot.kind {
-                            FieldKind::Strong if value != 0 => visit(value)?,
-                            FieldKind::Strong => {}
-                            FieldKind::Referent => referent = Some(value),
-                            FieldKind::Value => unreachable!(),
-                        }
-                    }
-                }
+        // The offsets were fixed with the schema; no class or field name is consulted, so an
+        // inherited field cannot be confused with one that shadows its bare name.
+        for &offset in self.strong.iter() {
+            let reference = slots[offset as usize].load(Ordering::Relaxed);
+            if reference != 0 {
+                visit(reference)?;
             }
         }
-        Ok(referent)
+        Ok(self
+            .referent
+            .map(|offset| slots[offset as usize].load(Ordering::Relaxed)))
     }
 }
 

@@ -69,7 +69,7 @@ fn gc_budget_instance_payload_is_copied_only_after_reservation() {
             FieldValue::new("I".parse().unwrap()).unwrap(),
         )]),
     )]));
-    let plan = InstancePlan::new(0, Arc::clone(&fields), Arc::clone(&layout)).unwrap();
+    let plan = InstancePlan::new(0, &fields, Arc::clone(&layout)).unwrap();
     let charge = plan.charge().unwrap();
     let heap = Heap::default();
     heap.admission.lock().budget.max = charge - 1;
@@ -86,7 +86,7 @@ fn gc_budget_instance_payload_is_copied_only_after_reservation() {
     heap.admission.lock().budget.max = charge;
     let reference = heap
         .create_instance(
-            InstancePlan::new(0, fields, layout).unwrap(),
+            InstancePlan::new(0, &fields, layout).unwrap(),
             &mut destination,
         )
         .unwrap();

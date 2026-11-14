@@ -99,6 +99,9 @@ pub(crate) struct JavaClass {
     /// Indexed by constant-pool index. Reads are a single atomic load: invokes from every thread
     /// hit this, so it must not take a lock or touch a shared reference count.
     member_refs: Box<[OnceLock<(MemberRefKind, MemberRef)>]>,
+    /// Resolved `ldc`/`ldc2_w` constants by constant pool index, so that loading one does not go
+    /// through the by-name resolution cache again.
+    constants: Box<[OnceLock<i64>]>,
     /// The loader that defined this class, when it is not one of the built-in loaders; `None`
     /// for the shared built-in namespace, where symbolic names are registry keys as they stand.
     #[get_copy = "pub(crate)"]
@@ -135,6 +138,33 @@ pub(crate) struct MemberRef {
     /// `invokevirtual`/`invokeinterface`: the first receiver class seen and its implementation
     /// (monomorphic). Other receiver classes take the full lookup.
     pub(crate) virtual_target: OnceLock<(usize, Arc<JavaMethod>)>,
+    /// `getstatic`/`putstatic`: the resolved field.
+    pub(crate) static_field: OnceLock<StaticField>,
+    /// `getfield`/`putfield`: the resolved field.
+    pub(crate) instance_field: OnceLock<InstanceField>,
+}
+
+/// A static field as a `getstatic`/`putstatic` site resolved it.
+#[derive(Debug)]
+pub(crate) struct StaticField {
+    /// The class that declares the field, and so the one to initialize before using it.
+    pub(crate) holder: Arc<JavaClass>,
+    pub(crate) value: Arc<FieldValue>,
+    /// `long` or `double`: two operand-stack slots.
+    pub(crate) wide: bool,
+    pub(crate) reference: bool,
+}
+
+/// An instance field as a `getfield`/`putfield` site resolved it.
+#[derive(Debug)]
+pub(crate) struct InstanceField {
+    pub(crate) wide: bool,
+    pub(crate) reference: bool,
+    /// Where the field's storage is in an instance: the index of its declaring class among the
+    /// instance's classes (root first) and of the field within that class. The same for every
+    /// object the site can see, since they all share the class hierarchy down to the site's
+    /// class. Found on the first access.
+    pub(crate) position: OnceLock<(u32, u32)>,
 }
 
 impl MemberRef {
@@ -152,12 +182,17 @@ impl MemberRef {
 pub struct InitState {
     state: Mutex<InnerState>,
     cv: Condvar,
+    /// Set once initialization succeeded, so the common "already initialized" answer needs no lock.
+    initialized: std::sync::atomic::AtomicBool,
 }
 
 impl InitState {
     /// Returns true only to the elected initializer. Ownership is logical; no
     /// mutex guard survives this call or spans the initializer's Java execution.
     pub(crate) fn begin(&self) -> std::result::Result<bool, i32> {
+        if self.initialized.load(std::sync::atomic::Ordering::Acquire) {
+            return Ok(false);
+        }
         let owner = std::thread::current().id();
         let mut state = crate::vm::safepoint::lock(&self.state);
         loop {
@@ -188,7 +223,11 @@ impl InitState {
         );
         *state = match cause {
             Some(cause_root) => InnerState::Failed { cause_root },
-            None => InnerState::Initialized,
+            None => {
+                self.initialized
+                    .store(true, std::sync::atomic::Ordering::Release);
+                InnerState::Initialized
+            }
         };
         self.cv.notify_all();
     }
@@ -214,6 +253,18 @@ pub enum InnerState {
 }
 
 impl JavaClass {
+    /// The constant an earlier `ldc` at this constant pool index resolved to, as it was cached.
+    pub(crate) fn cached_constant(&self, index: u16) -> Option<i64> {
+        self.constants.get(usize::from(index))?.get().copied()
+    }
+
+    /// Remembers what the constant at `index` resolved to. The first value stays.
+    pub(crate) fn cache_constant(&self, index: u16, value: i64) {
+        if let Some(slot) = self.constants.get(usize::from(index)) {
+            let _ = slot.set(value);
+        }
+    }
+
     /// Resolves a member reference from this class's constant pool, caching the result.
     pub(crate) fn member_ref(&self, kind: MemberRefKind, index: u16) -> Result<&MemberRef> {
         let mismatch = || {
@@ -250,6 +301,8 @@ impl JavaClass {
             static_target: OnceLock::new(),
             special_target: OnceLock::new(),
             virtual_target: OnceLock::new(),
+            static_field: OnceLock::new(),
+            instance_field: OnceLock::new(),
         };
         // Racing resolvers produce identical values; keep whichever was stored first.
         let (_, member) = slot.get_or_init(|| (kind, member));
@@ -491,6 +544,7 @@ impl JavaClass {
             mirror_clazz_ref: OnceLock::default(),
             class_file_version: (0, 0),
             member_refs: (0..member_ref_slots).map(|_| OnceLock::new()).collect(),
+            constants: (0..member_ref_slots).map(|_| OnceLock::new()).collect(),
             defining_loader: None,
             hidden: false,
             nest_host: OnceLock::new(),
