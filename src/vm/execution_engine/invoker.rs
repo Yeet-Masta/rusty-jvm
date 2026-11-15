@@ -52,7 +52,10 @@ pub(crate) fn invoke_interpreted(
     if java_method.is_empty_void() {
         // Running it would only push a frame and pop it again; the caller's pc already points
         // past the invoke.
-        last_frame_mut(stack_frames)?.drop_top_slots(count);
+        let frame = last_frame_mut(stack_frames)?;
+        frame.drop_top_slots(count);
+        // As a return would: a later throw in this frame is at its own pc.
+        frame.reset_ex_pc();
         return Ok(true);
     }
     if stack_limit::would_overflow(stack_frames) {
@@ -96,6 +99,9 @@ fn run_accessor(
     };
     frame.drop_top_slots(1);
     push_words(frame, words, field.wide, field.reference)?;
+    // The call is over, as a return would end it: a later throw in this frame is at its own pc,
+    // not at the invoke's.
+    frame.reset_ex_pc();
     Ok(true)
 }
 

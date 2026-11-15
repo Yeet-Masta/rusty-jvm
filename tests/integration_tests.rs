@@ -5781,3 +5781,17 @@ fn should_keep_slow_path_semantics_on_warm_getter_store_and_copy_paths() {
          partial copy a null\n",
     );
 }
+
+#[test]
+fn should_run_warm_switch_compare_dup_ldc_and_type_check_sites_in_the_frame_local_loop() {
+    utils::assert_success_utf8(
+        "samples.interpreter.framelocal.FrameLocalControl",
+        "switch 99/1 99/2 99/0 10/0 11/0 12/0 13/0 14/0 15/0 99/0 99/3 99/4 99/5\n\
+         compare EeLlNnGgGgGgEeNnGgGgNnNnNnNnNnLlLlNnEeEeLlLlNnEeEe\n\
+         dups 499500 999 2997 -2997\n\
+         ldc 10123456799000 java.lang.String\n\
+         instanceof int str num null obj int str\n\
+         cast 600 CCE\n\
+         after frameless call NPE true\n",
+    );
+}

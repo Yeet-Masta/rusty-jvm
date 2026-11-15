@@ -22,10 +22,9 @@ use crate::vm::error::Result;
 use crate::vm::execution_engine::opcode::*;
 use crate::vm::execution_engine::string_pool_helper::StringPoolHelper;
 use crate::vm::heap::heap::HEAP;
-use crate::vm::helper::vec_to_i64;
 use crate::vm::method_area::java_method::JavaMethod;
 use crate::vm::method_area::loaded_classes::CLASSES;
-use crate::vm::system_native::throwable::NATIVE_METHOD;
+use crate::vm::system_native::throwable::{backtrace_frames, NATIVE_METHOD};
 use jclassmodel::constant_pool::ConstantPoolLookup;
 use std::collections::BTreeSet;
 
@@ -54,21 +53,14 @@ fn build_message_from_throwable(this: i32) -> Option<String> {
         return None;
     }
 
-    let method_array_ref = *HEAP.get_array_value(backtrace_ref, 1).ok()?.first()?;
-    let tag_array_ref = *HEAP.get_array_value(backtrace_ref, 3).ok()?.first()?;
-    let bci_array_ref = *HEAP.get_array_value(backtrace_ref, 4).ok()?.first()?;
-
-    if HEAP.get_array_len(method_array_ref).ok()? < 1 {
-        return None;
-    }
-
     // Frame 0 is the frame that raised the NPE (the throwable's own constructor frames are excluded
     // when the backtrace is collected).
-    if *HEAP.get_array_value(tag_array_ref, 0).ok()?.first()? == NATIVE_METHOD {
+    let top = *backtrace_frames(backtrace_ref).ok()?.first()?;
+    if top.tag == NATIVE_METHOD {
         return None;
     }
-    let method_ptr = vec_to_i64(&HEAP.get_array_value(method_array_ref, 0).ok()?);
-    let bci = *HEAP.get_array_value(bci_array_ref, 0).ok()?.first()? as usize;
+    let method_ptr = top.method_ref;
+    let bci = top.bci as usize;
 
     // SAFETY: the pointer was recorded in the backtrace as `Arc::as_ptr(&JavaMethod)` while the
     // method's class was loaded; loaded classes live for the lifetime of the VM, so it stays valid.

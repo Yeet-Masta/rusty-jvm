@@ -83,6 +83,23 @@ fn peek_words(stack: &[Slot], wide: bool) -> Option<[i32; 2]> {
     })
 }
 
+/// The big-endian `i32` operand at `at`, as `tableswitch`, `lookupswitch` and `goto_w` encode.
+#[inline(always)]
+fn operand_i32(code: &[u8], at: usize) -> Option<i32> {
+    Some(i32::from_be_bytes(code.get(at..at + 4)?.try_into().ok()?))
+}
+
+/// `fcmpl`/`fcmpg` and `dcmpl`/`dcmpg`: `nan` is the result when either value is NaN.
+#[inline(always)]
+fn compare<T: PartialOrd>(a: T, b: T, nan: i32) -> i32 {
+    match a.partial_cmp(&b) {
+        Some(std::cmp::Ordering::Greater) => 1,
+        Some(std::cmp::Ordering::Equal) => 0,
+        Some(std::cmp::Ordering::Less) => -1,
+        None => nan,
+    }
+}
+
 /// The slot `depth` below the top, `1` being the top itself.
 #[inline(always)]
 fn peek(stack: &[Slot], depth: usize) -> Option<i32> {
@@ -381,6 +398,36 @@ impl StackFrame {
                     stack.push(value1);
                     pc += 1;
                 }
+                // dup_x2: the top slot copied below the three under it (either form)
+                91 => {
+                    room!(1);
+                    let Some(at) = stack.len().checked_sub(3) else {
+                        break;
+                    };
+                    let value = *stack.last().expect("Empty stack");
+                    stack.insert(at, value);
+                    pc += 1;
+                }
+                // dup2_x1: the top two slots copied below the one under them (either form)
+                93 => {
+                    room!(2);
+                    let Some(at) = stack.len().checked_sub(3) else {
+                        break;
+                    };
+                    let (value2, value1) = (stack[at + 1], stack[at + 2]);
+                    stack.splice(at..at, [value2, value1]);
+                    pc += 1;
+                }
+                // dup2_x2: the top two slots copied below the two under them (every form)
+                94 => {
+                    room!(2);
+                    let Some(at) = stack.len().checked_sub(4) else {
+                        break;
+                    };
+                    let (value2, value1) = (stack[at + 2], stack[at + 3]);
+                    stack.splice(at..at, [value2, value1]);
+                    pc += 1;
+                }
                 // swap
                 95 => {
                     let value1 = pop_slot(stack);
@@ -558,6 +605,150 @@ impl StackFrame {
                     let value1 = pop_long(stack);
                     push(stack, value1.cmp(&value2) as i32);
                     pc += 1;
+                }
+                // fcmpl, fcmpg
+                149 | 150 => {
+                    let b = f32::from_bits(pop(stack) as u32);
+                    let a = f32::from_bits(pop(stack) as u32);
+                    push(stack, compare(a, b, if opcode == 150 { 1 } else { -1 }));
+                    pc += 1;
+                }
+                // dcmpl, dcmpg
+                151 | 152 => {
+                    let b = f64::from_bits(pop_long(stack) as u64);
+                    let a = f64::from_bits(pop_long(stack) as u64);
+                    push(stack, compare(a, b, if opcode == 152 { 1 } else { -1 }));
+                    pc += 1;
+                }
+                // tableswitch: operands start at the next multiple of four after the opcode
+                170 => {
+                    let base = (pc + 4) & !3;
+                    let (Some(default), Some(low), Some(high)) = (
+                        operand_i32(code, base),
+                        operand_i32(code, base + 4),
+                        operand_i32(code, base + 8),
+                    ) else {
+                        break;
+                    };
+                    let index = pop(stack);
+                    let offset = if index < low || index > high {
+                        default
+                    } else {
+                        let entry = base + 12 + (index as i64 - low as i64) as usize * 4;
+                        let Some(offset) = operand_i32(code, entry) else {
+                            stack.push(Slot::Value(index));
+                            break;
+                        };
+                        offset
+                    };
+                    pc = (pc as isize + offset as isize) as usize;
+                }
+                // lookupswitch: sorted (match, offset) pairs after the default and their count
+                171 => {
+                    let base = (pc + 4) & !3;
+                    let (Some(default), Some(pairs)) =
+                        (operand_i32(code, base), operand_i32(code, base + 4))
+                    else {
+                        break;
+                    };
+                    let Some(table) = code.get(base + 8..base + 8 + pairs.max(0) as usize * 8)
+                    else {
+                        break;
+                    };
+                    let key = pop(stack);
+                    let pair = |i: usize| {
+                        let at = i * 8;
+                        (
+                            i32::from_be_bytes([table[at], table[at + 1], table[at + 2], table[at + 3]]),
+                            i32::from_be_bytes([table[at + 4], table[at + 5], table[at + 6], table[at + 7]]),
+                        )
+                    };
+                    let (mut low, mut high) = (0usize, table.len() / 8);
+                    let mut offset = default;
+                    while low < high {
+                        let middle = (low + high) / 2;
+                        let (candidate, target) = pair(middle);
+                        match candidate.cmp(&key) {
+                            std::cmp::Ordering::Less => low = middle + 1,
+                            std::cmp::Ordering::Greater => high = middle,
+                            std::cmp::Ordering::Equal => {
+                                offset = target;
+                                break;
+                            }
+                        }
+                    }
+                    pc = (pc as isize + offset as isize) as usize;
+                }
+                // goto_w
+                200 => {
+                    let Some(offset) = operand_i32(code, pc + 1) else {
+                        break;
+                    };
+                    pc = (pc as isize + offset as isize) as usize;
+                }
+                // ldc, ldc_w, ldc2_w once resolved: the class caches the value, a reference
+                // tagged in bit 32
+                18..=20 => {
+                    let index = if opcode == 18 {
+                        code.get(pc + 1).map(|&index| u16::from(index))
+                    } else {
+                        pool_index(code, pc)
+                    };
+                    let Some(bits) =
+                        index.and_then(|index| klass.and_then(|klass| klass.cached_constant(index)))
+                    else {
+                        break;
+                    };
+                    if opcode == 20 {
+                        room!(2);
+                        push_long(stack, bits);
+                        pc += 3;
+                    } else {
+                        room!(1);
+                        stack.push(if bits & (1 << 32) != 0 {
+                            Slot::Ref(bits as i32)
+                        } else {
+                            Slot::Value(bits as i32)
+                        });
+                        pc += if opcode == 18 { 2 } else { 3 };
+                    }
+                }
+                // checkcast, once this site has accepted the object's class
+                192 => {
+                    let (Some(index), Some(object)) = (pool_index(code, pc), peek(stack, 1)) else {
+                        break;
+                    };
+                    if object != 0 {
+                        let (Some(klass), Ok(Some(id))) = (klass, HEAP.instance_klass_id(object))
+                        else {
+                            break;
+                        };
+                        if klass.cached_type_check(index, id) != Some(true) {
+                            break;
+                        }
+                    }
+                    pc += 3;
+                }
+                // instanceof, once this site has checked the object's class
+                193 => {
+                    let (Some(index), Some(object)) = (pool_index(code, pc), peek(stack, 1)) else {
+                        break;
+                    };
+                    let instance_of = if object == 0 {
+                        false
+                    } else {
+                        let (Some(klass), Ok(Some(id))) = (klass, HEAP.instance_klass_id(object))
+                        else {
+                            break;
+                        };
+                        let Some(outcome) = klass.cached_type_check(index, id) else {
+                            break;
+                        };
+                        outcome
+                    };
+                    stack.pop();
+                    push(stack, i32::from(instance_of));
+                    pc += 3;
                 }
                 // ifeq .. ifle
                 153..=158 => {

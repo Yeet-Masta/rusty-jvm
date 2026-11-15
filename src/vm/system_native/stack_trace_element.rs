@@ -1,9 +1,9 @@
 use crate::vm::error::Result;
 use crate::vm::execution_engine::string_pool_helper::StringPoolHelper;
 use crate::vm::heap::heap::HEAP;
-use crate::vm::helper::{klass, vec_to_i64};
+use crate::vm::helper::klass;
 use crate::vm::method_area::java_method::JavaMethod;
-use crate::vm::system_native::throwable::NATIVE_METHOD;
+use crate::vm::system_native::throwable::{backtrace_frames, NATIVE_METHOD};
 
 const NATIVE_MARKER: i32 = -2;
 const CLASS_NAME: &str = "java/lang/StackTraceElement";
@@ -14,31 +14,20 @@ pub(crate) fn init_stack_trace_elements(
     backtrace_ref: i32,
     depth: i32,
 ) -> Result<()> {
-    // extract arrays from Object[] Throwable.backtrace
-    let class_array_ref = HEAP.get_array_value(backtrace_ref, 0)?[0];
-    let method_array_ref = HEAP.get_array_value(backtrace_ref, 1)?[0];
-    let line_array_ref = HEAP.get_array_value(backtrace_ref, 2)?[0];
-    let tag_array_ref = HEAP.get_array_value(backtrace_ref, 3)?[0];
-
-    for index in 0..depth {
-        let class_ref = HEAP.get_array_value(class_array_ref, index)?[0];
-
-        let method_ref = vec_to_i64(&HEAP.get_array_value(method_array_ref, index)?);
+    let frames = backtrace_frames(backtrace_ref)?;
+    for (index, frame) in frames.iter().take(depth.max(0) as usize).enumerate() {
         // SAFETY: class unloading is disabled, so the method registry keeps every `JavaMethod`
         // recorded in a backtrace alive for the life of the VM.
-        let method_name = unsafe { (*(method_ref as *const JavaMethod)).name() };
+        let method_name = unsafe { (*(frame.method_ref as *const JavaMethod)).name() };
 
-        let line_number = {
-            let tag = HEAP.get_array_value(tag_array_ref, index)?[0];
-            if tag == NATIVE_METHOD {
-                NATIVE_MARKER
-            } else {
-                HEAP.get_array_value(line_array_ref, index)?[0]
-            }
+        let line_number = if frame.tag == NATIVE_METHOD {
+            NATIVE_MARKER
+        } else {
+            frame.line_number
         };
 
-        let element_ref = HEAP.get_array_value(element_array_ref, index)?[0];
-        fill_element(element_ref, class_ref, method_name, line_number)?;
+        let element_ref = HEAP.get_array_value(element_array_ref, index as i32)?[0];
+        fill_element(element_ref, frame.class_ref, method_name, line_number)?;
     }
 
     Ok(())
