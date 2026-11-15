@@ -207,6 +207,13 @@ pub(crate) fn collect_snapshot(
         "sweeping",
     );
     crate::vm::monitor::prune_idle(|reference| heap.is_marked(reference));
+    // Freed references may be issued again: tables keyed by them forget the freed ones.
+    crate::vm::system_native::method_handle_natives::method_type::prune(|reference| {
+        heap.is_marked(reference)
+    });
+    crate::vm::threads::prune_activity(|reference| heap.is_marked(reference));
+    #[cfg(windows)]
+    crate::vm::system_native::interrupt_event::prune(|reference| heap.is_marked(reference));
     if !trace.references.is_empty() {
         pending.notify();
     }

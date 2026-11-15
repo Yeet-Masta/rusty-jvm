@@ -46,8 +46,8 @@ struct Chunk<V> {
     marks: Box<[AtomicU64]>,
     /// Objects present.
     live: AtomicU32,
-    /// Objects ever inserted. A chunk whose every slot has been filled once and emptied again
-    /// can never be used again, since references are not reused.
+    /// Objects ever inserted. A chunk whose every slot has been filled once and emptied again is
+    /// retired; a reference in it that is issued again gets a fresh chunk.
     filled: AtomicU32,
 }
 
@@ -263,6 +263,38 @@ impl<V> ObjectTable<V> {
         self.chunk(chunk_index).is_some_and(|chunk| {
             chunk.marks[slot / 64].load(Ordering::Relaxed) & (1 << (slot % 64)) != 0
         })
+    }
+
+    /// The first key from `from` up to, not including, `end` that holds no object, if any. Exact
+    /// only while nothing inserts or removes, as under the heap's admission lock.
+    pub(crate) fn first_vacant(&self, from: i32, end: usize) -> Option<i32> {
+        let from = usize::try_from(from.max(1)).ok()?;
+        let end = end.min(1 << 31);
+        let mut key = from;
+        while key < end {
+            let (chunk_index, slot) = (key >> CHUNK_BITS, key & (CHUNK - 1));
+            let Some(chunk) = self.chunk(chunk_index) else {
+                // No chunk: every key in it is vacant.
+                return i32::try_from(key).ok();
+            };
+            let mut word = slot / 64;
+            // Slots before `slot` in its word are not candidates.
+            let mut mask = !0u64 << (slot % 64);
+            while word < CHUNK / 64 {
+                let vacant = !chunk.present[word].load(Ordering::Acquire) & mask;
+                if vacant != 0 {
+                    let found = (chunk_index << CHUNK_BITS) | (word * 64 + vacant.trailing_zeros() as usize);
+                    return (found < end).then(|| i32::try_from(found).ok()).flatten();
+                }
+                word += 1;
+                mask = !0;
+                if (chunk_index << CHUNK_BITS) | (word * 64) >= end {
+                    return None;
+                }
+            }
+            key = (chunk_index + 1) << CHUNK_BITS;
+        }
+        None
     }
 
     /// Clears every mark.

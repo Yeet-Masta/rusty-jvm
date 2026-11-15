@@ -9,7 +9,7 @@ use crate::vm::system_native::method_handle_natives::resolution::member_name_ini
 
 pub(crate) mod invocation;
 mod member_name;
-mod method_type;
+pub(crate) mod method_type;
 pub(crate) mod native_accessor;
 mod offsets;
 mod resolution;

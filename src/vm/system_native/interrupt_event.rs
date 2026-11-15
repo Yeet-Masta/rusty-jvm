@@ -13,6 +13,20 @@ use winapi::um::winnt::HANDLE;
 /// Java `Thread` object -> its event. Thread objects keep their identity for their lifetime.
 static EVENTS: LazyLock<DashMap<i32, usize>> = LazyLock::new(DashMap::new);
 
+/// Closes and forgets the events of `Thread` objects `live` rejects. Called by the collector,
+/// which frees them; their references may be issued again.
+pub(crate) fn prune(mut live: impl FnMut(i32) -> bool) {
+    EVENTS.retain(|thread, event| {
+        if live(*thread) {
+            return true;
+        }
+        // SAFETY: the event was created by `event_for` and is closed only here or in `release`,
+        // which removes it from the map first.
+        unsafe { CloseHandle(*event as HANDLE) };
+        false
+    });
+}
+
 fn event_for(thread: i32) -> HANDLE {
     *EVENTS.entry(thread).or_insert_with(|| {
         // Manual reset, initially non-signalled.

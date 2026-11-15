@@ -144,17 +144,25 @@ fn gc_budget_two_allocators_compete_for_one_remaining_slot() {
 }
 
 #[test]
-fn gc_budget_key_exhaustion_never_wraps_or_reuses_swept_key() {
+fn gc_budget_key_exhaustion_never_wraps_and_issues_freed_keys_again() {
     let heap = bounded(u64::MAX);
-    heap.admission.lock().next = Some(i32::MAX);
+    {
+        let mut admission = heap.admission.lock();
+        admission.next = Some(i32::MAX);
+        // As if every key below were taken.
+        admission.vacant_from = i32::MAX;
+    }
     let last = heap.create_array("[I", 2, &mut RootedSlots::new()).unwrap();
     assert_eq!(last, i32::MAX);
-    heap.remove_recorded(last).unwrap();
+    assert_eq!(heap.admission.lock().next, None);
     assert!(matches!(
         heap.reserve(charge()),
         Err(AllocError::IdentityExhausted)
     ));
-    assert_eq!(heap.admission.lock().next, None);
+    heap.remove_recorded(last).unwrap();
+    // Every positive key has been issued: only a freed one is issued again, never 0 or below.
+    let again = heap.create_array("[I", 2, &mut RootedSlots::new()).unwrap();
+    assert_eq!(again, i32::MAX);
     assert!(heap.data.get(0).is_none());
     assert!(heap.data.get(i32::MIN).is_none());
 }

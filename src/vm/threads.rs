@@ -80,6 +80,12 @@ static ACTIVITY: LazyLock<DashMap<i32, std::sync::Arc<ThreadActivity>>> =
 /// The `java.lang.Thread` of each registered OS thread, to name the owner of a monitor.
 static OS_THREADS: LazyLock<DashMap<std::thread::ThreadId, i32>> = LazyLock::new(DashMap::new);
 
+/// Forgets the activity records of `Thread` objects `live` rejects. Called by the collector, which
+/// frees them; their references may be issued again.
+pub(crate) fn prune_activity(mut live: impl FnMut(i32) -> bool) {
+    ACTIVITY.retain(|thread_ref, _| live(*thread_ref));
+}
+
 /// The activity record of `thread_ref`, created on first use.
 pub(crate) fn activity(thread_ref: i32) -> std::sync::Arc<ThreadActivity> {
     if let Some(found) = ACTIVITY.get(&thread_ref) {

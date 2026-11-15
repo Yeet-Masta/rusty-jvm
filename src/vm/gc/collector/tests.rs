@@ -659,7 +659,8 @@ fn gc_collect_pressure_retries_common_admission_without_overspending() {
     );
     assert!(results.iter().any(|result| matches!(result, Err(true))));
     assert_eq!(HEAP.memory(), (charge, charge));
-    assert!(!HEAP.contains(dead));
+    // The collection freed `dead`; its reference may have been issued again, to the winner.
+    assert!(!HEAP.contains(dead) || HEAP.get_array_value(dead, 0).unwrap() == vec![9]);
 }
 
 #[test]
@@ -712,7 +713,9 @@ fn gc_collect_pressure_contender_upgrades_an_ordinary_epoch_before_joining() {
     owner.join().unwrap();
     assert!(allocator.join().unwrap(),
         "pressure must not accept a completed epoch that retained the only reclaimable soft target");
-    assert!(!HEAP.contains(target));
+    // The collection freed `target`; its reference may have been issued again, to the zeroed
+    // array allocated after it.
+    assert!(!HEAP.contains(target) || HEAP.get_array_value(target, 0).unwrap() == vec![0]);
 }
 
 #[test]

@@ -15,10 +15,16 @@ const CACHE_LIMIT: usize = 4096;
 /// Decoded `MethodType` objects by reference.
 ///
 /// Every method-handle invocation decodes its handle's type, which walks the parameter classes and
-/// parses a descriptor. A `MethodType`'s `ptypes` and `rtype` never change once it is built, and a
-/// heap reference is never issued twice, so a reference identifies one decoded type for good.
+/// parses a descriptor. A `MethodType`'s `ptypes` and `rtype` never change once it is built, so a
+/// reference identifies one decoded type for as long as its object lives; a collection drops the
+/// entries of the objects it frees (see [`prune`]), whose references may be issued again.
 static CACHE: LazyLock<DashMap<i32, Arc<MethodType>, FastBuildHasher>> =
     LazyLock::new(DashMap::default);
+
+/// Forgets the decoded types of objects `live` rejects. Called by the collector, which frees them.
+pub(crate) fn prune(mut live: impl FnMut(i32) -> bool) {
+    CACHE.retain(|reference, _| live(*reference));
+}
 
 #[derive(Debug, Getters)]
 #[get = "pub"]

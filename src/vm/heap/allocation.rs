@@ -8,7 +8,12 @@ use crate::vm::stack::rooted_slots::RootedSlots;
 #[derive(Debug)]
 pub(super) struct Admission {
     pub(super) budget: Budget,
+    /// The next key never issued, or `None` once every positive key has been.
     pub(super) next: Option<i32>,
+    /// Keys below this one hold objects, or were vacant when last searched. A collection frees
+    /// keys and starts the search over, so references are issued again: the heap's identities
+    /// last as long as its objects, not the program, and a reused slot is already in memory.
+    pub(super) vacant_from: i32,
 }
 
 impl Admission {
@@ -16,6 +21,7 @@ impl Admission {
         Self {
             budget: Budget::new(max, enforced),
             next: Some(1),
+            vacant_from: 1,
         }
     }
 }
@@ -39,10 +45,7 @@ impl Heap {
         destination: &mut RootedSlots,
     ) -> AllocResult<i32> {
         let recorded = value.charge()?;
-        let key = admission
-            .next
-            .filter(|key| *key > 0)
-            .ok_or(AllocError::IdentityExhausted)?;
+        let (key, fresh) = self.next_key(admission)?;
         // Validate all accounting before insertion. Holding the admission mutex serializes the
         // key/insert/root triple.
         if recorded > charge {
@@ -69,7 +72,10 @@ impl Heap {
         // Rejects an occupied key before anything is published.
         self.data.insert_tagged(key, value, recorded, tag)?;
         admission.budget.commit(charge, recorded)?;
-        admission.next = key.checked_add(1);
+        if fresh {
+            admission.next = key.checked_add(1);
+        }
+        admission.vacant_from = key.saturating_add(1);
         destination.publish_single_ref(key);
         trigger::allocated();
         Ok(key)
@@ -110,7 +116,20 @@ impl Heap {
         published
     }
 
-    fn try_reserve_locked(&self, admission: &mut Admission, charge: u64) -> AllocResult<()> {
+    /// The key the next object gets, and whether it was never issued: a key a collection freed,
+    /// lowest first, or else the next fresh one, which must be positive and free.
+    fn next_key(&self, admission: &mut Admission) -> AllocResult<(i32, bool)> {
+        // Every key below the next fresh one has been issued; once all have, every positive key.
+        let end = admission
+            .next
+            .map_or(1usize << 31, |next| usize::try_from(next).unwrap_or(0));
+        if usize::try_from(admission.vacant_from).is_ok_and(|from| from < end) {
+            if let Some(key) = self.data.first_vacant(admission.vacant_from, end) {
+                return Ok((key, false));
+            }
+            // Nothing vacant below the fresh keys until something is freed.
+            admission.vacant_from = admission.next.unwrap_or(i32::MAX);
+        }
         let key = admission
             .next
             .filter(|key| *key > 0)
@@ -118,6 +137,11 @@ impl Heap {
         if self.data.contains_key(key) {
             return Err(AllocError::IdentityExhausted);
         }
+        Ok((key, true))
+    }
+
+    fn try_reserve_locked(&self, admission: &mut Admission, charge: u64) -> AllocResult<()> {
+        self.next_key(admission)?;
         admission.budget.reserve(charge)
     }
 
@@ -164,6 +188,7 @@ impl Heap {
                 return Err(AllocError::InvalidLayout);
             }
             admission.budget.reclaim(recorded)?;
+            admission.vacant_from = admission.vacant_from.min(reference);
             reclaimed = reclaimed
                 .checked_add(recorded)
                 .ok_or(AllocError::Arithmetic)?;
@@ -181,6 +206,7 @@ impl Heap {
             .ok_or(AllocError::InvalidLayout)?;
         admission.budget.reclaim(charge)?;
         self.data.remove(reference);
+        admission.vacant_from = admission.vacant_from.min(reference);
         Ok(charge)
     }
 

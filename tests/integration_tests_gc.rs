@@ -285,6 +285,17 @@ fn should_keep_a_fixed_live_graph_across_increasing_lifetime_keys() {
 }
 
 #[test]
+fn should_issue_references_again_without_aliasing_live_or_weakly_held_objects() {
+    let output = run(
+        &["-Xmx64m", "-XX:GCAllocThreshold=128"],
+        "samples.gc.GcReuseDemo",
+        &[],
+        Duration::from_secs(300),
+    );
+    assert_quiet_success(&output, "reuse-ok\n");
+}
+
+#[test]
 fn should_match_jdk_reflect_array_semantics_under_collection() {
     let output = run(
         &["-Xmx64m", "-XX:GCAllocThreshold=128"],
