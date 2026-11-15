@@ -158,8 +158,25 @@ pub(crate) fn zero_counter(_this: i32) -> Result<i64> {
 
 // ---- threads ----
 
+/// The threads the management interface reports: the registered ones that have not terminated.
+/// A thread is still registered for a moment after it woke its joiners, where HotSpot, which
+/// finds a thread through its `eetop`, already reports none.
 pub(super) fn live_threads() -> Vec<i32> {
-    threads::parker_refs()
+    let mut threads = threads::parker_refs();
+    threads.retain(|&thread_ref| !is_terminated(thread_ref));
+    threads
+}
+
+fn is_terminated(thread_ref: i32) -> bool {
+    let status = HEAP
+        .get_object_field_value(thread_ref, "java/lang/Thread", "holder")
+        .ok()
+        .filter(|holder| holder[0] != 0)
+        .and_then(|holder| {
+            HEAP.get_object_field_value(holder[0], "java/lang/Thread$FieldHolder", "threadStatus")
+                .ok()
+        });
+    status.is_some_and(|status| status[0] == threads::thread_status::TERMINATED)
 }
 
 fn is_daemon(thread_ref: i32) -> Result<bool> {

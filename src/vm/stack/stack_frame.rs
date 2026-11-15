@@ -72,6 +72,8 @@ pub(crate) struct FrameCode {
     /// The method these frames run, when the frames were built from it (as every frame the VM
     /// runs is); stack traces then find it without a by-name lookup.
     pub(crate) method: Option<&'static crate::vm::method_area::java_method::JavaMethod>,
+    /// The method's compiled code and the counts that decide when to compile it.
+    pub(crate) jit: crate::vm::jit::JitState,
 }
 
 impl ClassCache {
@@ -93,6 +95,7 @@ impl FrameCode {
             exception_table: Arc::new(ExceptionTable::new(Vec::new())),
             klass: ClassCache::default(),
             method: None,
+            jit: Default::default(),
         }
     }
 }
@@ -312,6 +315,7 @@ impl StackFrame {
                 exception_table,
                 klass: ClassCache::default(),
                 method: None,
+                jit: Default::default(),
             })),
             locals_size,
             stack_size,
@@ -483,7 +487,9 @@ impl StackFrame {
 
     /// The method's class, if already cached.
     #[inline]
-    pub(crate) fn resolved_class(&self) -> Option<&Arc<crate::vm::method_area::java_class::JavaClass>> {
+    pub(crate) fn resolved_class(
+        &self,
+    ) -> Option<&Arc<crate::vm::method_area::java_class::JavaClass>> {
         self.code.klass.get()
     }
 

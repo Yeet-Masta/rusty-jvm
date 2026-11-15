@@ -170,6 +170,31 @@ flowchart TD
     LOOP -- yes --> DONE([return last_value])
 ```
 
+### 4.1 Baseline just-in-time compiler
+
+Before the loop above takes an instruction, the frame-local loop
+(`StackFrame::run_frame_local`) runs the instructions that touch nothing but the executing
+frame, and stops at the first that needs a handler. The compiler (`src/vm/jit`, built on
+Cranelift) replaces that loop, one method at a time:
+
+- **Contract.** Compiled code does what the frame-local loop does, from the same state: it works
+  on the frame's own slots, stops at the same instructions, and reports how many instructions
+  ran and why it stopped. It can be entered at any instruction and may stop at any. Calls,
+  returns, exceptions, monitors, safepoints and the collector's root scans therefore see the
+  frames they always saw, and are unchanged.
+- **Trigger.** A method is compiled once it has run `-XX:CompileThreshold` (10,000) frame-local
+  instructions interpreted. Compilation happens on a "JIT Compiler" thread, and the method is
+  interpreted until its code is ready; `-Xbatch` compiles in the thread that reached the
+  threshold. `-Xint` turns the compiler off.
+- **Coverage.** Constants, loads and stores, stack shuffles, arithmetic, conversions,
+  comparisons, branches and switches become machine instructions. Field and array access, `ldc`
+  and type checks call back into the frame-local loop for the one instruction. Everything else
+  stops the code for its handler.
+- **Parity.** Results are HotSpot's interpreter's, bit for bit, including which NaN a
+  floating-point operation returns (`execution_engine::float_arithmetic`). The integration suite
+  runs with `RUSTY_JVM_COMPILE_THRESHOLD=1` to check compiled code against every test program:
+  `RUSTY_JVM_COMPILE_THRESHOLD=1 cargo test --release --test integration_tests`.
+
 ---
 
 ## 5. Virtual Method Dispatch (vtable)

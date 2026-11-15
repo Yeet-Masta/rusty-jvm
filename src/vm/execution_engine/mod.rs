@@ -3,8 +3,10 @@ mod engine;
 #[cfg(test)]
 pub(crate) use engine::Engine;
 pub(crate) mod executor;
-pub(crate) mod invoke_dynamic_runner;
+pub(crate) mod float_arithmetic;
+mod frame_local_calls;
 pub(crate) mod intrinsics;
+pub(crate) mod invoke_dynamic_runner;
 pub(crate) mod invoker;
 pub(crate) mod ldc_resolution_manager;
 pub(crate) mod opcode;
@@ -19,6 +21,5 @@ mod ops_reference_processor;
 mod ops_stack_processor;
 mod ops_store_processor;
 pub(crate) mod static_init;
-mod frame_local_calls;
 pub(crate) mod string_concat;
 pub(crate) mod string_pool_helper;

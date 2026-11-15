@@ -487,6 +487,7 @@ use crate::utils::{
     is_bigendian, line_ending, map_library_name, tmp_file, ExecutionResult,
 };
 use itertools::Itertools;
+#[cfg(not(target_os = "linux"))]
 use regex::Regex;
 use rstest::rstest;
 use serde_json::Value;
@@ -2305,8 +2306,20 @@ fn should_return_system_properties() {
     let os_version = json["os.version"]
         .as_str()
         .expect("os.version is not a string");
-    let re = Regex::new(r"^\d+\.\d+\.\d+$").unwrap();
-    assert!(re.is_match(os_version), "os.version format is incorrect");
+    // On Linux, HotSpot reports the kernel release from uname (e.g. "6.8.0-45-generic").
+    #[cfg(target_os = "linux")]
+    {
+        let release = std::process::Command::new("uname")
+            .arg("-r")
+            .output()
+            .expect("failed to run uname -r");
+        assert_eq!(os_version, String::from_utf8_lossy(&release.stdout).trim());
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let re = Regex::new(r"^\d+\.\d+\.\d+$").unwrap();
+        assert!(re.is_match(os_version), "os.version format is incorrect");
+    }
 
     let user_dir = json["user.dir"].as_str().expect("user.dir is not a string");
     assert!(user_dir.ends_with("java_classes_for_tests"));
@@ -3540,6 +3553,14 @@ Memory and garbage collection:
     -XX:GCAllocThreshold=<count>  Collect after this many allocations (default: 65536,
                                   adapted to the number of live objects)
     -XX:+GCStressAtSafepoints     Collect at every safepoint, for testing the VM (slow)
+
+Just-in-time compilation:
+    -Xint                         Interpret only: compile nothing
+    -Xbatch                       Compile a method where it turns warm, before going on,
+                                  instead of in the background (-XX:-BackgroundCompilation)
+    -XX:CompileThreshold=<count>  Compile a method after it has run this many bytecode
+                                  instructions interpreted (default: 10000)
+    -XX:+PrintCompilation         Print each method as it is compiled
 "#;
     utils::assert_with_all_args(
         &["--help"],
@@ -5782,6 +5803,46 @@ fn should_keep_slow_path_semantics_on_warm_getter_store_and_copy_paths() {
          constructors 5000 1000 1000\n\
          intrinsics true true true true -2147483648\n",
     );
+}
+
+#[test]
+fn should_compute_math_intrinsics_bit_for_bit_as_hotspot() {
+    utils::assert_success_utf8(
+        "samples.interpreter.intrinsics.MathIntrinsics",
+        "doubles -4496296998329033773\n\
+         floats -6489023135558654519\n\
+         integers -5859485541564853899\n\
+         doubles -4496296998329033773\n\
+         floats -6489023135558654519\n\
+         integers -5859485541564853899\n\
+         sqrt 1.4142135623730951 -2 2.0 -0.0 0.0 5.551115123125783E-17\n",
+    );
+}
+
+/// The compiled code of every instruction the baseline compiler handles gives what HotSpot's
+/// interpreter gives, as does the interpreter here. The reference runs with `-Xint` because
+/// HotSpot's optimizing compiler picks other NaNs than its interpreter for some expressions.
+#[test]
+fn should_run_compiled_instructions_bit_for_bit_as_hotspot_interprets_them() {
+    let entry = "samples.jit.opcodes.JitOpcodes";
+    let reference = utils::run_reference_jvm(&["-Xint"], entry);
+    assert_eq!(reference.exit_code, 0, "{}", reference.stderr);
+    assert_eq!(reference.stdout.lines().count(), 4);
+    for vm_options in [
+        &[][..],
+        &["-Xbatch", "-XX:CompileThreshold=500"],
+        &["-Xint"],
+    ] {
+        let output = utils::get_command_with_vm_options(vm_options, entry, &[])
+            .output()
+            .expect("Failed to run rusty-jvm");
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout).replace("\r\n", "\n"),
+            reference.stdout,
+            "with {vm_options:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
 }
 
 #[test]

@@ -30,7 +30,7 @@ pub(crate) fn run(stack_frames: &mut StackFrames, budget: u32) -> Result<u32> {
         let Some(frame) = stack_frames.last_mut() else {
             break;
         };
-        let (ran, stop) = frame.run_frame_local(budget - done);
+        let (ran, stop) = frame.run_local(budget - done);
         done += ran;
         let handled = match stop {
             FrameLocalStop::Other => false,
@@ -83,7 +83,8 @@ fn warm_target(stack_frames: &StackFrames) -> Result<Option<(&'static JavaMethod
     };
     let code = frame.code_bytes();
     let pc = frame.pc();
-    let (Some(&opcode), Some(&high), Some(&low)) = (code.get(pc), code.get(pc + 1), code.get(pc + 2))
+    let (Some(&opcode), Some(&high), Some(&low)) =
+        (code.get(pc), code.get(pc + 1), code.get(pc + 2))
     else {
         return Ok(None);
     };

@@ -17,7 +17,9 @@
 //! anything, and its handler then does the rest, exceptions included.
 
 use super::StackFrame;
+use crate::vm::execution_engine::float_arithmetic;
 use crate::vm::heap::heap::HEAP;
+use crate::vm::jit::{self, JitIo, STOP_INVOKE, STOP_OTHER, STOP_RETURN};
 use crate::vm::method_area::java_class::{InstanceField, JavaClass, MemberRefKind, StaticField};
 use crate::vm::stack::slot::Slot;
 
@@ -217,7 +219,76 @@ pub(crate) enum FrameLocalStop {
     Return(usize),
 }
 
+/// The frame-local loop run for one instruction, for compiled code: the frame's pc and stack
+/// top come from `io`, and go back to it, with why the instruction did not run if it did not.
+/// Returns how many instructions ran.
+///
+/// # Safety
+///
+/// `io` must be the `JitIo` the engine passed to compiled code for `io.frame`, which nothing
+/// else uses while the code runs.
+pub(crate) unsafe extern "C" fn jit_step(io: *mut JitIo) -> u32 {
+    // SAFETY: as the caller promises.
+    let io = unsafe { &mut *io };
+    let frame = unsafe { &mut *io.frame };
+    frame.pc = io.pc as usize;
+    frame.stack_len = io.top as usize - frame.max_locals;
+    let (ran, stop) = frame.run_frame_local(1);
+    io.pc = frame.pc as u32;
+    io.top = (frame.max_locals + frame.stack_len) as u32;
+    io.stop = encode_stop(stop);
+    ran
+}
+
+fn encode_stop(stop: FrameLocalStop) -> u32 {
+    match stop {
+        FrameLocalStop::Other => STOP_OTHER,
+        FrameLocalStop::Invoke => STOP_INVOKE,
+        FrameLocalStop::Return(slots) => STOP_RETURN + slots as u32,
+    }
+}
+
+fn decode_stop(stop: u32) -> FrameLocalStop {
+    match stop {
+        STOP_INVOKE => FrameLocalStop::Invoke,
+        STOP_OTHER => FrameLocalStop::Other,
+        _ => FrameLocalStop::Return((stop - STOP_RETURN) as usize),
+    }
+}
+
 impl StackFrame {
+    /// Runs frame-local instructions as [`Self::run_frame_local`] does, in the method's compiled
+    /// code once there is some, and counts towards compiling it until then.
+    #[inline]
+    pub(crate) fn run_local(&mut self, budget: u32) -> (u32, FrameLocalStop) {
+        let code: &'static super::FrameCode = self.code;
+        if let Some(entry) = jit::entry(code) {
+            let mut io = JitIo {
+                slots: self.slots.as_mut_ptr(),
+                frame: std::ptr::from_mut(self),
+                pc: self.pc as u32,
+                top: (self.max_locals + self.stack_len) as u32,
+                limit: self.slots.len() as u32,
+                budget,
+                done: 0,
+                stop: STOP_OTHER,
+            };
+            // SAFETY: the code was compiled for this frame's method, and reads and writes only
+            // this frame's slots (and the frame, through `jit_step`) while it runs.
+            unsafe { entry(&mut io) };
+            self.pc = io.pc as usize;
+            self.stack_len = io.top as usize - self.max_locals;
+            if io.done > 0 || io.stop != STOP_OTHER {
+                return (io.done, decode_stop(io.stop));
+            }
+            // The code declined at its entry pc: interpret.
+            return self.run_frame_local(budget);
+        }
+        let (ran, stop) = self.run_frame_local(budget);
+        jit::note_interpreted(code, ran, jit_step);
+        (ran, stop)
+    }
+
     /// Runs frame-local instructions from the current pc, at most `budget` of them, stopping
     /// before the first instruction that is not one. Returns how many ran, and why it stopped:
     /// an invoke or return may still be done without the interpreter loop (see
@@ -519,16 +590,16 @@ impl StackFrame {
                 }
                 96 => int_binary!(|a, b| a.wrapping_add(b)),
                 97 => long_binary!(|a, b| a.wrapping_add(b)),
-                98 => float_binary!(|a, b| a + b),
-                99 => double_binary!(|a, b| a + b),
+                98 => float_binary!(|a, b| float_arithmetic::fadd(a, b)),
+                99 => double_binary!(|a, b| float_arithmetic::dadd(a, b)),
                 100 => int_binary!(|a, b| a.wrapping_sub(b)),
                 101 => long_binary!(|a, b| a.wrapping_sub(b)),
                 102 => float_binary!(|a, b| a - b),
                 103 => double_binary!(|a, b| a - b),
                 104 => int_binary!(|a, b| a.wrapping_mul(b)),
                 105 => long_binary!(|a, b| a.wrapping_mul(b)),
-                106 => float_binary!(|a, b| a * b),
-                107 => double_binary!(|a, b| a * b),
+                106 => float_binary!(|a, b| float_arithmetic::fmul(a, b)),
+                107 => double_binary!(|a, b| float_arithmetic::dmul(a, b)),
                 // idiv, irem: a zero divisor throws, which the handler does
                 108 | 112 => {
                     if stack.last().expect("Empty stack").value() == 0 {
@@ -740,8 +811,18 @@ impl StackFrame {
                     let pair = |i: usize| {
                         let at = i * 8;
                         (
-                            i32::from_be_bytes([table[at], table[at + 1], table[at + 2], table[at + 3]]),
-                            i32::from_be_bytes([table[at + 4], table[at + 5], table[at + 6], table[at + 7]]),
+                            i32::from_be_bytes([
+                                table[at],
+                                table[at + 1],
+                                table[at + 2],
+                                table[at + 3],
+                            ]),
+                            i32::from_be_bytes([
+                                table[at + 4],
+                                table[at + 5],
+                                table[at + 6],
+                                table[at + 7],
+                            ]),
                         )
                     };
                     let (mut low, mut high) = (0usize, table.len() / 8);
@@ -775,8 +856,8 @@ impl StackFrame {
                     } else {
                         pool_index(code, pc)
                     };
-                    let Some(bits) =
-                        index.and_then(|index| klass.and_then(|klass| klass.cached_constant(index)))
+                    let Some(bits) = index
+                        .and_then(|index| klass.and_then(|klass| klass.cached_constant(index)))
                     else {
                         break;
                     };
@@ -796,7 +877,8 @@ impl StackFrame {
                 }
                 // checkcast, once this site has accepted the object's class
                 192 => {
-                    let (Some(index), Some(object)) = (pool_index(code, pc), peek(stack, 1)) else {
+                    let (Some(index), Some(object)) = (pool_index(code, pc), peek(stack, 1))
+                    else {
                         break;
                     };
                     if object != 0 {
@@ -812,7 +894,8 @@ impl StackFrame {
                 }
                 // instanceof, once this site has checked the object's class
                 193 => {
-                    let (Some(index), Some(object)) = (pool_index(code, pc), peek(stack, 1)) else {
+                    let (Some(index), Some(object)) = (pool_index(code, pc), peek(stack, 1))
+                    else {
                         break;
                     };
                     let instance_of = if object == 0 {

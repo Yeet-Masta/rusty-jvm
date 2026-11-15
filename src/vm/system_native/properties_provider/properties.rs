@@ -1,6 +1,8 @@
 use crate::vm::error::Error;
 use crate::vm::JAVA_HOME;
+#[cfg(not(target_os = "linux"))]
 use os_info::Type;
+#[cfg(not(target_os = "linux"))]
 use os_info::Version::Semantic;
 use std::env;
 #[cfg(unix)]
@@ -226,6 +228,29 @@ static STREAM_ENCODINGS: LazyLock<[Option<String>; 3]> = LazyLock::new(|| {
     })
 });
 
+/// Linux's `uname`, from which HotSpot takes `os.name` (the system name) and `os.version` (the
+/// kernel release), as `java_props_md.c` does. Asking `os_info` would also run `lsb_release` and
+/// `getconf` at every start, and give the distribution's version rather than the kernel's.
+#[cfg(target_os = "linux")]
+static UNAME: LazyLock<(String, String)> = LazyLock::new(|| match nix::sys::utsname::uname() {
+    Ok(name) => (
+        name.sysname().to_string_lossy().into_owned(),
+        name.release().to_string_lossy().into_owned(),
+    ),
+    Err(_) => ("Linux".to_string(), "0.0.0".to_string()),
+});
+
+#[cfg(target_os = "linux")]
+pub(crate) fn os_version() -> &'static str {
+    &UNAME.1
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn os_name() -> &'static str {
+    &UNAME.0
+}
+
+#[cfg(not(target_os = "linux"))]
 static OS_VERSION: LazyLock<String> = LazyLock::new(|| {
     let info = os_info::get();
     let version = info.version();
@@ -234,10 +259,12 @@ static OS_VERSION: LazyLock<String> = LazyLock::new(|| {
         _ => "0.0.0".to_string(),
     }
 });
+#[cfg(not(target_os = "linux"))]
 pub(crate) fn os_version() -> &'static str {
     &OS_VERSION
 }
 
+#[cfg(not(target_os = "linux"))]
 static OS_NAME: LazyLock<&'static str> = LazyLock::new(|| {
     let info = os_info::get();
     match info.os_type() {
@@ -282,6 +309,7 @@ static OS_NAME: LazyLock<&'static str> = LazyLock::new(|| {
         _ => unreachable!("Unsupported OS type"),
     }
 });
+#[cfg(not(target_os = "linux"))]
 pub(crate) fn os_name() -> &'static str {
     &OS_NAME
 }

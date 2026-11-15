@@ -1,5 +1,6 @@
 use crate::vm::error::{Error, Result};
 use crate::vm::execution_engine::common::last_frame_mut;
+use crate::vm::execution_engine::float_arithmetic;
 use crate::vm::execution_engine::opcode::*;
 use crate::vm::stack::stack_frame::{StackFrame, StackFrames};
 use crate::vm::stack::stack_value::StackValue;
@@ -25,24 +26,24 @@ pub(crate) fn process(code: u8, stack_frames: &mut StackFrames) -> Result<()> {
     match code {
         IADD => binary_operation(stack_frame, |a: i32, b| a.wrapping_add(b), "IADD"),
         LADD => binary_operation(stack_frame, |a: i64, b| a.wrapping_add(b), "LADD"),
-        FADD => binary_operation(stack_frame, |a: f32, b: f32| a + b, "FADD"),
-        DADD => binary_operation(stack_frame, |a: f64, b: f64| a + b, "DADD"),
+        FADD => binary_operation(stack_frame, float_arithmetic::fadd, "FADD"),
+        DADD => binary_operation(stack_frame, float_arithmetic::dadd, "DADD"),
         ISUB => binary_operation(stack_frame, |a: i32, b| a.wrapping_sub(b), "ISUB"),
         LSUB => binary_operation(stack_frame, |a: i64, b| a.wrapping_sub(b), "LSUB"),
         FSUB => binary_operation(stack_frame, |a: f32, b: f32| a - b, "FSUB"),
         DSUB => binary_operation(stack_frame, |a: f64, b: f64| a - b, "DSUB"),
         IMUL => binary_operation(stack_frame, |a: i32, b| a.wrapping_mul(b), "IMUL"),
         LMUL => binary_operation(stack_frame, |a: i64, b| a.wrapping_mul(b), "LMUL"),
-        FMUL => binary_operation(stack_frame, |a: f32, b: f32| a * b, "FMUL"),
-        DMUL => binary_operation(stack_frame, |a: f64, b: f64| a * b, "DMUL"),
+        FMUL => binary_operation(stack_frame, float_arithmetic::fmul, "FMUL"),
+        DMUL => binary_operation(stack_frame, float_arithmetic::dmul, "DMUL"),
         IDIV => binary_operation(stack_frame, |a: i32, b| a.wrapping_div(b), "IDIV"), // todo add check for ArithmeticException here
         LDIV => binary_operation(stack_frame, |a: i64, b| a.wrapping_div(b), "LDIV"), // todo add check for ArithmeticException here
         FDIV => binary_operation(stack_frame, |a: f32, b: f32| a / b, "FDIV"),
         DDIV => binary_operation(stack_frame, |a: f64, b: f64| a / b, "DDIV"),
         IREM => binary_operation(stack_frame, |a: i32, b| a.wrapping_rem(b), "IREM"), // todo add check for ArithmeticException here
         LREM => binary_operation(stack_frame, |a: i64, b| a.wrapping_rem(b), "LREM"), // todo add check for ArithmeticException here
-        FREM => binary_operation(stack_frame, |a: f32, b: f32| a % b, "FREM"),
-        DREM => binary_operation(stack_frame, |a: f64, b: f64| a % b, "DREM"),
+        FREM => binary_operation(stack_frame, float_arithmetic::frem, "FREM"),
+        DREM => binary_operation(stack_frame, float_arithmetic::drem, "DREM"),
         INEG => unary_operation(stack_frame, |a: i32| a.wrapping_neg(), "INEG"),
         LNEG => unary_operation(stack_frame, |a: i64| a.wrapping_neg(), "LNEG"),
         FNEG => unary_operation(stack_frame, |a: f32| -a, "FNEG"),

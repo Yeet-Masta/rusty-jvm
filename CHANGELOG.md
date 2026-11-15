@@ -11,6 +11,18 @@
   deadlock detection, and stack traces of blocked threads (`Thread.getAllStackTraces`)
 * Heap dumps in the HPROF format through `HotSpotDiagnosticMXBean.dumpHeap`, and the VM options
   this VM acts on through `getVMOption`
+* `Math.sqrt`, `abs`, `min`, `max`, `fma`, `floor`, `ceil`, `rint` and `round`, and
+  `Integer`/`Long` `numberOfLeadingZeros`, `numberOfTrailingZeros` and `bitCount`, run natively
+  with HotSpot's results, bit for bit
+* On Linux, `os.name` and `os.version` come from `uname` as in HotSpot (`os.version` is the kernel
+  release, not the distribution's version), and starting the VM no longer runs `lsb_release`
+* A baseline just-in-time compiler (Cranelift) for arithmetic, conversions, comparisons, branches,
+  switches and moves between locals and the operand stack, compiling warm methods on a background
+  thread; `-Xint`, `-Xbatch`, `-XX:CompileThreshold=<n>`, `-XX:+PrintCompilation`
+* Floating-point `+`, `*` and `%` return the NaN HotSpot's interpreter returns (which of two NaN
+  operands, with which sign), on x86-64
+* A benchmark suite and runner (`bench/run.py`) comparing rusty-jvm with HotSpot's interpreter,
+  C1 and C2; see [docs/benchmarking.md](docs/benchmarking.md)
 
 # 0.6.0
 

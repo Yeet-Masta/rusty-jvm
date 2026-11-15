@@ -175,6 +175,7 @@ impl JavaMethod {
                 exception_table: Arc::clone(context.exception_table()),
                 klass: Default::default(),
                 method: Some(self.immortal_self()),
+                jit: Default::default(),
             }))
         });
         let mut frame = StackFrame::from_code(
@@ -546,7 +547,9 @@ impl JavaMethod {
                 .and_then(|member| member.special_target.get())
                 .is_some_and(|target| {
                     // The receiver alone: anything else would leave the call's arguments to it.
-                    target.arg_ref_chunks().is_ok_and(|chunks| chunks.len() == 1)
+                    target
+                        .arg_ref_chunks()
+                        .is_ok_and(|chunks| chunks.len() == 1)
                         && target.is_empty_void()
                 }),
             _ => false,
@@ -567,8 +570,7 @@ impl JavaMethod {
     pub fn is_polymorphic_signature(&self) -> bool {
         // Signature polymorphic methods are native by definition (JVMS 2.9.3); checking that
         // first keeps every other call from hashing the annotation name.
-        self.native
-            && self.has_annotation("Ljava/lang/invoke/MethodHandle$PolymorphicSignature;")
+        self.native && self.has_annotation("Ljava/lang/invoke/MethodHandle$PolymorphicSignature;")
     }
 
     /// Whether the method carries the runtime-visible annotation of type `descriptor`

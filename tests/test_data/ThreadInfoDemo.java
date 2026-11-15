@@ -241,6 +241,10 @@ public class ThreadInfoDemo {
         CountDownLatch locksHeld = new CountDownLatch(2);
         Thread ownerA = daemon("lock-a", () -> deadlock(lockA, lockB, locksHeld));
         Thread ownerB = daemon("lock-b", () -> deadlock(lockB, lockA, locksHeld));
+        // Each is also WAITING earlier, on the latch: wait until it queues for the other's lock.
+        while (!lockB.hasQueuedThread(ownerA) || !lockA.hasQueuedThread(ownerB)) {
+            Thread.sleep(1);
+        }
         await(ownerA, Thread.State.WAITING);
         await(ownerB, Thread.State.WAITING);
         System.out.println("monitor cycle: " + names(THREADS.findMonitorDeadlockedThreads()) + " all: "

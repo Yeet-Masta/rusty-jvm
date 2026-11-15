@@ -2,7 +2,7 @@
 name = "rusty-jvm"
 version = "0.6.0"
 edition = "2021"
-rust-version = "1.80"
+rust-version = "1.97"
 description = "A Java Virtual Machine (JVM) implemented from scratch in Rust — interprets Java bytecode with no dependency on existing JVMs."
 documentation = "https://docs.rs/rusty-jvm"
 homepage = "https://github.com/hextriclosan/rusty-jvm"
@@ -11,7 +11,7 @@ readme = "README.md"
 keywords = ["jvm", "java", "bytecode", "interpreter", "virtual-machine"]
 categories = ["command-line-utilities", "emulators", "compilers"]
 license = "MIT"
-exclude = [".*", "tests/**", "utils/**", "Cross.toml", "renovate.json", "rustfmt.toml"]
+exclude = [".*", "bench/**", "tests/**", "utils/**", "Cross.toml", "renovate.json", "rustfmt.toml"]
 
 [workspace]
 members = ["jclassfile", "jclassmodel", "jdescriptor", "jimage-rs", "jniname", "tests/jni_test_lib"]
@@ -32,7 +32,6 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 num-traits = "0.2.19"
 num_enum = "0.7.6"
 murmur3 = "0.5.2"
-os_info = { version =  "3.14.0", default-features = false  }
 parking_lot = "0.13.0"
 libloading = "0.9.0"
 path-absolutize = "4.0.0"
@@ -53,12 +52,20 @@ jni-sys = "0.4.1"
 whoami = "2.1.2"
 cesu8 = "1.1.0"
 mimalloc = { version = "0.1.52", default-features = false }
+cranelift-codegen = "0.137.0"
+cranelift-frontend = "0.137.0"
+cranelift-jit = "0.137.0"
+cranelift-module = "0.137.0"
+cranelift-native = "0.137.0"
+
+[target.'cfg(not(target_os = "linux"))'.dependencies]
+os_info = { version =  "3.14.0", default-features = false  }
 
 [target.'cfg(windows)'.dependencies]
 winapi = { version = "0.3.9", features = ["winbase", "processenv", "minwindef", "fileapi", "winnt", "minwinbase", "securitybaseapi", "processthreadsapi", "sysinfoapi", "winerror", "handleapi", "errhandlingapi", "ntdef", "winnls", "consoleapi", "stringapiset", "netioapi", "ifdef", "ipifcons", "nldef", "ws2def", "ws2ipdef", "inaddr", "in6addr", "shlobj", "knownfolders", "combaseapi", "ioapiset", "synchapi", "libloaderapi"] }
 
 [target.'cfg(unix)'.dependencies]
-nix = { version = "0.31.1", features = ["fs", "uio", "user"] }
+nix = { version = "0.31.1", features = ["feature", "fs", "uio", "user"] }
 realpath-ext = "0.1.3"
 
 [target.'cfg(target_os = "macos")'.dependencies]

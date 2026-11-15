@@ -6,6 +6,7 @@ mod execution_engine;
 mod gc;
 mod heap;
 mod helper;
+mod jit;
 mod jni;
 mod jvm_interface;
 mod jvm_shim;
@@ -64,6 +65,7 @@ pub fn run(arguments: &Arguments, java_home: &Path) -> Result<()> {
     safepoint::attach();
     gc::install(arguments)?;
     stack::stack_limit::configure(arguments.jvm_options());
+    jit::configure(arguments.jvm_options(), arguments.advanced_jvm_options());
     system_native::management::init(arguments);
     // Before any JDK native library is loaded, so their `JVM_*` imports resolve to it.
     jvm_shim::install();
@@ -211,7 +213,14 @@ fn init_logger() -> Result<()> {
         .with_ansi(false)
         .with_filter(filter_fn(|metadata| metadata.target() == "gc"));
     let filter_layer = EnvFilter::try_from_default_env()
-        .or_else(|_| EnvFilter::try_new("info,gc=off"))
+        // The compiler's own libraries log every function they define, with its whole code, at
+        // `info`: that is for whoever asks for it with `RUST_LOG`, not for every run.
+        .or_else(|_| {
+            EnvFilter::try_new(
+                "info,gc=off,cranelift_codegen=warn,cranelift_frontend=warn,cranelift_jit=warn,\
+                 cranelift_module=warn,cranelift_native=warn",
+            )
+        })
         .map_err(|e| Error::new_execution(&format!("Error creating EnvFilter: {e}")))?;
     let filter_layer = if gc::logging_enabled() {
         let directive = "gc=info"

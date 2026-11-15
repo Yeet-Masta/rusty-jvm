@@ -14,12 +14,16 @@
 use std::fmt::{Debug, Display, Formatter};
 
 /// One 32-bit frame slot, tagged with whether its bits are a heap reference.
+///
+/// The layout is fixed (a `u32` tag, 0 or 1, then the `i32`) because compiled code reads and
+/// writes slots directly; see [`crate::vm::jit`].
 #[derive(Clone, Copy, PartialEq, Eq)]
+#[repr(u32)]
 pub(crate) enum Slot {
     /// Non-reference bits: an `int`, a `float`'s bit pattern, or half of a `long`/`double`.
-    Value(i32),
+    Value(i32) = 0,
     /// A heap reference (`0` for `null`), and so a root for a collector.
-    Ref(i32),
+    Ref(i32) = 1,
 }
 
 impl Slot {

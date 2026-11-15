@@ -17,5 +17,13 @@ Memory and garbage collection:
     -XX:GCAllocThreshold=<count>  Collect after this many allocations (default: 65536,
                                   adapted to the number of live objects)
     -XX:+GCStressAtSafepoints     Collect at every safepoint, for testing the VM (slow)
+
+Just-in-time compilation:
+    -Xint                         Interpret only: compile nothing
+    -Xbatch                       Compile a method where it turns warm, before going on,
+                                  instead of in the background (-XX:-BackgroundCompilation)
+    -XX:CompileThreshold=<count>  Compile a method after it has run this many bytecode
+                                  instructions interpreted (default: 10000)
+    -XX:+PrintCompilation         Print each method as it is compiled
 "#
 }
