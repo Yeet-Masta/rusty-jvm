@@ -80,11 +80,7 @@ impl JavaClass {
     pub(crate) fn root_refs(&self) -> Result<Vec<i32>> {
         let mut roots = Vec::new();
         roots.extend(self.mirror_ref_if_present());
-        for name in &self.static_references {
-            let value = self
-                .static_fields
-                .get(name)
-                .ok_or_else(|| Error::new_execution("Missing static reference slot"))?;
+        for value in &self.static_references {
             roots.push(value.reference_snapshot()?);
         }
         roots.extend(

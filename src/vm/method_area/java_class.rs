@@ -40,7 +40,7 @@ mod gc;
 struct BuiltFields {
     info: IndexMap<String, Arc<FieldInfo>>,
     static_values: IndexMap<String, Arc<FieldValue>>,
-    static_references: Box<[String]>,
+    static_references: Box<[Arc<FieldValue>]>,
     instance_template: IndexMap<String, FieldValue>,
 }
 
@@ -49,7 +49,7 @@ pub(crate) struct JavaClass {
     methods: IndexMap<String, Arc<JavaMethod>>,
     fields_info: IndexMap<String, Arc<FieldInfo>>,
     static_fields: IndexMap<String, Arc<FieldValue>>,
-    static_references: Box<[String]>,
+    static_references: Box<[Arc<FieldValue>]>,
     instance_fields_template: IndexMap<String, FieldValue>,
     #[get = "pub"]
     constant_pool: ConstantPool,
@@ -537,10 +537,12 @@ impl JavaClass {
                 ),
             );
             if is_static {
+                let value = Arc::new(FieldValue::new(field.descriptor.clone())?);
                 if is_reference(&field.descriptor) {
-                    static_references.push(field.name.clone());
+                    // The same storage as in `static_values`, so a root scan reads it directly.
+                    static_references.push(Arc::clone(&value));
                 }
-                static_values.insert(field.name, Arc::new(FieldValue::new(field.descriptor)?));
+                static_values.insert(field.name, value);
             } else {
                 instance_template.insert(field.name, FieldValue::new(field.descriptor)?);
             }
@@ -559,7 +561,7 @@ impl JavaClass {
         methods: IndexMap<String, Arc<JavaMethod>>,
         fields_info: IndexMap<String, Arc<FieldInfo>>,
         static_fields: IndexMap<String, Arc<FieldValue>>,
-        static_references: Box<[String]>,
+        static_references: Box<[Arc<FieldValue>]>,
         instance_fields_template: IndexMap<String, FieldValue>,
         constant_pool: ConstantPool,
         attributes: Attributes,

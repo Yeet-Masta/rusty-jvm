@@ -35,6 +35,9 @@ struct Chunk<V> {
     /// What each present object was charged against the heap budget, written and read under
     /// its slot's lock.
     charges: Box<[AtomicU64]>,
+    /// One bit per slot, set while it holds an object, so a walk over the chunk visits only the
+    /// objects present without taking each empty slot's lock.
+    present: Box<[AtomicU64]>,
     /// Objects present.
     live: AtomicU32,
     /// Objects ever inserted. A chunk whose every slot has been filled once and emptied again
@@ -47,6 +50,7 @@ impl<V> Chunk<V> {
         Box::new(Self {
             slots: (0..CHUNK).map(|_| RwLock::new(None)).collect(),
             charges: (0..CHUNK).map(|_| AtomicU64::new(0)).collect(),
+            present: (0..CHUNK / 64).map(|_| AtomicU64::new(0)).collect(),
             live: AtomicU32::new(0),
             filled: AtomicU32::new(0),
         })
@@ -214,6 +218,7 @@ impl<V> ObjectTable<V> {
         }
         *guard = Some(value);
         chunk.charges[slot].store(charge, Ordering::Relaxed);
+        chunk.present[slot / 64].fetch_or(1 << (slot % 64), Ordering::Release);
         chunk.live.fetch_add(1, Ordering::Relaxed);
         chunk.filled.fetch_add(1, Ordering::Relaxed);
         Ok(())
@@ -238,21 +243,28 @@ impl<V> ObjectTable<V> {
             .map(|_| chunk.charges[slot].load(Ordering::Relaxed))
     }
 
-    /// Every present object's key and charge, in reference order.
+    /// Every present object's key and charge, in reference order. Exact only while no thread
+    /// inserts or removes, as during a collection.
     pub(crate) fn charges(&self) -> impl Iterator<Item = (i32, u64)> + '_ {
         let high = self.high.load(Ordering::Acquire);
         (0..high)
             .filter_map(move |index| self.chunk(index).map(|chunk| (index, chunk)))
             .flat_map(|(index, chunk)| {
                 chunk
-                    .slots
+                    .present
                     .iter()
                     .enumerate()
-                    .filter_map(move |(slot, lock)| {
-                        let guard = lock.read();
-                        guard.as_ref()?;
-                        let key = i32::try_from((index << CHUNK_BITS) | slot).ok()?;
-                        Some((key, chunk.charges[slot].load(Ordering::Relaxed)))
+                    .flat_map(move |(word, bits)| {
+                        let mut bits = bits.load(Ordering::Acquire);
+                        std::iter::from_fn(move || {
+                            if bits == 0 {
+                                return None;
+                            }
+                            let slot = word * 64 + bits.trailing_zeros() as usize;
+                            bits &= bits - 1;
+                            let key = i32::try_from((index << CHUNK_BITS) | slot).ok()?;
+                            Some((key, chunk.charges[slot].load(Ordering::Relaxed)))
+                        })
                     })
             })
     }
@@ -265,6 +277,7 @@ impl<V> ObjectTable<V> {
         let (value, charge) = {
             let mut guard = chunk.slots[slot].write();
             let value = guard.take()?;
+            chunk.present[slot / 64].fetch_and(!(1 << (slot % 64)), Ordering::Release);
             (value, chunk.charges[slot].load(Ordering::Relaxed))
         };
         let live = chunk.live.fetch_sub(1, Ordering::Relaxed) - 1;
@@ -359,6 +372,7 @@ mod tests {
         );
         assert_eq!(table.remove(1), Some(("uno", 10)));
         assert!(!table.contains_key(1));
+        assert_eq!(table.charges().collect::<Vec<_>>(), vec![(5000, 20)]);
         assert_eq!(table.remove(1), None);
     }
 

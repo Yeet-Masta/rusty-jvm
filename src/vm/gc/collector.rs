@@ -205,15 +205,11 @@ pub(crate) fn collect_snapshot(
         );
         *pending_head = reference.object;
     }
-    let mut reclaimed = 0;
-    for &(reference, _) in &entries {
-        if !trace.marked.contains(&reference) {
-            reclaimed += validated(
-                heap.remove_recorded(reference).map_err(Into::into),
-                "sweeping",
-            );
-        }
-    }
+    let reclaimed = validated(
+        heap.sweep(&entries, |reference| trace.marked.contains(&reference))
+            .map_err(Into::into),
+        "sweeping",
+    );
     crate::vm::monitor::prune_idle(|reference| trace.marked.contains(&reference));
     if !trace.references.is_empty() {
         pending.notify();

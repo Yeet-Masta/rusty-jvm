@@ -59,6 +59,33 @@ impl Heap {
         })
     }
 
+    /// Removes every entry of `entries` (reference and recorded charge) that `live` rejects, under
+    /// one admission lock, and returns the bytes refunded. The collector calls this only while its
+    /// quiescent Operation is retained. Stops at the first entry whose object or charge does not
+    /// match the table, having removed the ones before it.
+    pub(crate) fn sweep(
+        &self,
+        entries: &[(i32, u64)],
+        mut live: impl FnMut(i32) -> bool,
+    ) -> AllocResult<u64> {
+        let mut admission = self.admission.lock();
+        let mut reclaimed = 0u64;
+        for &(reference, recorded) in entries {
+            if live(reference) {
+                continue;
+            }
+            if self.data.charge(reference) != Some(recorded) {
+                return Err(AllocError::InvalidLayout);
+            }
+            admission.budget.reclaim(recorded)?;
+            self.data.remove(reference);
+            reclaimed = reclaimed
+                .checked_add(recorded)
+                .ok_or(AllocError::Arithmetic)?;
+        }
+        Ok(reclaimed)
+    }
+
     /// The collector calls this only while its quiescent Operation is retained.
     /// Never derive a refund from a newly computed layout.
     pub(crate) fn remove_recorded(&self, reference: i32) -> AllocResult<u64> {
