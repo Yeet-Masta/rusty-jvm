@@ -14,7 +14,9 @@ use crate::vm::stack::rooted_slots::RootedSlots;
 use crate::vm::stack::slot::Slot;
 use crate::vm::stack::stack_value::StackValue;
 use crate::vm::system_native::dispatcher::args::build_args;
-use crate::vm::system_native::dispatcher::builtin_natives::find_builtin_native;
+use crate::vm::system_native::dispatcher::builtin_natives::{
+    find_builtin_direct, find_builtin_native, DirectNative,
+};
 use crate::vm::system_native::dispatcher::cif_cache::{get_cif, SafeCif};
 use crate::vm::system_native::dispatcher::utils::get_symbol_address;
 use crate::vm::system_native::native_libraries::find_libjava_symbol;
@@ -36,6 +38,9 @@ pub(crate) struct NativeLink {
     long_name: String,
     /// The built-in registered under the declaring class.
     builtin: Option<i64>,
+    /// The same built-in, callable from the interpreter's slots without JNI or libffi. `None` for
+    /// an `initIDs`, which must also run the JDK library's own.
+    direct: Option<DirectNative>,
     /// The symbol a native library exports for this method, once one was found.
     library: OnceLock<i64>,
     cif: Arc<SafeCif>,
@@ -67,12 +72,14 @@ impl NativeLink {
                     Error::new_native(&format!("Failed to convert {signature} to C name"))
                 })?;
             let method_descriptor = method.get_method_descriptor();
+            let init_ids =
+                method_name == "initIDs" && method_descriptor.parameter_types().is_empty();
             Ok(NativeLink {
                 builtin: find_builtin_native(&signature),
+                direct: (!init_ids).then(|| find_builtin_direct(&signature)).flatten(),
                 library: OnceLock::new(),
                 cif: get_cif(method_descriptor)?,
-                init_ids: method_name == "initIDs"
-                    && method_descriptor.parameter_types().is_empty(),
+                init_ids,
                 signature,
                 short_name,
                 long_name,
@@ -115,6 +122,28 @@ pub(crate) fn invoke(
         return Ok(());
     };
     let link = NativeLink::of(method)?;
+    // A built-in is plain Rust: call it with the argument slots as they are. A RegisterNatives
+    // binding still takes precedence, as below.
+    if let Some(direct) = link.direct {
+        if registered_native(class_name, name_signature).is_none() {
+            crate::vm::safepoint::poll();
+            crate::vm::gc::trigger::at_safepoint();
+            let (receiver, params) = match args.split_first() {
+                Some((receiver, params)) if !is_static => (Some(receiver.value()), params),
+                _ => (None, args),
+            };
+            let raw = direct(receiver, params);
+            #[cfg(test)]
+            crate::vm::safepoint::event(crate::vm::safepoint::Event::NativeCallReturned);
+            if JavaThread::get_pending_exception().is_some() {
+                return Ok(());
+            }
+            destination.replace(typed_slots(method_descriptor.return_type(), &raw)?);
+            crate::vm::safepoint::poll();
+            crate::vm::gc::trigger::at_safepoint();
+            return Ok(());
+        }
+    }
     let storage = build_args(args, method_descriptor.parameter_types(), is_static);
     if JavaThread::get_pending_exception().is_some() {
         return Ok(());

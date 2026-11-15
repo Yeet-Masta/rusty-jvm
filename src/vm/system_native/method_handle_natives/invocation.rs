@@ -56,7 +56,7 @@ pub(crate) fn invoke_with_call_site_type(
     }
     let type_ref =
         HEAP.get_object_field_value(handle_ref, "java/lang/invoke/MethodHandle", "type")?[0];
-    if MethodType::new(type_ref)?.descriptor()? == *call_site {
+    if MethodType::new(type_ref)?.descriptor_ref() == call_site {
         return invoke_exact(handle_ref, method_args);
     }
 

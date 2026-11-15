@@ -3,6 +3,8 @@ use crate::vm::jni::handles;
 use crate::vm::jni::java_thread::JavaThread;
 use crate::vm::jni::set_pending_internal_error;
 use crate::vm::method_area::lookup::lookup_method;
+use crate::vm::stack::slot::Slot;
+use crate::vm::stack::stack_value::StackValue;
 use crate::vm::system_native as sn;
 #[allow(unused_imports)]
 use jni_sys::{
@@ -109,6 +111,152 @@ macro_rules! jni_ret_default_impl {
     };
 }
 
+/// A built-in native called straight from the interpreter, returning its result as JVM words in
+/// pop order. On failure it records a pending exception and returns no words.
+///
+/// It takes the receiver of an instance method (`None` for a static one) apart from the other
+/// argument slots. Like the JNI wrapper, whose second parameter is the receiver or the class, an
+/// entry declared `instance` for a method the JDK declares static gets the class mirror as its
+/// receiver, and an entry declared `static` ignores any receiver.
+pub(crate) type DirectNative = fn(Option<i32>, &[Slot]) -> Vec<i32>;
+
+/// Reads a scalar argument of a JNI primitive type from the argument slots, the same way
+/// `build_args` narrows a slot for libffi.
+trait FromSlots: Sized {
+    fn take(args: &[Slot], index: &mut usize) -> Self;
+}
+
+#[inline]
+fn word(args: &[Slot], index: usize) -> i32 {
+    args.get(index).map_or(0, Slot::value)
+}
+
+#[inline]
+fn take_wide(args: &[Slot], index: &mut usize) -> u64 {
+    let low = word(args, *index) as u32;
+    let high = word(args, *index + 1) as u32;
+    *index += 2;
+    (u64::from(high) << 32) | u64::from(low)
+}
+
+macro_rules! from_one_slot {
+    ($($ty:ty => |$v:ident| $conv:expr),* $(,)?) => {
+        $(impl FromSlots for $ty {
+            #[inline]
+            fn take(args: &[Slot], index: &mut usize) -> Self {
+                let $v = word(args, *index);
+                *index += 1;
+                $conv
+            }
+        })*
+    };
+}
+
+from_one_slot! {
+    jboolean => |v| v as u8 != 0,
+    jbyte => |v| v as i8,
+    jchar => |v| v as u16,
+    jshort => |v| v as i16,
+    jint => |v| v,
+    jfloat => |v| f32::from_bits(v as u32),
+}
+
+impl FromSlots for jlong {
+    #[inline]
+    fn take(args: &[Slot], index: &mut usize) -> Self {
+        take_wide(args, index) as i64
+    }
+}
+
+impl FromSlots for jdouble {
+    #[inline]
+    fn take(args: &[Slot], index: &mut usize) -> Self {
+        f64::from_bits(take_wide(args, index))
+    }
+}
+
+#[inline]
+fn take_ref(args: &[Slot], index: &mut usize) -> i32 {
+    let reference = word(args, *index);
+    *index += 1;
+    reference
+}
+
+/// A JNI primitive return value as the JVM words libffi would have produced for it.
+trait IntoWords {
+    fn into_words(self) -> Vec<i32>;
+}
+
+macro_rules! into_one_word {
+    ($($ty:ty),* $(,)?) => {
+        $(impl IntoWords for $ty {
+            #[inline]
+            fn into_words(self) -> Vec<i32> {
+                vec![i32::from(self)]
+            }
+        })*
+    };
+}
+
+into_one_word!(jboolean, jbyte, jchar, jshort, jint);
+
+impl IntoWords for jlong {
+    fn into_words(self) -> Vec<i32> {
+        self.to_vec()
+    }
+}
+
+impl IntoWords for jfloat {
+    fn into_words(self) -> Vec<i32> {
+        self.to_vec()
+    }
+}
+
+impl IntoWords for jdouble {
+    fn into_words(self) -> Vec<i32> {
+        self.to_vec()
+    }
+}
+
+/// Reads an argument for the pure impl from the argument slots.
+macro_rules! slot_arg_impl {
+    (bool, $rust:ty, $ffi:ty, $args:expr, $index:ident) => {
+        <$ffi as FromSlots>::take($args, &mut $index) as i32 != 0
+    };
+    (int, $rust:ty, $ffi:ty, $args:expr, $index:ident) => {
+        <$ffi as FromSlots>::take($args, &mut $index) as $rust
+    };
+    (float, $rust:ty, $ffi:ty, $args:expr, $index:ident) => {
+        <$ffi as FromSlots>::take($args, &mut $index) as $rust
+    };
+    (ref, $rust:ty, $ffi:ty, $args:expr, $index:ident) => {
+        take_ref($args, &mut $index)
+    };
+    (void, $rust:ty, $ffi:ty, $args:expr, $index:ident) => {
+        compile_error!("`void` cannot be used as an argument")
+    };
+}
+
+/// Converts the pure impl's success value into JVM words.
+macro_rules! slot_ret_impl {
+    (void, $ffi:ty, $e:expr) => {{
+        let () = $e;
+        Vec::new()
+    }};
+    (bool, $ffi:ty, $e:expr) => {
+        IntoWords::into_words($e as $ffi)
+    };
+    (int, $ffi:ty, $e:expr) => {
+        IntoWords::into_words($e as $ffi)
+    };
+    (float, $ffi:ty, $e:expr) => {
+        IntoWords::into_words($e as $ffi)
+    };
+    (ref, $ffi:ty, $e:expr) => {
+        vec![$e]
+    };
+}
+
 /// Generates the five `jni_*` mapping macros from a single type table.
 ///
 /// `$dol` is the literal `$` token, threaded in so the *generated* macros can
@@ -140,6 +288,16 @@ macro_rules! jni_types {
         /// The zero/null value of the wrapper's JNI return type, used after an error.
         macro_rules! jni_ret_default {
             $( ($token) => { jni_ret_default_impl!($kind, $ffi) }; )*
+        }
+        /// Reads an argument for the pure impl from the call's argument slots.
+        macro_rules! slot_arg {
+            $( ($token, $dol args:expr, $dol index:ident) => {
+                slot_arg_impl!($kind, $rust, $ffi, $dol args, $dol index)
+            }; )*
+        }
+        /// Converts the pure impl's success value into JVM words.
+        macro_rules! slot_ret {
+            $( ($token, $dol e:expr) => { slot_ret_impl!($kind, $ffi, $dol e) }; )*
         }
     };
 }
@@ -266,6 +424,105 @@ macro_rules! builtin_wrapper {
             }
         }
     };
+}
+
+/// Generates a [`DirectNative`] that adapts the same pure impl to the interpreter's argument slots,
+/// with no JNI environment, local handles or libffi call in between.
+macro_rules! builtin_direct {
+    ($class:literal static $name:ident ( $($pname:ident : $pty:ident),* ) -> $ret:ident => $inner:path) => {
+        #[allow(non_snake_case, unused_mut, unused_variables)]
+        fn $name(_receiver: Option<i32>, args: &[Slot]) -> Vec<i32> {
+            let mut index = 0usize;
+            $(let $pname = slot_arg!($pty, args, index);)*
+            match $inner($($pname),*) {
+                Ok(__value) => slot_ret!($ret, __value),
+                Err(__error) => {
+                    set_pending_native_error(&__error);
+                    Vec::new()
+                }
+            }
+        }
+    };
+    ($class:literal instance $name:ident ( $($pname:ident : $pty:ident),* ) -> $ret:ident => $inner:path) => {
+        #[allow(non_snake_case, unused_mut, unused_variables)]
+        fn $name(receiver: Option<i32>, args: &[Slot]) -> Vec<i32> {
+            let this = match receiver.map_or_else(|| crate::vm::helper::clazz_ref($class), Ok) {
+                Ok(this) => this,
+                Err(__error) => {
+                    set_pending_native_error(&__error);
+                    return Vec::new();
+                }
+            };
+            let mut index = 0usize;
+            $(let $pname = slot_arg!($pty, args, index);)*
+            match $inner(this $(, $pname)*) {
+                Ok(__value) => slot_ret!($ret, __value),
+                Err(__error) => {
+                    set_pending_native_error(&__error);
+                    Vec::new()
+                }
+            }
+        }
+    };
+}
+
+#[cfg(test)]
+mod direct_tests {
+    use super::*;
+
+    fn direct(signature: &str) -> DirectNative {
+        find_builtin_direct(signature).expect("registered built-in")
+    }
+
+    #[test]
+    fn should_read_wide_arguments_low_word_first_and_return_pop_order() {
+        let bits = 1.5f64.to_bits();
+        let to_bits = direct("java/lang/Double:doubleToRawLongBits:(D)J");
+        let words = to_bits(
+            None,
+            &[Slot::Value(bits as i32), Slot::Value((bits >> 32) as i32)],
+        );
+        assert_eq!(words, crate::vm::helper::i64_to_vec(bits as i64));
+
+        let from_bits = direct("java/lang/Double:longBitsToDouble:(J)D");
+        let words = from_bits(
+            None,
+            &[Slot::Value(bits as i32), Slot::Value((bits >> 32) as i32)],
+        );
+        assert_eq!(words, 1.5f64.to_vec());
+    }
+
+    #[test]
+    fn should_convert_single_word_floats() {
+        let to_bits = direct("java/lang/Float:floatToRawIntBits:(F)I");
+        assert_eq!(
+            to_bits(None, &[Slot::Value(2.5f32.to_bits() as i32)]),
+            vec![2.5f32.to_bits() as i32]
+        );
+        let from_bits = direct("java/lang/Float:intBitsToFloat:(I)F");
+        assert_eq!(
+            from_bits(None, &[Slot::Value(2.5f32.to_bits() as i32)]),
+            2.5f32.to_vec()
+        );
+    }
+
+    #[test]
+    fn should_skip_the_receiver_for_an_entry_declared_static() {
+        // An entry declared static ignores a receiver the JDK's declaration passes.
+        let to_bits = direct("java/lang/Float:floatToRawIntBits:(F)I");
+        assert_eq!(
+            to_bits(Some(77), &[Slot::Value(2.5f32.to_bits() as i32)]),
+            vec![2.5f32.to_bits() as i32]
+        );
+    }
+
+    #[test]
+    fn should_register_a_direct_native_for_every_builtin() {
+        assert_eq!(BUILTIN_DIRECT_TABLE.len(), BUILTIN_NATIVE_TABLE.len());
+        for signature in BUILTIN_NATIVE_TABLE.keys() {
+            assert!(BUILTIN_DIRECT_TABLE.contains_key(signature), "{signature}");
+        }
+    }
 }
 
 #[cfg(test)]
@@ -406,6 +663,31 @@ macro_rules! builtin_natives {
             )*
             table
         });
+
+        /// The same natives as [`BUILTIN_NATIVE_TABLE`], as [`DirectNative`]s.
+        static BUILTIN_DIRECT_TABLE: LazyLock<HashMap<String, DirectNative>> =
+            LazyLock::new(|| {
+                let mut table = HashMap::new();
+                $(
+                    $(#[$gmeta])*
+                    {
+                        $(
+                            $(#[$imeta])*
+                            {
+                                builtin_direct!($class $recv $method ( $($pname : $pty),* ) -> $ret => $inner);
+                                register(
+                                    &mut table,
+                                    $class,
+                                    stringify!($method),
+                                    &build_descriptor(&[$(jni_desc_frag!($pty)),*], jni_desc_frag!($ret)),
+                                    $method as DirectNative,
+                                );
+                            }
+                        )*
+                    }
+                )*
+                table
+            });
 
         /// The declared `(class, method, descriptor)` of every built-in native, used
         /// by [`validate_builtin_natives`] to check each declaration against the real
@@ -1058,12 +1340,12 @@ fn build_descriptor(params: &[&str], ret: &str) -> String {
 /// Keys by `class:method:descriptor` rather than the JNI long C-name: the latter omits the return
 /// type, so it can't tell apart overloads that differ only in it (e.g. `fstatat0` returning `void`
 /// in JDK 25 but `int` in JDK 26).
-fn register(
-    table: &mut HashMap<String, i64>,
+fn register<T>(
+    table: &mut HashMap<String, T>,
     class_name: &str,
     method_name: &str,
     descriptor: &str,
-    address: i64,
+    address: T,
 ) {
     let key = format!("{class_name}:{method_name}:{descriptor}");
     let previous = table.insert(key, address);
@@ -1076,6 +1358,11 @@ fn register(
 /// Looks up a built-in native by its `class:method:descriptor` signature.
 pub(super) fn find_builtin_native(method_signature: &str) -> Option<i64> {
     BUILTIN_NATIVE_TABLE.get(method_signature).copied()
+}
+
+/// Looks up a built-in native's [`DirectNative`] by its `class:method:descriptor` signature.
+pub(super) fn find_builtin_direct(method_signature: &str) -> Option<DirectNative> {
+    BUILTIN_DIRECT_TABLE.get(method_signature).copied()
 }
 
 /// Built-in natives that only some of the supported JDK releases or platforms declare (added, removed, turned
