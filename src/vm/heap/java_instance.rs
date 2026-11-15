@@ -688,6 +688,13 @@ impl JavaInstance {
     }
 
     /// The words at a field position a `getfield` site has already found.
+    /// Where `class_name.field_name` is in this instance; see [`InstanceLayout::locate`].
+    ///
+    /// [`InstanceLayout::locate`]: crate::vm::gc::layout::InstanceLayout::locate
+    pub(crate) fn locate_field(&self, class_name: &str, field_name: &str) -> Option<(usize, usize)> {
+        self.get_instance().layout.locate(class_name, field_name)
+    }
+
     pub(crate) fn read_slots(&self, offset: usize, width: usize) -> Option<[i32; 2]> {
         self.get_instance().read(offset, width)
     }

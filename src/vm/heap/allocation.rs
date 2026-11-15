@@ -29,6 +29,98 @@ pub(crate) struct Reservation<'a> {
 }
 
 impl Heap {
+    /// Publishes `value` under the next key against a reserved `charge`, with `admission` held.
+    /// A failure publishes nothing and leaves the reservation in place, for its owner to cancel.
+    fn publish(
+        &self,
+        admission: &mut Admission,
+        charge: u64,
+        value: HeapValue,
+        destination: &mut RootedSlots,
+    ) -> AllocResult<i32> {
+        let recorded = value.charge()?;
+        let key = admission
+            .next
+            .filter(|key| *key > 0)
+            .ok_or(AllocError::IdentityExhausted)?;
+        // Validate all accounting before insertion. Holding the admission mutex serializes the
+        // key/insert/root triple.
+        if recorded > charge {
+            return Err(AllocError::InvalidLayout);
+        }
+        let used = admission
+            .budget
+            .used
+            .checked_add(recorded)
+            .ok_or(AllocError::Arithmetic)?;
+        let reserved = admission
+            .budget
+            .reserved
+            .checked_sub(charge)
+            .ok_or(AllocError::Arithmetic)?;
+        let total = used.checked_add(reserved).ok_or(AllocError::Arithmetic)?;
+        if admission.budget.enforced && total > admission.budget.max {
+            return Err(AllocError::Capacity);
+        }
+        let tag = match &value {
+            HeapValue::Object(instance) => super::heap::klass_tag(instance.klass_id()),
+            HeapValue::Arr(_) => super::heap::ARRAY_TAG,
+        };
+        // Rejects an occupied key before anything is published.
+        self.data.insert_tagged(key, value, recorded, tag)?;
+        admission.budget.commit(charge, recorded)?;
+        admission.next = key.checked_add(1);
+        destination.publish_single_ref(key);
+        trigger::allocated();
+        Ok(key)
+    }
+
+    /// Reserves `charge`, builds the value and publishes it in one admission critical section
+    /// instead of two. The value is built only once its charge is reserved, so a refused
+    /// allocation builds nothing. At capacity, the reservation is retried after a collection,
+    /// outside the lock, as [`Self::reserve`] does.
+    ///
+    /// `build` must not poll, call Java, park or allocate on this heap.
+    pub(crate) fn allocate_with(
+        &self,
+        charge: u64,
+        build: impl FnOnce() -> crate::vm::error::Result<HeapValue>,
+        destination: &mut RootedSlots,
+    ) -> crate::vm::error::Result<i32> {
+        trigger::before_allocation();
+        let mut admission = self.admission.lock();
+        let mut reserved = self.try_reserve_locked(&mut admission, charge);
+        if matches!(reserved, Err(AllocError::Capacity)) && trigger::enabled() {
+            drop(admission);
+            collector::collect(collector::Cause::Pressure);
+            admission = self.admission.lock();
+            reserved = self.try_reserve_locked(&mut admission, charge);
+        }
+        reserved?;
+        // The debit is reserved from here on: every failure cancels it before returning.
+        let published = build().and_then(|value| {
+            Ok(self.publish(&mut admission, charge, value, destination)?)
+        });
+        if published.is_err() {
+            admission
+                .budget
+                .cancel(charge)
+                .expect("a live reservation owns its exact reserved debit");
+        }
+        published
+    }
+
+    fn try_reserve_locked(&self, admission: &mut Admission, charge: u64) -> AllocResult<()> {
+        let key = admission
+            .next
+            .filter(|key| *key > 0)
+            .ok_or(AllocError::IdentityExhausted)?;
+        if self.data.contains_key(key) {
+            return Err(AllocError::IdentityExhausted);
+        }
+        admission.budget.reserve(charge)
+    }
+
     pub(crate) fn reserve(&self, charge: u64) -> AllocResult<Reservation<'_>> {
         trigger::before_allocation();
         match self.try_reserve(charge) {
@@ -44,14 +136,7 @@ impl Heap {
 
     fn try_reserve(&self, charge: u64) -> AllocResult<Reservation<'_>> {
         let mut admission = self.admission.lock();
-        let key = admission
-            .next
-            .filter(|key| *key > 0)
-            .ok_or(AllocError::IdentityExhausted)?;
-        if self.data.contains_key(key) {
-            return Err(AllocError::IdentityExhausted);
-        }
-        admission.budget.reserve(charge)?;
+        self.try_reserve_locked(&mut admission, charge)?;
         Ok(Reservation {
             heap: self,
             charge,
@@ -148,41 +233,15 @@ impl Reservation<'_> {
         value: HeapValue,
         destination: &mut RootedSlots,
     ) -> AllocResult<i32> {
-        let recorded = value.charge()?;
         let mut admission = self.heap.admission.lock();
-        let key = admission
-            .next
-            .filter(|key| *key > 0)
-            .ok_or(AllocError::IdentityExhausted)?;
-        // Validate all accounting before insertion; a failed commit leaves the reservation
-        // live for Drop to cancel. Holding this mutex serializes the key/insert/root pair.
-        if recorded > self.charge {
-            return Err(AllocError::InvalidLayout);
-        }
-        let used = admission
-            .budget
-            .used
-            .checked_add(recorded)
-            .ok_or(AllocError::Arithmetic)?;
-        let reserved = admission
-            .budget
-            .reserved
-            .checked_sub(self.charge)
-            .ok_or(AllocError::Arithmetic)?;
-        let total = used.checked_add(reserved).ok_or(AllocError::Arithmetic)?;
-        if admission.budget.enforced && total > admission.budget.max {
-            return Err(AllocError::Capacity);
-        }
-        // Rejects an occupied key before anything is published.
-        self.heap.data.insert_checked(key, value, recorded)?;
-        admission.budget.commit(self.charge, recorded)?;
-        admission.next = key.checked_add(1);
-        destination.publish_single_ref(key);
+        let key = self
+            .heap
+            .publish(&mut admission, self.charge, value, destination)?;
         self.active = false;
-        trigger::allocated();
         Ok(key)
     }
 
+    #[cfg(test)]
     pub(crate) fn cancel(mut self) -> AllocResult<()> {
         self.heap.admission.lock().budget.cancel(self.charge)?;
         self.active = false;

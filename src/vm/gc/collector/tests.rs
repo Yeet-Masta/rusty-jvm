@@ -547,7 +547,7 @@ fn gc_collect_scratch_high_water_tracks_current_objects_not_lifetime_keys() {
         assert_eq!(stats.before, 129);
         assert_eq!(stats.live, 1);
         assert_eq!(
-            allocations, 4,
+            allocations, 3,
             "only preflight allocates, not trace or sweep"
         );
         assert!(bytes <= stats.scratch_bytes);

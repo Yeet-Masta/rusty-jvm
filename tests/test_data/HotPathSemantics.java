@@ -29,6 +29,7 @@ public class HotPathSemantics {
         arrayStores();
         arrayCopies();
         constructors();
+        intrinsics();
     }
 
     static void getters() {
@@ -146,5 +147,37 @@ public class HotPathSemantics {
             }
         }
         System.out.println("constructors " + sum + " " + made + " " + empties);
+    }
+
+    static int manualHash(String s) {
+        int h = 0;
+        for (char c : s.toCharArray()) {
+            h = 31 * h + c;
+        }
+        return h;
+    }
+
+    // String.hashCode, String.length and Integer.valueOf run natively once warm.
+    static void intrinsics() {
+        String[] samples = {"", "hello", "f5a5a608", "polygenelubricants", "héllo", "世界🌍"};
+        boolean hashes = true;
+        boolean lengths = true;
+        for (int round = 0; round < 200; round++) {
+            for (String s : samples) {
+                String copy = new String(s.toCharArray());
+                hashes &= copy.hashCode() == manualHash(s) && copy.hashCode() == manualHash(s);
+                lengths &= copy.length() == s.toCharArray().length;
+            }
+        }
+        boolean values = true;
+        boolean identities = true;
+        for (int i = -300; i < 300; i++) {
+            Integer a = Integer.valueOf(i);
+            Integer b = Integer.valueOf(i);
+            values &= a.intValue() == i && a.equals(b);
+            identities &= (a == b) == (i >= -128 && i <= 127);
+        }
+        System.out.println("intrinsics " + hashes + " " + lengths + " " + values + " " + identities
+                + " " + "polygenelubricants".hashCode());
     }
 }

@@ -3,12 +3,10 @@ use super::budget::AllocError;
 use super::pending::{PendingList, PENDING};
 use super::references::{Kind, Reference};
 use super::{roots, trigger};
-use crate::vm::commons::fast_hash::FastBuildHasher;
 use crate::vm::error::Result;
 use crate::vm::heap::heap::{Heap, HEAP};
 use crate::vm::jni::{handles, java_thread::JavaThread};
 use crate::vm::safepoint::{self, Operation, COORDINATOR};
-use std::collections::HashSet;
 use std::mem::size_of;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -28,8 +26,10 @@ pub(crate) struct Stats {
     pub(crate) scratch_bytes: usize,
 }
 
+/// A collection's marking state. The marks themselves are bits in the heap's object table, so
+/// marking allocates nothing past the work list.
 struct Trace {
-    marked: HashSet<i32, FastBuildHasher>,
+    marked: usize,
     work: Vec<i32>,
     references: Vec<Reference>,
     limit: usize,
@@ -38,15 +38,11 @@ struct Trace {
 impl Trace {
     fn new(limit: usize) -> Result<Self> {
         let mut trace = Self {
-            marked: HashSet::default(),
+            marked: 0,
             work: Vec::new(),
             references: Vec::new(),
             limit,
         };
-        trace
-            .marked
-            .try_reserve(limit)
-            .map_err(|_| AllocError::HostAllocation)?;
         trace
             .work
             .try_reserve_exact(limit)
@@ -58,32 +54,37 @@ impl Trace {
         Ok(trace)
     }
 
-    fn mark(&mut self, reference: i32) -> Result<()> {
-        if reference == 0 || self.marked.contains(&reference) {
+    fn mark(&mut self, heap: &Heap, reference: i32) -> Result<()> {
+        if reference == 0 {
             return Ok(());
         }
-        // Even corrupted edges cannot grow scratch past preflight. Each valid
-        // object enters the worklist once, irrespective of edge count or key age.
-        if reference < 0 || self.marked.len() == self.limit {
-            return Err(AllocError::InvalidLayout.into());
+        // An edge to no object is corrupt. Even corrupted edges cannot grow scratch past
+        // preflight: each valid object enters the worklist once, irrespective of edge count or
+        // key age.
+        match heap.mark(reference) {
+            None => Err(AllocError::InvalidLayout.into()),
+            Some(false) => Ok(()),
+            Some(true) if self.marked == self.limit => Err(AllocError::InvalidLayout.into()),
+            Some(true) => {
+                self.marked += 1;
+                self.work.push(reference);
+                Ok(())
+            }
         }
-        self.marked.insert(reference);
-        self.work.push(reference);
-        Ok(())
     }
 
     fn close(&mut self, heap: &Heap, pressure: bool) -> Result<()> {
         while let Some(object) = self.work.pop() {
-            let reference = heap.trace_edges(object, |edge| self.mark(edge))?;
+            let reference = heap.trace_edges(object, |edge| self.mark(heap, edge))?;
             if let Some(reference) = reference {
                 if reference.referent != 0 && !heap.contains(reference.referent) {
                     return Err(AllocError::InvalidLayout.into());
                 }
                 match reference.kind {
-                    Kind::Soft if !pressure => self.mark(reference.referent)?,
+                    Kind::Soft if !pressure => self.mark(heap, reference.referent)?,
                     // Finalization is disabled. Never discover a FinalReference,
                     // or free a referent that Java could still read through one.
-                    Kind::Final | Kind::Other => self.mark(reference.referent)?,
+                    Kind::Final | Kind::Other => self.mark(heap, reference.referent)?,
                     Kind::Soft | Kind::Weak | Kind::Phantom => {}
                 }
                 self.references.push(reference);
@@ -95,16 +96,7 @@ impl Trace {
     }
 
     fn scratch_bytes(&self) -> usize {
-        // HashSet exposes element capacity, not bucket bytes. Report a conservative
-        // bucket/control-byte bound; tests also measure actual allocator requests.
-        let hash_bytes = self
-            .marked
-            .capacity()
-            .saturating_mul(2)
-            .saturating_add(16)
-            .saturating_mul(size_of::<i32>() + 1);
-        hash_bytes
-            + self.work.capacity() * size_of::<i32>()
+        self.work.capacity() * size_of::<i32>()
             + self.references.capacity() * size_of::<Reference>()
     }
 }
@@ -164,24 +156,28 @@ pub(crate) fn collect_snapshot(
     _operation: &Operation,
 ) -> Result<Stats> {
     heap.free_retired_chunks();
+    // Marks left by a skipped cycle must not keep anything alive; the guard clears this cycle's
+    // marks however it ends.
+    heap.clear_marks();
+    let _marks = ClearMarks(heap);
     let entries = heap.collection_entries()?;
     let mut trace = Trace::new(entries.len())?;
     let mut pending_head = pending.for_collection()?;
     for &root in snapshot {
-        trace.mark(root)?;
+        trace.mark(heap, root)?;
     }
     trace.close(heap, cause == Cause::Pressure)?;
     // Marking has checked every live ID under its heap guard. Check the remaining
     // entries before any mutation, rather than acquiring every live shard twice.
     for &(reference, _) in &entries {
-        if !trace.marked.contains(&reference) && !heap.contains(reference) {
+        if !heap.is_marked(reference) && !heap.contains(reference) {
             return Err(AllocError::InvalidLayout.into());
         }
     }
 
     trace.references.retain(|reference| {
         reference.active()
-            && !trace.marked.contains(&reference.referent)
+            && !heap.is_marked(reference.referent)
             && matches!(reference.kind, Kind::Soft | Kind::Weak | Kind::Phantom)
     });
     // The trace read both links of every discovered reference; check that both can be written.
@@ -193,7 +189,7 @@ pub(crate) fn collect_snapshot(
     // the collector fails closed from here on: nothing below can be skipped half-done.
     // Nothing below allocates scratch or takes admission while a heap guard lives.
     // Weak JNI identities survive; only their target is cleared.
-    handles::clear_weak_references(|reference| trace.marked.contains(&reference));
+    handles::clear_weak_references(|reference| heap.is_marked(reference));
     for reference in &trace.references {
         validated(
             heap.set_reference_link(reference.object, "referent", 0),
@@ -206,21 +202,30 @@ pub(crate) fn collect_snapshot(
         *pending_head = reference.object;
     }
     let reclaimed = validated(
-        heap.sweep(&entries, |reference| trace.marked.contains(&reference))
+        heap.sweep(&entries, |reference| heap.is_marked(reference))
             .map_err(Into::into),
         "sweeping",
     );
-    crate::vm::monitor::prune_idle(|reference| trace.marked.contains(&reference));
+    crate::vm::monitor::prune_idle(|reference| heap.is_marked(reference));
     if !trace.references.is_empty() {
         pending.notify();
     }
     Ok(Stats {
         before: entries.len(),
-        live: trace.marked.len(),
+        live: trace.marked,
         reclaimed,
         discovered: trace.references.len(),
         scratch_bytes: trace.scratch_bytes() + entries.capacity() * size_of::<(i32, u64)>(),
     })
+}
+
+/// Clears the heap's marks when dropped, so no collection leaves any behind.
+struct ClearMarks<'a>(&'a Heap);
+
+impl Drop for ClearMarks<'_> {
+    fn drop(&mut self) {
+        self.0.clear_marks();
+    }
 }
 
 /// Unwraps a mutation whose preconditions the collector has already validated.

@@ -65,6 +65,16 @@ impl Default for Heap {
     }
 }
 
+/// An array's object-table tag. An instance's is its class id plus one (see [`klass_tag`]).
+pub(super) const ARRAY_TAG: usize = 0;
+/// The tag of an instance whose class id has no tag of its own; its class is read from the object.
+const UNTAGGED: usize = usize::MAX;
+
+/// The object-table tag of an instance of class `klass_id`.
+pub(super) fn klass_tag(klass_id: usize) -> usize {
+    klass_id.checked_add(1).unwrap_or(UNTAGGED)
+}
+
 impl Heap {
     /// Read outgoing edges under one heap guard, then release it before the caller
     /// follows any edge. Only call while mutators are quiescent.
@@ -95,9 +105,8 @@ impl Heap {
         destination: &mut RootedSlots,
     ) -> Result<i32> {
         destination.prepare_single_ref()?;
-        let reservation = self.reserve(plan.charge()?)?;
-        let instance = plan.build()?;
-        Ok(reservation.commit(Object(instance), destination)?)
+        let charge = plan.charge()?;
+        self.allocate_with(charge, || Ok(Object(plan.build()?)), destination)
     }
 
     pub fn set_object_field_value(
@@ -128,6 +137,20 @@ impl Heap {
     /// Reads a field at a position its site has already found, or `None` if `objectref` is not a
     /// plain object or has no such slot.
     #[inline]
+    /// Where the field `class_name.field_name` is in the instance `objectref`: the offset of
+    /// its first word and its width.
+    pub(crate) fn locate_field(
+        &self,
+        objectref: i32,
+        class_name: &str,
+        field_name: &str,
+    ) -> Option<(usize, usize)> {
+        match self.data.get(objectref).as_deref() {
+            Some(Object(instance)) => instance.locate_field(class_name, field_name),
+            _ => None,
+        }
+    }
+
     pub(crate) fn read_field_at(
         &self,
         objectref: i32,
@@ -295,16 +318,26 @@ impl Heap {
 
     /// The class id of a non-array object, or `None` for an array. Unlike `get_instance_name` this
     /// neither resolves the class nor allocates, so call sites can use it as an inline-cache key.
+    /// The class of an instance, or `None` for an array: the tag its allocation recorded, read
+    /// without the object's lock (an object's class never changes).
+    #[inline]
     pub(crate) fn instance_klass_id(&self, objectref: i32) -> Result<Option<usize>> {
-        let entry = self.data.get(objectref).ok_or_else(|| {
+        let missing = || {
             Error::new_execution(&format!(
                 "error getting object from heap by ref {objectref}"
             ))
-        })?;
-        Ok(match entry.value() {
-            Object(java_instance) => Some(java_instance.klass_id()),
-            Arr(_) => None,
-        })
+        };
+        match self.data.tag(objectref).ok_or_else(missing)? {
+            ARRAY_TAG => Ok(None),
+            UNTAGGED => {
+                let entry = self.data.get(objectref).ok_or_else(missing)?;
+                Ok(match entry.value() {
+                    Object(java_instance) => Some(java_instance.klass_id()),
+                    Arr(_) => None,
+                })
+            }
+            tag => Ok(Some(tag - 1)),
+        }
     }
 
     pub fn get_instance_name(&self, objectref: i32) -> Result<String> {
@@ -345,15 +378,11 @@ impl Heap {
     ) -> Result<i32> {
         let layout = ArrayLayout::new(type_name, len)?;
         destination.prepare_single_ref()?;
-        let reservation = self.reserve(layout.charge(type_name)?)?;
-        let array = match Array::from_layout(type_name, layout) {
-            Ok(array) => array,
-            Err(error) => {
-                reservation.cancel()?;
-                return Err(error.into());
-            }
-        };
-        let reference = reservation.commit(Arr(array), destination)?;
+        let reference = self.allocate_with(
+            layout.charge(type_name)?,
+            || Ok(Arr(Array::from_layout(type_name, layout)?)),
+            destination,
+        )?;
         #[cfg(test)]
         observe_array_commit(reference);
         Ok(reference)
@@ -375,8 +404,11 @@ impl Heap {
             None
         };
         destination.prepare_single_ref()?;
-        let reservation = self.reserve(layout.charge(type_name)?)?;
-        Ok(reservation.commit(Arr(Array::new_with_values(type_name, array)?), destination)?)
+        self.allocate_with(
+            layout.charge(type_name)?,
+            || Ok(Arr(Array::new_with_values(type_name, array)?)),
+            destination,
+        )
     }
 
     /// Creates a `byte[]` holding a copy of `bytes`, published into `destination`.

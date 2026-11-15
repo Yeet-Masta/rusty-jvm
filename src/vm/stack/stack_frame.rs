@@ -1,7 +1,6 @@
 use crate::vm::error::{Error, Result};
 use crate::vm::method_area::instance_checker::InstanceChecker;
 use crate::vm::stack::slot::Slot;
-use crate::vm::stack::stack::Stack;
 use crate::vm::stack::stack_value::StackValue;
 use derive_new::new;
 use jclassmodel::exception_table::ExceptionTableRecord;
@@ -30,8 +29,12 @@ pub(crate) struct StackFrame {
     bci: usize,
     /// Stores the current program counter (pc) in `ex_pc` before invoking a method. This value is later used as the current `pc` if an exception is thrown.
     ex_pc: Option<usize>,
-    locals: Box<[Slot]>,
-    operand_stack: Stack<Slot>,
+    /// The frame's locals, then its operand stack: one allocation per frame.
+    slots: Box<[Slot]>,
+    /// How many of `slots` are locals; the rest are the operand stack's.
+    max_locals: usize,
+    /// How many operand-stack slots are in use.
+    stack_len: usize,
     synchronized_method: bool,
     synchronized_static: bool,
     synchronized_monitor: Option<i32>,
@@ -66,6 +69,9 @@ pub(crate) struct FrameCode {
     /// own class (invokes, field access, `ldc`) then skip the by-name registry lookup, in every
     /// frame of the method.
     pub(crate) klass: ClassCache,
+    /// The method these frames run, when the frames were built from it (as every frame the VM
+    /// runs is); stack traces then find it without a by-name lookup.
+    pub(crate) method: Option<&'static crate::vm::method_area::java_method::JavaMethod>,
 }
 
 impl ClassCache {
@@ -86,6 +92,7 @@ impl FrameCode {
             line_numbers: Arc::new(BTreeMap::new()),
             exception_table: Arc::new(ExceptionTable::new(Vec::new())),
             klass: ClassCache::default(),
+            method: None,
         }
     }
 }
@@ -196,6 +203,23 @@ impl StackFrames {
         self.frames.push(frame);
     }
 
+    /// Pushes `callee` and moves the caller's top `args` operand-stack slots into its first
+    /// locals. The frame goes onto the stack first, so it is not copied again once filled.
+    pub(crate) fn call(&mut self, callee: StackFrame, args: usize) -> Result<()> {
+        if self.frames.is_empty() {
+            return Err(Error::new_execution("Error getting stack frame"));
+        }
+        self.frames.push(callee);
+        let [.., caller, callee] = self.frames.as_mut_slice() else {
+            unreachable!("a caller and the callee just pushed");
+        };
+        let moved = caller.move_args_into(args, callee);
+        if moved.is_err() {
+            self.frames.pop();
+        }
+        moved
+    }
+
     /// Pops the top stack frame from the stack frames and returns it.
     /// Resets the exception program counter (ex_pc) of the next frame if it exists since it is normal stack unwinding.
     pub fn exit_frame(&mut self) -> (Option<StackFrame>, bool) {
@@ -287,33 +311,58 @@ impl StackFrame {
                 line_numbers,
                 exception_table,
                 klass: ClassCache::default(),
+                method: None,
             })),
             locals_size,
             stack_size,
         )
     }
 
+    #[inline]
+    fn locals(&self) -> &[Slot] {
+        &self.slots[..self.max_locals]
+    }
+
+    #[inline]
+    fn locals_mut(&mut self) -> &mut [Slot] {
+        &mut self.slots[..self.max_locals]
+    }
+
+    /// The operand-stack slots in use, bottom first.
+    #[inline]
+    fn stack(&self) -> &[Slot] {
+        &self.slots[self.max_locals..self.max_locals + self.stack_len]
+    }
+
+    #[inline]
+    fn max_stack(&self) -> usize {
+        self.slots.len() - self.max_locals
+    }
+
     /// The top `count` operand-stack slots, deepest first: a call's arguments in order.
     pub(crate) fn top_slots(&self, count: usize) -> Result<&[Slot]> {
-        self.operand_stack
-            .top(count)
+        let stack = self.stack();
+        stack
+            .len()
+            .checked_sub(count)
+            .map(|start| &stack[start..])
             .ok_or_else(|| Error::new_execution("Operand stack holds fewer slots than the call"))
     }
 
-    /// Discards the top `count` operand-stack slots.
+    /// Discards the top `count` operand-stack slots, or all of them if there are fewer.
     pub(crate) fn drop_top_slots(&mut self, count: usize) {
-        self.operand_stack.drop_top(count);
+        self.stack_len = self.stack_len.saturating_sub(count);
     }
 
     /// Moves the top `count` operand-stack slots into the first locals of `callee`, in order.
     pub(crate) fn move_args_into(&mut self, count: usize, callee: &mut StackFrame) -> Result<()> {
         let args = self.top_slots(count)?;
         let locals = callee
-            .locals
+            .locals_mut()
             .get_mut(..count)
             .ok_or_else(|| Error::new_execution("Callee has fewer locals than arguments"))?;
         locals.copy_from_slice(args);
-        self.operand_stack.drop_top(count);
+        self.drop_top_slots(count);
         Ok(())
     }
 
@@ -328,8 +377,9 @@ impl StackFrame {
             pc: 0,
             bci: 0,
             ex_pc: None,
-            locals: vec![Slot::Value(0); locals_size].into_boxed_slice(),
-            operand_stack: Stack::with_capacity(stack_size),
+            slots: vec![Slot::Value(0); locals_size + stack_size].into_boxed_slice(),
+            max_locals: locals_size,
+            stack_len: 0,
             synchronized_method: false,
             synchronized_static: false,
             synchronized_monitor: None,
@@ -383,8 +433,9 @@ impl StackFrame {
             pc: 0,
             bci: 0,
             ex_pc: None,
-            locals: args.into_boxed_slice(),
-            operand_stack: Stack::with_capacity(0),
+            max_locals: args.len(),
+            slots: args.into_boxed_slice(),
+            stack_len: 0,
             synchronized_method: false,
             synchronized_static: false,
             synchronized_monitor: None,
@@ -548,7 +599,7 @@ impl StackFrame {
     }
 
     pub fn clear_stack(&mut self) {
-        self.operand_stack.clear()
+        self.stack_len = 0;
     }
 
     pub fn push<T: StackValue>(&mut self, stack_value: T) -> Result<()> {
@@ -580,15 +631,20 @@ impl StackFrame {
     /// type they do not know (`dup`, `swap`, ...) push a `Slot` for exactly that reason — going
     /// through `push_raw` would strip the reference tag off every value they touch.
     pub(crate) fn push_slot(&mut self, slot: Slot) -> Result<()> {
-        self.operand_stack
-            .push(slot)
-            .map_err(|e| Error::new_execution(&e))
+        if self.stack_len >= self.max_stack() {
+            return Err(Error::new_execution("Exceeded max stack size"));
+        }
+        self.slots[self.max_locals + self.stack_len] = slot;
+        self.stack_len += 1;
+        Ok(())
     }
 
     /// Pops a slot with its tag intact; the counterpart of [`Self::push_slot`], and likewise
     /// reached through [`Self::pop`] rather than called directly.
     pub(crate) fn pop_slot(&mut self) -> Slot {
-        self.operand_stack.pop().expect("Empty stack")
+        assert!(self.stack_len > 0, "Empty stack");
+        self.stack_len -= 1;
+        self.slots[self.max_locals + self.stack_len]
     }
 
     pub fn set_local<T: StackValue>(&mut self, index: usize, stack_value: T) {
@@ -601,7 +657,7 @@ impl StackFrame {
 
     /// Stores non-reference bits in a local. See [`Self::push_raw`].
     pub fn set_local_raw(&mut self, index: usize, val: i32) {
-        self.locals[index] = Slot::Value(val);
+        self.locals_mut()[index] = Slot::Value(val);
     }
 
     pub fn get_local_raw(&self, index: usize) -> i32 {
@@ -611,7 +667,7 @@ impl StackFrame {
     /// Stores a local with its tag intact; the locals counterpart of [`Self::push_slot`], reached
     /// through [`Self::set_local`].
     pub(crate) fn set_local_slot(&mut self, index: usize, slot: Slot) {
-        self.locals[index] = slot;
+        self.locals_mut()[index] = slot;
     }
 
     pub(crate) fn set_synchronized_method(&mut self, synchronized: bool, is_static: bool) {
@@ -651,7 +707,7 @@ impl StackFrame {
     /// Reads a local with its tag intact; the counterpart of [`Self::set_local_slot`], reached
     /// through [`Self::get_local`].
     pub(crate) fn get_local_slot(&self, index: usize) -> Slot {
-        *self.locals.get(index).expect("No value at index")
+        *self.locals().get(index).expect("No value at index")
     }
 
     /// Every heap reference this frame holds, including its synchronized-method monitor — the
@@ -660,9 +716,9 @@ impl StackFrame {
     /// Only slots the interpreter tagged are reported, so an `int` that happens to equal a live
     /// reference is not mistaken for one.
     pub(crate) fn ref_slots(&self) -> impl Iterator<Item = i32> + '_ {
-        self.locals
+        // Slots past the operand stack's top are stale, not roots.
+        self.slots[..self.max_locals + self.stack_len]
             .iter()
-            .chain(self.operand_stack.iter())
             .filter(|slot| slot.is_ref())
             .map(|slot| slot.value())
             .chain(self.synchronized_monitor)
@@ -680,6 +736,11 @@ impl StackFrame {
         &self.code.method_name
     }
 
+    /// The frame's shared, immortal metadata.
+    pub(crate) fn frame_code(&self) -> &'static FrameCode {
+        self.code
+    }
+
     pub(crate) fn method_name_arc(&self) -> Arc<String> {
         Arc::clone(&self.code.method_name)
     }
@@ -694,12 +755,13 @@ impl Display for StackFrame {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            r#"StackFrame {{ method_name: "{}", pc: {}, ex_pc: {:?}, locals: {:?}, operand_stack: {:?}, bytecode_ref: {:?}, current_class_name: "{}", line_numbers: {:?}, exception_table: {:?} }}"#,
+            r#"StackFrame {{ method_name: "{}", pc: {}, ex_pc: {:?}, locals: {:?}, operand_stack: Stack {{ max_size: {}, data: {:?} }}, bytecode_ref: {:?}, current_class_name: "{}", line_numbers: {:?}, exception_table: {:?} }}"#,
             self.code.method_name,
             self.pc,
             self.ex_pc,
-            self.locals,
-            self.operand_stack,
+            self.locals(),
+            self.max_stack(),
+            self.stack(),
             self.code.bytecode,
             self.code.class_name,
             self.code.line_numbers,

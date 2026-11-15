@@ -57,10 +57,71 @@ fn resolved_static_field<'a>(
         .then_some(field)
 }
 
+/// A frame's operand stack as the frame-local loop works it: the frame's slots past its locals,
+/// the first `top` of them in use. It reads as the slice of those in use.
+pub(super) struct OpStack<'a> {
+    buf: &'a mut [Slot],
+    top: usize,
+}
+
+impl OpStack<'_> {
+    /// Pushes a slot. The loop checks for room first; past it, this panics rather than overflow.
+    #[inline(always)]
+    fn push(&mut self, slot: Slot) {
+        self.buf[self.top] = slot;
+        self.top += 1;
+    }
+
+    #[inline(always)]
+    fn pop(&mut self) -> Option<Slot> {
+        self.top = self.top.checked_sub(1)?;
+        Some(self.buf[self.top])
+    }
+
+    /// Keeps the bottom `len` slots, if there are more.
+    #[inline(always)]
+    fn truncate(&mut self, len: usize) {
+        self.top = self.top.min(len);
+    }
+
+    /// Inserts a slot at `at`, moving those above it up one.
+    #[inline(always)]
+    fn insert(&mut self, at: usize, slot: Slot) {
+        assert!(at <= self.top);
+        self.buf.copy_within(at..self.top, at + 1);
+        self.buf[at] = slot;
+        self.top += 1;
+    }
+
+    /// Inserts two slots at `at`, moving those above them up two.
+    #[inline(always)]
+    fn insert_two(&mut self, at: usize, slots: [Slot; 2]) {
+        assert!(at <= self.top);
+        self.buf.copy_within(at..self.top, at + 2);
+        self.buf[at..at + 2].copy_from_slice(&slots);
+        self.top += 2;
+    }
+}
+
+impl std::ops::Deref for OpStack<'_> {
+    type Target = [Slot];
+    #[inline(always)]
+    fn deref(&self) -> &[Slot] {
+        &self.buf[..self.top]
+    }
+}
+
+impl std::ops::DerefMut for OpStack<'_> {
+    #[inline(always)]
+    fn deref_mut(&mut self) -> &mut [Slot] {
+        &mut self.buf[..self.top]
+    }
+}
+
 /// Pushes field or array words as their handlers do: a wide value low word first, a reference
 /// tagged.
 #[inline(always)]
-fn push_words(stack: &mut Vec<Slot>, words: [i32; 2], wide: bool, reference: bool) {
+fn push_words(stack: &mut OpStack<'_>, words: [i32; 2], wide: bool, reference: bool) {
     if wide {
         stack.push(Slot::Value(words[1]));
         stack.push(Slot::Value(words[0]));
@@ -107,29 +168,29 @@ fn peek(stack: &[Slot], depth: usize) -> Option<i32> {
 }
 
 #[inline(always)]
-fn pop(stack: &mut Vec<Slot>) -> i32 {
+fn pop(stack: &mut OpStack<'_>) -> i32 {
     stack.pop().expect("Empty stack").value()
 }
 
 #[inline(always)]
-fn pop_slot(stack: &mut Vec<Slot>) -> Slot {
+fn pop_slot(stack: &mut OpStack<'_>) -> Slot {
     stack.pop().expect("Empty stack")
 }
 
 #[inline(always)]
-fn pop_long(stack: &mut Vec<Slot>) -> i64 {
+fn pop_long(stack: &mut OpStack<'_>) -> i64 {
     let high = pop(stack);
     let low = pop(stack);
     (i64::from(high) << 32) | i64::from(low as u32)
 }
 
 #[inline(always)]
-fn push(stack: &mut Vec<Slot>, value: i32) {
+fn push(stack: &mut OpStack<'_>, value: i32) {
     stack.push(Slot::Value(value));
 }
 
 #[inline(always)]
-fn push_long(stack: &mut Vec<Slot>, value: i64) {
+fn push_long(stack: &mut OpStack<'_>, value: i64) {
     stack.push(Slot::Value(value as i32));
     stack.push(Slot::Value((value >> 32) as i32));
 }
@@ -162,11 +223,17 @@ impl StackFrame {
     /// an invoke or return may still be done without the interpreter loop (see
     /// `frame_local_calls`).
     pub(crate) fn run_frame_local(&mut self, budget: u32) -> (u32, FrameLocalStop) {
-        let code: &[u8] = &self.code.bytecode;
-        let klass: Option<&JavaClass> = self.code.klass.0.get().map(|klass| &**klass);
-        let locals: &mut [Slot] = &mut self.locals;
-        let (stack, max_stack) = self.operand_stack.parts();
+        let frame_code: &'static super::FrameCode = self.code;
+        let code: &[u8] = &frame_code.bytecode;
+        let klass: Option<&JavaClass> = frame_code.klass.0.get().map(|klass| &**klass);
         let mut pc = self.pc;
+        let (locals, rest) = self.slots.split_at_mut(self.max_locals);
+        let max_stack = rest.len();
+        let mut operand_stack = OpStack {
+            buf: rest,
+            top: self.stack_len,
+        };
+        let stack = &mut operand_stack;
         let mut done = 0u32;
         let mut stop = FrameLocalStop::Other;
 
@@ -429,7 +496,7 @@ impl StackFrame {
                         break;
                     };
                     let (value2, value1) = (stack[at + 1], stack[at + 2]);
-                    stack.splice(at..at, [value2, value1]);
+                    stack.insert_two(at, [value2, value1]);
                     pc += 1;
                 }
                 // dup2_x2: the top two slots copied below the two under them (every form)
@@ -439,7 +506,7 @@ impl StackFrame {
                         break;
                     };
                     let (value2, value1) = (stack[at + 2], stack[at + 3]);
-                    stack.splice(at..at, [value2, value1]);
+                    stack.insert_two(at, [value2, value1]);
                     pc += 1;
                 }
                 // swap
@@ -948,6 +1015,8 @@ impl StackFrame {
             done += 1;
         }
 
+        let top = operand_stack.top;
+        self.stack_len = top;
         self.pc = pc;
         (done, stop)
     }

@@ -60,7 +60,22 @@ impl Engine {
                 if !tracing {
                     // Instructions that only touch the frame run in a loop of their own; the
                     // rest of this iteration handles the instruction that loop stopped at.
-                    let ran = frame_local_calls::run(&mut stack_frames, FRAME_LOCAL_RUN)?;
+                    // A Java exception raised by a call done there (an intrinsic's allocation
+                    // running out of memory, say) is thrown from the calling frame, as from a
+                    // handler.
+                    let ran = match frame_local_calls::run(&mut stack_frames, FRAME_LOCAL_RUN) {
+                        Ok(ran) => ran,
+                        Err(error) => match error.throwable_ref() {
+                            Some(throwable) => {
+                                crate::vm::exception::common::throw_exception_with_ref(
+                                    crate::vm::stack::slot::Slot::Ref(throwable),
+                                    &mut stack_frames,
+                                )?;
+                                continue;
+                            }
+                            None => return Err(error),
+                        },
+                    };
                     if ran > 0 {
                         safepoint::dispatch_bytecodes(ran);
                     }

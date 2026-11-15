@@ -42,6 +42,11 @@ pub(crate) fn invoke_interpreted(
     let ref_chunks = java_method.arg_ref_chunks()?;
     let count = ref_chunks.len();
     validate_arg_slots(ref_chunks, last_frame_mut(stack_frames)?.top_slots(count)?)?;
+    if let Some(intrinsic) = java_method.intrinsic() {
+        if crate::vm::execution_engine::intrinsics::run(stack_frames, intrinsic)? {
+            return Ok(true);
+        }
+    }
     if count == 1 {
         if let Some(index) = java_method.accessor_field_index() {
             if run_accessor(stack_frames, java_method, index)? {
@@ -63,9 +68,7 @@ pub(crate) fn invoke_interpreted(
         stack_limit::throw_stack_overflow(stack_frames)?;
         return Ok(true);
     }
-    let mut next_frame = java_method.new_stack_frame()?;
-    last_frame_mut(stack_frames)?.move_args_into(count, &mut next_frame)?;
-    stack_frames.new_frame(next_frame);
+    stack_frames.call(java_method.new_stack_frame()?, count)?;
     Ok(true)
 }
 

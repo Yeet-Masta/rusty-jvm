@@ -1,3 +1,4 @@
+use crate::vm::stack::stack_frame::FrameCode;
 use crate::vm::error::{Error, Result};
 use crate::vm::heap::heap::HEAP;
 use crate::vm::jni::java_thread::JavaThread;
@@ -129,8 +130,7 @@ impl StackFramesUtil {
             let newest_to_oldest: Vec<_> = frames
                 .map(|frame| {
                     (
-                        frame.current_class_name_arc(),
-                        frame.method_name_arc(),
+                        frame.frame_code(),
                         Self::extract_line_number(frame.line_numbers(), frame.ex_pc()),
                         frame.bci() as u16,
                     )
@@ -150,8 +150,9 @@ impl StackFramesUtil {
             let after_fill = newest_to_oldest
                 .iter()
                 .position(|frame| {
-                    let name = frame.1.split(':').next();
-                    !(frame.0.as_str() == "java/lang/Throwable" && name == Some("fillInStackTrace"))
+                    let name = frame.0.method_name.split(':').next();
+                    !(frame.0.class_name.as_str() == "java/lang/Throwable"
+                        && name == Some("fillInStackTrace"))
                 })
                 .unwrap_or(newest_to_oldest.len());
 
@@ -160,7 +161,7 @@ impl StackFramesUtil {
             let eligible: Vec<_> = newest_to_oldest[after_fill..]
                 .iter()
                 .rev()
-                .take_while(|frame| frame.0.as_str() != throwable_name)
+                .take_while(|frame| frame.0.class_name.as_str() != throwable_name)
                 .collect();
 
             // When the stack is deeper than `max_stack_size`, the JVM keeps the *newest* frames
@@ -189,8 +190,7 @@ impl StackFramesUtil {
                 .take(max_stack_size)
                 .map(|frame| {
                     (
-                        frame.current_class_name_arc(),
-                        frame.method_name_arc(),
+                        frame.frame_code(),
                         Self::extract_line_number(frame.line_numbers(), frame.ex_pc()),
                         frame.bci() as u16,
                     )
@@ -210,8 +210,7 @@ impl StackFramesUtil {
                 .iter()
                 .map(|frame| {
                     (
-                        Arc::clone(&frame.code.class_name),
-                        Arc::clone(&frame.code.method_name),
+                        frame.code,
                         Self::extract_line_number(&frame.code.line_numbers, frame.ex_pc),
                         frame.bci as u16,
                     )
@@ -220,22 +219,33 @@ impl StackFramesUtil {
         )
     }
 
-    fn resolve_trace(frames: Vec<(Arc<String>, Arc<String>, u16, u16)>) -> Result<Vec<StackElement>> {
+    /// The stack elements of frames given as (metadata, line, bci). A frame's class and method
+    /// come from its metadata where it has them, and from the registries by name otherwise.
+    fn resolve_trace(frames: Vec<(&'static FrameCode, u16, u16)>) -> Result<Vec<StackElement>> {
         frames
             .into_iter()
-            .map(|(class, method, line, bci)| {
-                let klass = CLASSES.get_loaded(&class).ok_or_else(|| {
-                    Error::new_execution("executing frame's class is not loaded")
-                })?;
-                let method = klass.get_method(&method)?;
+            .map(|(code, line, bci)| {
+                let mirror = match code.klass.get() {
+                    Some(klass) => klass.mirror_clazz_ref()?,
+                    None => CLASSES
+                        .get_loaded(&code.class_name)
+                        .ok_or_else(|| {
+                            Error::new_execution("executing frame's class is not loaded")
+                        })?
+                        .mirror_clazz_ref()?,
+                };
                 // Class unloading is disabled: the permanent registry pins this method.
-                Ok(StackElement::new(
-                    klass.mirror_clazz_ref()?,
-                    Arc::as_ptr(&method) as i64,
-                    line,
-                    bci,
-                    method.is_native(),
-                ))
+                let (method_ref, native) = match code.method {
+                    Some(method) => (std::ptr::from_ref(method) as i64, method.is_native()),
+                    None => {
+                        let klass = CLASSES.get_loaded(&code.class_name).ok_or_else(|| {
+                            Error::new_execution("executing frame's class is not loaded")
+                        })?;
+                        let method = klass.get_method(&code.method_name)?;
+                        (Arc::as_ptr(&method) as i64, method.is_native())
+                    }
+                };
+                Ok(StackElement::new(mirror, method_ref, line, bci, native))
             })
             .collect()
     }

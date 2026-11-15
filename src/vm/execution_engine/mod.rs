@@ -4,6 +4,7 @@ mod engine;
 pub(crate) use engine::Engine;
 pub(crate) mod executor;
 pub(crate) mod invoke_dynamic_runner;
+pub(crate) mod intrinsics;
 pub(crate) mod invoker;
 pub(crate) mod ldc_resolution_manager;
 pub(crate) mod opcode;

@@ -38,6 +38,12 @@ struct Chunk<V> {
     /// One bit per slot, set while it holds an object, so a walk over the chunk visits only the
     /// objects present without taking each empty slot's lock.
     present: Box<[AtomicU64]>,
+    /// A word per slot fixed for the life of its object (the heap stores its class), written
+    /// before the slot's presence bit is set, so it is read without the slot's lock.
+    tags: Box<[AtomicUsize]>,
+    /// One bit per slot, set while a collection has found its object reachable. Clear outside
+    /// collections; a collection clears what it set before mutators resume.
+    marks: Box<[AtomicU64]>,
     /// Objects present.
     live: AtomicU32,
     /// Objects ever inserted. A chunk whose every slot has been filled once and emptied again
@@ -51,6 +57,8 @@ impl<V> Chunk<V> {
             slots: (0..CHUNK).map(|_| RwLock::new(None)).collect(),
             charges: (0..CHUNK).map(|_| AtomicU64::new(0)).collect(),
             present: (0..CHUNK / 64).map(|_| AtomicU64::new(0)).collect(),
+            tags: (0..CHUNK).map(|_| AtomicUsize::new(0)).collect(),
+            marks: (0..CHUNK / 64).map(|_| AtomicU64::new(0)).collect(),
             live: AtomicU32::new(0),
             filled: AtomicU32::new(0),
         })
@@ -221,8 +229,66 @@ impl<V> ObjectTable<V> {
         })
     }
 
+    /// The tag recorded for a present object, without its slot's lock: `None` when absent. The
+    /// presence bit is set after the tag is written, with release ordering.
+    #[inline]
+    pub(crate) fn tag(&self, key: i32) -> Option<usize> {
+        let (chunk_index, slot) = Self::locate(key)?;
+        let chunk = self.chunk(chunk_index)?;
+        if chunk.present[slot / 64].load(Ordering::Acquire) & (1 << (slot % 64)) == 0 {
+            return None;
+        }
+        Some(chunk.tags[slot].load(Ordering::Relaxed))
+    }
+
+    /// Marks a present object: `Some(true)` if it was not marked yet, `Some(false)` if it was, and
+    /// `None`, marking nothing, when no object has this key.
+    #[inline]
+    pub(crate) fn mark(&self, key: i32) -> Option<bool> {
+        let (chunk_index, slot) = Self::locate(key)?;
+        let chunk = self.chunk(chunk_index)?;
+        let bit = 1u64 << (slot % 64);
+        if chunk.present[slot / 64].load(Ordering::Acquire) & bit == 0 {
+            return None;
+        }
+        Some(chunk.marks[slot / 64].fetch_or(bit, Ordering::Relaxed) & bit == 0)
+    }
+
+    /// Whether [`Self::mark`] marked this key since the last [`Self::clear_marks`].
+    #[inline]
+    pub(crate) fn is_marked(&self, key: i32) -> bool {
+        let Some((chunk_index, slot)) = Self::locate(key) else {
+            return false;
+        };
+        self.chunk(chunk_index).is_some_and(|chunk| {
+            chunk.marks[slot / 64].load(Ordering::Relaxed) & (1 << (slot % 64)) != 0
+        })
+    }
+
+    /// Clears every mark.
+    pub(crate) fn clear_marks(&self) {
+        let high = self.high.load(Ordering::Acquire);
+        for chunk in (0..high).filter_map(|index| self.chunk(index)) {
+            for word in chunk.marks.iter() {
+                word.store(0, Ordering::Relaxed);
+            }
+        }
+    }
+
     /// Inserts under a key that must be positive and free, recording the object's charge.
+    #[cfg(test)]
     pub(crate) fn insert_checked(&self, key: i32, value: V, charge: u64) -> AllocResult<()> {
+        self.insert_tagged(key, value, charge, 0)
+    }
+
+    /// [`Self::insert_checked`], also recording the object's tag (see [`Self::tag`]).
+    pub(crate) fn insert_tagged(
+        &self,
+        key: i32,
+        value: V,
+        charge: u64,
+        tag: usize,
+    ) -> AllocResult<()> {
         let (chunk_index, slot) = Self::locate(key).ok_or(AllocError::IdentityExhausted)?;
         let chunk = self.chunk_or_insert(chunk_index);
         let mut guard = chunk.slots[slot].write();
@@ -231,6 +297,7 @@ impl<V> ObjectTable<V> {
         }
         *guard = Some(value);
         chunk.charges[slot].store(charge, Ordering::Relaxed);
+        chunk.tags[slot].store(tag, Ordering::Relaxed);
         chunk.present[slot / 64].fetch_or(1 << (slot % 64), Ordering::Release);
         chunk.live.fetch_add(1, Ordering::Relaxed);
         chunk.filled.fetch_add(1, Ordering::Relaxed);

@@ -55,6 +55,22 @@ impl Heap {
 
     /// Frees the object table's chunks emptied since the last collection. Only while mutators
     /// are quiescent.
+    /// Marks a present object for the running collection: `Some(true)` the first time, `None`
+    /// when there is no such object.
+    #[inline]
+    pub(crate) fn mark(&self, reference: i32) -> Option<bool> {
+        self.data.mark(reference)
+    }
+
+    #[inline]
+    pub(crate) fn is_marked(&self, reference: i32) -> bool {
+        self.data.is_marked(reference)
+    }
+
+    pub(crate) fn clear_marks(&self) {
+        self.data.clear_marks();
+    }
+
     pub(crate) fn free_retired_chunks(&self) {
         self.data.free_retired();
     }

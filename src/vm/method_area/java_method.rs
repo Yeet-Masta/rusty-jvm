@@ -44,6 +44,8 @@ pub(crate) struct JavaMethod {
     frame_code: OnceCell<&'static FrameCode>,
     /// What calling this native method needs that no call changes, resolved on its first call.
     native_link: OnceCell<NativeLink>,
+    /// The intrinsic the interpreter runs for this method, if any, looked up on its first call.
+    intrinsic: OnceCell<Option<crate::vm::execution_engine::intrinsics::Intrinsic>>,
 }
 
 #[derive(Debug, new, Getters, CopyGetters)]
@@ -76,6 +78,22 @@ pub(crate) fn immortal(method: &Arc<JavaMethod>) -> &'static JavaMethod {
 }
 
 impl JavaMethod {
+    /// This method for the life of the VM; see [`immortal`]. Only for a method that runs, which
+    /// belongs to a loaded class.
+    fn immortal_self(&self) -> &'static JavaMethod {
+        // SAFETY: as for `immortal`: a method that runs is owned by the permanent registry.
+        unsafe { &*std::ptr::from_ref(self) }
+    }
+
+    /// The intrinsic the interpreter may run instead of this method; see
+    /// [`intrinsics`](crate::vm::execution_engine::intrinsics).
+    #[inline]
+    pub(crate) fn intrinsic(&self) -> Option<crate::vm::execution_engine::intrinsics::Intrinsic> {
+        *self.intrinsic.get_or_init(|| {
+            crate::vm::execution_engine::intrinsics::lookup(&self.class_name, &self.name_signature)
+        })
+    }
+
     /// Replaces the class-name handle with one shared by the whole class.
     pub(crate) fn with_class_name(mut self, class_name: Arc<String>) -> Self {
         debug_assert_eq!(*self.class_name, *class_name);
@@ -115,6 +133,7 @@ impl JavaMethod {
             parameters: None,
             arg_ref_chunks: OnceCell::new(),
             frame_code: OnceCell::new(),
+            intrinsic: OnceCell::new(),
             native_link: OnceCell::new(),
         }
     }
@@ -155,6 +174,7 @@ impl JavaMethod {
                 line_numbers: Arc::clone(context.line_numbers()),
                 exception_table: Arc::clone(context.exception_table()),
                 klass: Default::default(),
+                method: Some(self.immortal_self()),
             }))
         });
         let mut frame = StackFrame::from_code(
@@ -171,10 +191,13 @@ impl JavaMethod {
     /// holding `args` so its reference arguments stay visible as roots for the duration.
     pub fn new_native_stack_frame(&self, args: Vec<Slot>) -> StackFrame {
         let code = *self.frame_code.get_or_init(|| {
-            Box::leak(Box::new(FrameCode::native(
-                Arc::clone(&self.name_signature),
-                Arc::clone(&self.class_name),
-            )))
+            Box::leak(Box::new(FrameCode {
+                method: Some(self.immortal_self()),
+                ..FrameCode::native(
+                    Arc::clone(&self.name_signature),
+                    Arc::clone(&self.class_name),
+                )
+            }))
         });
         StackFrame::native_from_code(code, args)
     }
