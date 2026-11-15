@@ -86,12 +86,13 @@ pub(crate) fn invoke(
         } else {
             // JNI binds a native by the class that declares it, not the class named at the call
             // site: `FileDispatcherImpl.closeIntFD` is `Java_sun_nio_ch_UnixFileDispatcherImpl_..`.
-            let declaring_class = java_method.class_name();
-            let full_native_signature = format!("{declaring_class}:{full_signature}");
-            trace!("<Calling native method> -> {full_native_signature} ({method_args:?})");
+            trace!(
+                "<Calling native method> -> {}:{full_signature} ({method_args:?})",
+                java_method.class_name()
+            );
             stack_frames.new_frame(java_method.new_native_stack_frame(method_args.to_vec()));
             let result = invoke_native(
-                &full_native_signature,
+                &java_method,
                 class_name,
                 method_args,
                 is_static,

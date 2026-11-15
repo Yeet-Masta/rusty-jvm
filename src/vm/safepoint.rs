@@ -114,6 +114,21 @@ pub(crate) fn dispatch_bytecode() {
     }
 }
 
+/// [`dispatch_bytecode`] for `count` bytecodes that ran without a poll in between.
+#[inline]
+pub(crate) fn dispatch_bytecodes(count: u32) {
+    let due = BYTECODES.with(|counter| {
+        let before = counter.get();
+        let next = before.wrapping_add(count);
+        counter.set(next);
+        before >> 12 != next >> 12
+    });
+    if due {
+        poll();
+        crate::vm::gc::trigger::at_safepoint();
+    }
+}
+
 pub(crate) fn poll() {
     if !COORDINATOR.requested() {
         return;

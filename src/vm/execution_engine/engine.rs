@@ -27,6 +27,9 @@ thread_local! {
     static INJECT_INTERNAL_ERROR: Cell<bool> = const { Cell::new(false) };
 }
 
+/// The most frame-local instructions run between two safepoint polls.
+const FRAME_LOCAL_RUN: u32 = 1024;
+
 pub(crate) struct Engine {}
 
 impl Engine {
@@ -48,8 +51,21 @@ impl Engine {
             // method hammer one reference counter, which serializes them on its cache line.
             let mut class_name: Option<Arc<String>> = None;
             let mut klass: Option<Arc<JavaClass>> = None;
+            // Whether anyone listens to the per-instruction trace, which the frame-local loop
+            // below does not produce.
+            let tracing = tracing::enabled!(Level::TRACE);
             while !stack_frames.is_empty() {
                 Self::enter_synchronized_method(&mut stack_frames)?;
+                if !tracing {
+                    // Instructions that only touch the frame run in a loop of their own; the
+                    // rest of this iteration handles the instruction that loop stopped at.
+                    if let Some(frame) = stack_frames.last_mut() {
+                        let ran = frame.run_frame_local(FRAME_LOCAL_RUN);
+                        if ran > 0 {
+                            safepoint::dispatch_bytecodes(ran);
+                        }
+                    }
+                }
                 #[cfg(test)]
                 if INJECT_INTERNAL_ERROR.with(|inject| inject.replace(false)) {
                     return Err(Error::new_execution("injected internal execution error"));
@@ -73,7 +89,7 @@ impl Engine {
                     }
                     // Only resolve the source line when someone is listening: this runs for every
                     // bytecode and the lookup is a B-tree search.
-                    let span = if tracing::enabled!(Level::TRACE) {
+                    let span = if tracing {
                         let line = StackFramesUtil::extract_line_number(frame.line_numbers(), pc);
                         span!(Level::TRACE, "", "{}:{line}", frame.current_class_name())
                     } else {

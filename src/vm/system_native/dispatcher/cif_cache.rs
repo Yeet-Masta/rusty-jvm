@@ -13,7 +13,7 @@ pub(super) static CIF_CACHE: LazyLock<Mutex<LruCache<String, Arc<SafeCif>>>> =
         ))
     });
 #[repr(transparent)]
-pub(super) struct SafeCif(pub Cif);
+pub(crate) struct SafeCif(pub Cif);
 
 // SAFETY: Cif is immutable after preparation and safe to share between threads
 unsafe impl Send for SafeCif {}

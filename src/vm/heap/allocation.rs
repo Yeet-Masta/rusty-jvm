@@ -1,6 +1,7 @@
 use super::charge;
 use super::heap::Heap;
 use super::java_instance::HeapValue;
+use crate::vm::commons::auto_dash_map::auto_dash_map_i32::KeyHash;
 use crate::vm::gc::budget::{AllocError, AllocResult, Budget};
 use crate::vm::gc::{collector, trigger};
 use crate::vm::stack::rooted_slots::RootedSlots;
@@ -10,7 +11,7 @@ use std::collections::HashMap;
 pub(super) struct Admission {
     pub(super) budget: Budget,
     pub(super) next: Option<i32>,
-    pub(super) charges: HashMap<i32, u64>,
+    pub(super) charges: HashMap<i32, u64, KeyHash>,
 }
 
 impl Admission {
@@ -18,7 +19,7 @@ impl Admission {
         Self {
             budget: Budget::new(max, enforced),
             next: Some(1),
-            charges: HashMap::new(),
+            charges: HashMap::default(),
         }
     }
 }

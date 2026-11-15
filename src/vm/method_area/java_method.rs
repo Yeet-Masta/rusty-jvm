@@ -7,6 +7,7 @@ use crate::vm::jni::java_thread::JavaThread;
 use crate::vm::stack::slot::Slot;
 use crate::vm::stack::stack_frame::{ExceptionTable, FrameCode, StackFrame};
 use crate::vm::stack::stack_value::StackValueKind;
+use crate::vm::system_native::dispatcher::invoke::NativeLink;
 use derive_new::new;
 use getset::{CopyGetters, Getters};
 use jclassmodel::attributes::LocalVariableInfo;
@@ -40,6 +41,8 @@ pub(crate) struct JavaMethod {
     arg_ref_chunks: OnceCell<Vec<bool>>,
     /// Shared metadata for this method's frames, built on first call (after `with_class_name`).
     frame_code: OnceCell<Arc<FrameCode>>,
+    /// What calling this native method needs that no call changes, resolved on its first call.
+    native_link: OnceCell<NativeLink>,
 }
 
 #[derive(Debug, new, Getters, CopyGetters)]
@@ -100,6 +103,7 @@ impl JavaMethod {
             parameters: None,
             arg_ref_chunks: OnceCell::new(),
             frame_code: OnceCell::new(),
+            native_link: OnceCell::new(),
         }
     }
 
@@ -170,6 +174,10 @@ impl JavaMethod {
     /// The method's code (bytecode, local-variable table, …), or `None` for native/abstract methods.
     pub fn code_context(&self) -> Option<&CodeContext> {
         self.code_context.as_ref()
+    }
+
+    pub(crate) fn native_link(&self) -> &OnceCell<NativeLink> {
+        &self.native_link
     }
 
     pub fn is_native(&self) -> bool {

@@ -30,6 +30,10 @@ pub(crate) enum RegisteredNative {
 static REGISTERED_NATIVES: LazyLock<DashMap<(String, String), RegisteredNative>> =
     LazyLock::new(DashMap::new);
 
+/// Set by the first `RegisterNatives`. Until then no native call has a binding to look for,
+/// and the lookup, which builds its key, is skipped.
+static ANY_REGISTERED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// `RegisterNatives`. Like HotSpot, binds the methods one by one: those before a failing one stay
 /// bound.
 pub(crate) unsafe extern "system" fn register_natives(
@@ -110,6 +114,7 @@ unsafe fn register_native(
     } else {
         RegisteredNative::Function(method.fnPtr as usize as i64)
     };
+    ANY_REGISTERED.store(true, std::sync::atomic::Ordering::Release);
     REGISTERED_NATIVES.insert(
         (java_method.class_name().to_string(), name_signature),
         binding,
@@ -197,6 +202,9 @@ pub(crate) fn registered_native(
     class_name: &str,
     name_signature: &str,
 ) -> Option<RegisteredNative> {
+    if !ANY_REGISTERED.load(std::sync::atomic::Ordering::Acquire) {
+        return None;
+    }
     REGISTERED_NATIVES
         .get(&(class_name.to_owned(), name_signature.to_owned()))
         .map(|entry| *entry)

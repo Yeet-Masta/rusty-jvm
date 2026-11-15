@@ -15,7 +15,6 @@ use crate::vm::method_area::java_class::{
 use crate::vm::method_area::java_method::JavaMethod;
 use crate::vm::method_area::loaded_classes::CLASSES;
 use crate::vm::method_area::lookup;
-use crate::vm::method_area::method_area::with_method_area;
 use crate::vm::monitor;
 use crate::vm::stack::rooted_slots::RootedSlots;
 use crate::vm::stack::slot::Slot;
@@ -277,30 +276,22 @@ pub(crate) fn process(
             let stack_frame = last_frame_mut(stack_frames)?;
             let class_constpool_index = stack_frame.extract_two_bytes() as u16;
 
-            let klass = Arc::clone(current_class);
-            let constant_pool = klass.constant_pool();
+            let (klass_id, class_to_invoke_new_for) =
+                current_class.class_ref(class_constpool_index)?;
 
-            let class_to_invoke_new_for = constant_pool
-                .get_class_name(class_constpool_index)
-                .ok_or_else(|| {
-                    Error::new_constant_pool(&format!(
-                        "Error getting class name by index {class_constpool_index}"
-                    ))
-                })?;
-            let class_to_invoke_new_for = klass.resolve_class_name(&class_to_invoke_new_for)?;
+            StaticInit::initialize_java_class(class_to_invoke_new_for)?;
 
-            StaticInit::initialize(&class_to_invoke_new_for)?;
-
-            let instance_with_default_fields = with_method_area(|method_area| {
-                method_area.create_instance_with_default_fields(&class_to_invoke_new_for)
-            })?;
+            let instance_with_default_fields = class_to_invoke_new_for.new_instance(*klass_id)?;
 
             let mut destination = RootedSlots::new();
             let instanceref =
                 HEAP.create_instance(instance_with_default_fields, &mut destination)?;
             stack_frame.push(Slot::Ref(instanceref))?;
 
-            trace!("NEW -> class={class_to_invoke_new_for}, reference={instanceref}");
+            trace!(
+                "NEW -> class={}, reference={instanceref}",
+                class_to_invoke_new_for.this_class_name()
+            );
             stack_frame.incr_pc();
         }
         NEWARRAY => {
@@ -518,14 +509,8 @@ pub fn prepare_invoke_context(
 
 fn get_args(stack_frames: &mut StackFrames, arg_num: usize) -> Result<RootedSlots> {
     let mut destination = RootedSlots::new();
-    let mut method_args = Vec::with_capacity(arg_num);
-    for _ in 0..arg_num {
-        let val = last_frame_mut(stack_frames)?.pop_slot();
-        method_args.push(val);
-    }
-    method_args.reverse();
-
-    destination.replace(method_args);
+    let stack_frame = last_frame_mut(stack_frames)?;
+    destination.assign_popped(arg_num, || stack_frame.pop_slot());
     Ok(destination)
 }
 

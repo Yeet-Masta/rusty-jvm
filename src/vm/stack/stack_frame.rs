@@ -11,6 +11,9 @@ use std::fmt::Display;
 use std::sync::Arc;
 use tracing::trace;
 
+#[path = "stack_frame_fast.rs"]
+mod fast;
+
 #[derive(Clone, Debug)]
 pub(crate) struct StackFrame {
     /// Per-method metadata shared by every frame of the method: one reference-count update per

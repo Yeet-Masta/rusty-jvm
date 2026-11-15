@@ -7,6 +7,12 @@ use std::env;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
+/// The interpreter allocates a frame for every call and a block for every object, so the
+/// allocator is on its hottest paths. mimalloc serves those small, short-lived blocks several
+/// times faster than the system allocator, on Windows especially.
+#[global_allocator]
+static ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 fn main() -> ExitCode {
     let matches = Command::new("rusty-jvm")
         .arg(

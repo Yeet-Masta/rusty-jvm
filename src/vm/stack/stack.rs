@@ -24,6 +24,11 @@ impl<T> Stack<T> {
         self.data.pop()
     }
 
+    /// The entries, bottom first, and the size they may not exceed.
+    pub(crate) fn parts(&mut self) -> (&mut Vec<T>, usize) {
+        (&mut self.data, self.max_size)
+    }
+
     pub fn clear(&mut self) {
         self.data.clear();
     }

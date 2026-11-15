@@ -32,7 +32,7 @@ impl Hasher for KeyHasher {
     }
 }
 
-type KeyHash = BuildHasherDefault<KeyHasher>;
+pub(crate) type KeyHash = BuildHasherDefault<KeyHasher>;
 
 #[derive(Debug)]
 pub struct AutoDashMapI32<V> {

@@ -8,63 +8,119 @@ use crate::vm::jni::java_thread::JavaThread;
 use crate::vm::jni::jni_env::get_jni_env;
 use crate::vm::jni::local_frames::NativeFrame;
 use crate::vm::jni::native_registration_impl::{registered_native, RegisteredNative};
+use crate::vm::method_area::java_method::JavaMethod;
 use crate::vm::safepoint::{Blocking, Reason};
 use crate::vm::stack::rooted_slots::RootedSlots;
 use crate::vm::stack::slot::Slot;
 use crate::vm::stack::stack_value::StackValue;
 use crate::vm::system_native::dispatcher::args::build_args;
 use crate::vm::system_native::dispatcher::builtin_natives::find_builtin_native;
-use crate::vm::system_native::dispatcher::cif_cache::get_cif;
+use crate::vm::system_native::dispatcher::cif_cache::{get_cif, SafeCif};
 use crate::vm::system_native::dispatcher::utils::get_symbol_address;
 use crate::vm::system_native::native_libraries::find_libjava_symbol;
-use jdescriptor::{MethodDescriptor, TypeDescriptor};
+use jdescriptor::TypeDescriptor;
 use jni_sys::jobject;
 use libffi::high::CodePtr;
 use libffi::middle::{Arg, Cif};
 use std::ffi::c_void;
+use std::sync::{Arc, OnceLock};
 
-/// `method_signature` names the class that declares the native (`class:method:descriptor`), which
-/// is what JNI symbol names use. Built-ins may also be registered under `call_site_class`, the
-/// class the invoke instruction named, which is tried second.
+/// What calling a native method needs that no call changes: its names, its built-in
+/// implementation if it has one, and the prepared call interface. Resolved on the method's first
+/// call and kept with the method, so a call formats, parses and looks up nothing.
+pub(crate) struct NativeLink {
+    /// `class:method:descriptor`, by the class that declares the native, which is what JNI
+    /// symbol names use.
+    signature: String,
+    short_name: String,
+    long_name: String,
+    /// The built-in registered under the declaring class.
+    builtin: Option<i64>,
+    /// The symbol a native library exports for this method, once one was found.
+    library: OnceLock<i64>,
+    cif: Arc<SafeCif>,
+    /// A parameterless `initIDs`, which also runs the JDK library's own.
+    init_ids: bool,
+}
+
+impl std::fmt::Debug for NativeLink {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NativeLink")
+            .field("signature", &self.signature)
+            .finish_non_exhaustive()
+    }
+}
+
+impl NativeLink {
+    fn of(method: &JavaMethod) -> Result<&NativeLink> {
+        method.native_link().get_or_try_init(|| {
+            let class_name = method.class_name();
+            let name_signature = method.name_signature();
+            let (method_name, descriptor) = name_signature.split_once(':').ok_or_else(|| {
+                Error::new_native(&format!(
+                    "Dynamic JNI dispatch requires full method descriptor (expected method:descriptor, got: {name_signature})"
+                ))
+            })?;
+            let signature = format!("{class_name}:{name_signature}");
+            let (short_name, long_name) = jniname::c_name(class_name, method_name, descriptor)
+                .map_err(|_| {
+                    Error::new_native(&format!("Failed to convert {signature} to C name"))
+                })?;
+            let method_descriptor = method.get_method_descriptor();
+            Ok(NativeLink {
+                builtin: find_builtin_native(&signature),
+                library: OnceLock::new(),
+                cif: get_cif(method_descriptor)?,
+                init_ids: method_name == "initIDs"
+                    && method_descriptor.parameter_types().is_empty(),
+                signature,
+                short_name,
+                long_name,
+            })
+        })
+    }
+
+    /// The address of the library symbol implementing this method, resolved once.
+    fn library_symbol(&self, clazz_ref: i32) -> Result<i64> {
+        if let Some(&address) = self.library.get() {
+            return Ok(address);
+        }
+        let address = resolve_library_symbol(clazz_ref, &self.short_name, &self.long_name)?;
+        #[cfg(test)]
+        crate::vm::safepoint::event(crate::vm::safepoint::Event::ExternalNativeResolved);
+        Ok(*self.library.get_or_init(|| address))
+    }
+}
+
+/// Calls the native `method`. Built-ins may also be registered under `call_site_class`, the
+/// class the invoke instruction named, which is tried after the declaring class.
 pub(crate) fn invoke(
-    method_signature: &str,
+    method: &JavaMethod,
     call_site_class: &str,
     args: &[Slot],
     is_static: bool,
     destination: &mut RootedSlots,
 ) -> Result<()> {
-    let split: Vec<_> = method_signature.split(":").collect();
-    if split.len() != 3 {
-        return Err(Error::new_native(&format!(
-            "Dynamic JNI dispatch requires full method descriptor (expected class:method:descriptor, got: {method_signature})"
-        )));
-    }
-    let class_name = split[0];
-    let method_name = split[1];
-    let descriptor = split[2];
+    let class_name = method.class_name();
+    let name_signature = method.name_signature();
+    let method_descriptor = method.get_method_descriptor();
 
     // Frame and argument locals precede class/symbol resolution, which can call Java.
     let Some(_native_frame) = NativeFrame::enter() else {
         return Ok(());
     };
-    let method_descriptor: MethodDescriptor = descriptor.parse()?;
-    let raw_args: Vec<_> = args.iter().map(|slot| slot.value()).collect();
-    let storage = build_args(&raw_args, method_descriptor.parameter_types(), is_static);
+    let link = NativeLink::of(method)?;
+    let storage = build_args(args, method_descriptor.parameter_types(), is_static);
     if JavaThread::get_pending_exception().is_some() {
         return Ok(());
     }
-    let (short_name, long_name) =
-        jniname::c_name(class_name, method_name, descriptor).map_err(|_| {
-            Error::new_native(&format!("Failed to convert {method_signature} to C name"))
-        })?;
     let clazz_ref = clazz_ref(class_name)?;
     let clazz_handle = handles::new_local(clazz_ref);
     if JavaThread::get_pending_exception().is_some() {
         return Ok(());
     }
-    let name_signature = format!("{method_name}:{descriptor}");
     // like HotSpot, a binding of RegisterNatives takes precedence
-    let (symbol_address, external) = match registered_native(class_name, &name_signature) {
+    let (symbol_address, external) = match registered_native(class_name, name_signature) {
         // RegisterNatives binds third-party code, which runs in the Safe state like any other
         // library symbol
         Some(RegisteredNative::Function(address)) => (address, true),
@@ -72,18 +128,13 @@ pub(crate) fn invoke(
             set_pending_unsatisfied_link_error_without_message()?;
             return Ok(());
         }
-        None => match find_builtin_native(method_signature).or_else(|| {
+        None => match link.builtin.or_else(|| {
             (call_site_class != class_name)
                 .then(|| find_builtin_native(&format!("{call_site_class}:{name_signature}")))
                 .flatten()
         }) {
             Some(address) => (address, false),
-            None => {
-                let address = resolve_library_symbol(clazz_ref, &short_name, &long_name)?;
-                #[cfg(test)]
-                crate::vm::safepoint::event(crate::vm::safepoint::Event::ExternalNativeResolved);
-                (address, true)
-            }
+            None => (link.library_symbol(clazz_ref)?, true),
         },
     };
 
@@ -91,17 +142,16 @@ pub(crate) fn invoke(
         std::ptr::with_exposed_provenance_mut::<c_void>(symbol_address as usize);
 
     let env = get_jni_env();
-    let mut ffi_args = vec![Arg::new(&env)];
+    let mut ffi_args = Vec::with_capacity(storage.len() + 2);
+    ffi_args.push(Arg::new(&env));
     if is_static {
         ffi_args.push(Arg::new(&clazz_handle));
     }
-
-    let ffi_args_from_descriptor = storage.iter().map(|s| s.as_arg()).collect::<Vec<_>>();
-    ffi_args.extend(ffi_args_from_descriptor);
+    ffi_args.extend(storage.iter().map(|s| s.as_arg()));
 
     let code_ptr = CodePtr(fun_ptr);
 
-    let safe_cif = get_cif(&method_descriptor)?;
+    let safe_cif = &link.cif;
     crate::vm::safepoint::poll();
     crate::vm::gc::trigger::at_safepoint();
     let result = call_native(
@@ -121,10 +171,10 @@ pub(crate) fn invoke(
         NativeReturn::Slots(raw) => raw,
     };
     destination.replace(typed_slots(method_descriptor.return_type(), &raw)?);
-    if !external && method_name == "initIDs" && method_descriptor.parameter_types().is_empty() {
+    if !external && link.init_ids {
         // A built-in `initIDs` caches nothing for the JDK library that implements the class's other
         // natives; run the library's own so those natives find their field and method IDs.
-        if let Ok(address) = resolve_library_symbol(clazz_ref, &short_name, &long_name) {
+        if let Ok(address) = resolve_library_symbol(clazz_ref, &link.short_name, &link.long_name) {
             let init: extern "system" fn(*mut jni_sys::JNIEnv, jobject) =
                 unsafe { std::mem::transmute(address as usize) };
             let env = get_jni_env();

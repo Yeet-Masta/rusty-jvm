@@ -102,6 +102,9 @@ pub(crate) struct JavaClass {
     /// Resolved `ldc`/`ldc2_w` constants by constant pool index, so that loading one does not go
     /// through the by-name resolution cache again.
     constants: Box<[OnceLock<i64>]>,
+    /// Classes named by this class's constant pool, by index, once an opcode resolved them:
+    /// the class's id in the registry and the class.
+    class_refs: Box<[OnceLock<(usize, Arc<JavaClass>)>]>,
     /// The loader that defined this class, when it is not one of the built-in loaders; `None`
     /// for the shared built-in namespace, where symbolic names are registry keys as they stand.
     #[get_copy = "pub(crate)"]
@@ -253,6 +256,27 @@ pub enum InnerState {
 }
 
 impl JavaClass {
+    /// The class a `CONSTANT_Class` entry of this class's constant pool names, loaded (but not
+    /// initialized) on first use, with its id in the class registry.
+    pub(crate) fn class_ref(&self, index: u16) -> Result<&(usize, Arc<JavaClass>)> {
+        let missing =
+            || Error::new_constant_pool(&format!("Error getting class name by index {index}"));
+        let slot = self
+            .class_refs
+            .get(usize::from(index))
+            .ok_or_else(missing)?;
+        if let Some(resolved) = slot.get() {
+            return Ok(resolved);
+        }
+        let name = self
+            .constant_pool()
+            .get_class_name(index)
+            .ok_or_else(missing)?;
+        let name = self.resolve_class_name(&name)?;
+        let (id, _key, klass) = crate::vm::method_area::loaded_classes::CLASSES.get_full(&name)?;
+        Ok(slot.get_or_init(|| (id, klass)))
+    }
+
     /// The constant an earlier `ldc` at this constant pool index resolved to, as it was cached.
     pub(crate) fn cached_constant(&self, index: u16) -> Option<i64> {
         self.constants.get(usize::from(index))?.get().copied()
@@ -545,6 +569,7 @@ impl JavaClass {
             class_file_version: (0, 0),
             member_refs: (0..member_ref_slots).map(|_| OnceLock::new()).collect(),
             constants: (0..member_ref_slots).map(|_| OnceLock::new()).collect(),
+            class_refs: (0..member_ref_slots).map(|_| OnceLock::new()).collect(),
             defining_loader: None,
             hidden: false,
             nest_host: OnceLock::new(),
