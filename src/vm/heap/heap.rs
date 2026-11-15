@@ -1,6 +1,4 @@
 use crate::bail_thrown;
-use crate::vm::commons::auto_dash_map::auto_dash_map::AutoDashMap;
-use crate::vm::commons::auto_dash_map::auto_dash_map_i32::AutoDashMapI32;
 use crate::vm::error::{Error, Result};
 use crate::vm::exception::helpers::throw_null_pointer_exception;
 use crate::vm::exception::pending::Throws;
@@ -13,13 +11,13 @@ use crate::vm::heap::construction::{ArrayLayout, InstancePlan};
 use crate::vm::heap::java_instance::HeapValue::{Arr, Object};
 use crate::vm::heap::java_instance::JavaInstance::Class;
 use crate::vm::heap::java_instance::{Array, HeapValue};
+use crate::vm::heap::object_table::{Entry, EntryMut, ObjectTable};
 use crate::vm::jni::java_thread::JavaThread;
 use crate::vm::stack::rooted_slots::RootedSlots;
 use crate::vm::stack::slot::Slot;
 use crate::vm::stack::stack_frame::StackFrames;
-use dashmap::mapref::one::{MappedRef, MappedRefMut, Ref, RefMut};
 use dashmap::DashMap;
-use parking_lot::Mutex;
+use parking_lot::{MappedRwLockReadGuard, MappedRwLockWriteGuard, Mutex};
 use serde::Serialize;
 use std::fs::File;
 use std::ops::{Deref, DerefMut};
@@ -28,9 +26,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 pub(crate) static HEAP: LazyLock<Heap> = LazyLock::new(Heap::default);
 
-/// DashMap's mapped target must be Sized. Keep the Vec guard private and expose
-/// only a slice, so a caller cannot resize charged storage.
-pub(crate) struct ArrayDataMut<'a>(MappedRefMut<'a, i32, HeapValue, Vec<u8>>);
+/// Keep the Vec guard private and expose only a slice, so a caller cannot resize charged
+/// storage.
+pub(crate) struct ArrayDataMut<'a>(MappedRwLockWriteGuard<'a, Vec<u8>>);
 
 impl Deref for ArrayDataMut<'_> {
     type Target = [u8];
@@ -47,7 +45,7 @@ impl DerefMut for ArrayDataMut<'_> {
 
 #[derive(Debug, Serialize)]
 pub(crate) struct Heap {
-    pub(super) data: AutoDashMapI32<HeapValue>,
+    pub(super) data: ObjectTable<HeapValue>,
     pub(super) ref_by_stringvalue: DashMap<String, i32>,
     #[serde(skip)]
     pub(super) admission: Mutex<Admission>,
@@ -56,7 +54,7 @@ pub(crate) struct Heap {
 impl Default for Heap {
     fn default() -> Self {
         Self {
-            data: AutoDashMapI32::new(1), // start from 1 to avoid 0 as a valid reference
+            data: ObjectTable::default(), // references start from 1; 0 is null
             ref_by_stringvalue: DashMap::new(),
             // Bootstrap and runtime use the same strict admission limit.
             admission: Mutex::new(Admission::new(
@@ -379,7 +377,7 @@ impl Heap {
     pub(crate) fn get_entire_raw_data(
         &self,
         array_ref: i32,
-    ) -> Result<MappedRef<'_, i32, HeapValue, Vec<u8>>> {
+    ) -> Result<MappedRwLockReadGuard<'_, Vec<u8>>> {
         if array_ref == 0 {
             return Err(Error::new_execution(
                 "NullPointerException: null array reference",
@@ -389,7 +387,7 @@ impl Heap {
         self.data
             .get(array_ref)
             .and_then(|entry| match entry.value() {
-                Arr(_) => Some(Ref::map(entry, |value| match value {
+                Arr(_) => Some(Entry::map(entry, |value| match value {
                     Arr(arr) => arr.raw_data(),
                     _ => unreachable!("already checked that this is an array"),
                 })),
@@ -408,7 +406,7 @@ impl Heap {
         self.data
             .get_mut(array_ref)
             .and_then(|entry| match entry.value() {
-                Arr(_) => Some(ArrayDataMut(RefMut::map(entry, |value| match value {
+                Arr(_) => Some(ArrayDataMut(EntryMut::map(entry, |value| match value {
                     Arr(arr) => arr.raw_data_mut(),
                     _ => unreachable!("already checked that this is an array"),
                 }))),

@@ -1,6 +1,5 @@
 use super::heap::Heap;
 use super::java_instance::HeapValue;
-use crate::vm::commons::auto_dash_map::auto_dash_map::AutoDashMap;
 use crate::vm::error::Result;
 use crate::vm::gc::budget::AllocError;
 use crate::vm::gc::references::Reference;
@@ -20,10 +19,14 @@ impl Heap {
         }
         let mut entries = Vec::new();
         entries
-            .try_reserve_exact(admission.charges.len())
+            .try_reserve_exact(self.data.len())
             .map_err(|_| AllocError::HostAllocation)?;
         let mut total = 0_u64;
-        for (&reference, &charge) in &admission.charges {
+        for (reference, charge) in self.data.charges() {
+            if entries.len() == entries.capacity() {
+                // Mutators are quiescent, so the count above is exact.
+                return Err(AllocError::InvalidLayout.into());
+            }
             total = total.checked_add(charge).ok_or(AllocError::Arithmetic)?;
             entries.push((reference, charge));
         }
@@ -48,6 +51,12 @@ impl Heap {
     pub(crate) fn memory(&self) -> (u64, u64) {
         let admission = self.admission.lock();
         (admission.budget.max, admission.budget.used)
+    }
+
+    /// Frees the object table's chunks emptied since the last collection. Only while mutators
+    /// are quiescent.
+    pub(crate) fn free_retired_chunks(&self) {
+        self.data.free_retired();
     }
 
     pub(crate) fn contains(&self, reference: i32) -> bool {

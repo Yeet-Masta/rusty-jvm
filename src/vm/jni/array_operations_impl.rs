@@ -279,7 +279,6 @@ fn get_primitive_type_array_elements<T: Copy>(array_ref: i32, is_copy: *mut jboo
     let raw_data = HEAP
         .get_entire_raw_data(array_ref)
         .expect("Failed to get array elements")
-        .value()
         .clone();
     // Critical access erases T to u8, but must still align for any primitive element.
     let raw_ptr =

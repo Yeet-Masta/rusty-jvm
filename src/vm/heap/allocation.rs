@@ -1,17 +1,14 @@
 use super::charge;
 use super::heap::Heap;
 use super::java_instance::HeapValue;
-use crate::vm::commons::auto_dash_map::auto_dash_map_i32::KeyHash;
 use crate::vm::gc::budget::{AllocError, AllocResult, Budget};
 use crate::vm::gc::{collector, trigger};
 use crate::vm::stack::rooted_slots::RootedSlots;
-use std::collections::HashMap;
 
 #[derive(Debug)]
 pub(super) struct Admission {
     pub(super) budget: Budget,
     pub(super) next: Option<i32>,
-    pub(super) charges: HashMap<i32, u64, KeyHash>,
 }
 
 impl Admission {
@@ -19,7 +16,6 @@ impl Admission {
         Self {
             budget: Budget::new(max, enforced),
             next: Some(1),
-            charges: HashMap::default(),
         }
     }
 }
@@ -66,18 +62,13 @@ impl Heap {
     /// The collector calls this only while its quiescent Operation is retained.
     /// Never derive a refund from a newly computed layout.
     pub(crate) fn remove_recorded(&self, reference: i32) -> AllocResult<u64> {
-        use crate::vm::commons::auto_dash_map::auto_dash_map::AutoDashMap;
         let mut admission = self.admission.lock();
-        let charge = *admission
-            .charges
-            .get(&reference)
+        let charge = self
+            .data
+            .charge(reference)
             .ok_or(AllocError::InvalidLayout)?;
-        if self.data.get(reference).is_none() {
-            return Err(AllocError::InvalidLayout);
-        }
         admission.budget.reclaim(charge)?;
         self.data.remove(reference);
-        admission.charges.remove(&reference);
         Ok(charge)
     }
 
@@ -136,14 +127,6 @@ impl Reservation<'_> {
             .next
             .filter(|key| *key > 0)
             .ok_or(AllocError::IdentityExhausted)?;
-        // Reserve bookkeeping before changing either counter or publishing anything.
-        admission
-            .charges
-            .try_reserve(1)
-            .map_err(|_| AllocError::HostAllocation)?;
-        if admission.charges.contains_key(&key) || self.heap.data.contains_key(key) {
-            return Err(AllocError::IdentityExhausted);
-        }
         // Validate all accounting before insertion; a failed commit leaves the reservation
         // live for Drop to cancel. Holding this mutex serializes the key/insert/root pair.
         if recorded > self.charge {
@@ -163,9 +146,9 @@ impl Reservation<'_> {
         if admission.budget.enforced && total > admission.budget.max {
             return Err(AllocError::Capacity);
         }
-        self.heap.data.insert_checked(key, value)?;
+        // Rejects an occupied key before anything is published.
+        self.heap.data.insert_checked(key, value, recorded)?;
         admission.budget.commit(self.charge, recorded)?;
-        admission.charges.insert(key, recorded);
         admission.next = key.checked_add(1);
         destination.publish_single_ref(key);
         self.active = false;

@@ -3,6 +3,7 @@ use super::budget::AllocError;
 use super::pending::{PendingList, PENDING};
 use super::references::{Kind, Reference};
 use super::{roots, trigger};
+use crate::vm::commons::fast_hash::FastBuildHasher;
 use crate::vm::error::Result;
 use crate::vm::heap::heap::{Heap, HEAP};
 use crate::vm::jni::{handles, java_thread::JavaThread};
@@ -28,7 +29,7 @@ pub(crate) struct Stats {
 }
 
 struct Trace {
-    marked: HashSet<i32>,
+    marked: HashSet<i32, FastBuildHasher>,
     work: Vec<i32>,
     references: Vec<Reference>,
     limit: usize,
@@ -37,7 +38,7 @@ struct Trace {
 impl Trace {
     fn new(limit: usize) -> Result<Self> {
         let mut trace = Self {
-            marked: HashSet::new(),
+            marked: HashSet::default(),
             work: Vec::new(),
             references: Vec::new(),
             limit,
@@ -162,6 +163,7 @@ pub(crate) fn collect_snapshot(
     cause: Cause,
     _operation: &Operation,
 ) -> Result<Stats> {
+    heap.free_retired_chunks();
     let entries = heap.collection_entries()?;
     let mut trace = Trace::new(entries.len())?;
     let mut pending_head = pending.for_collection()?;
