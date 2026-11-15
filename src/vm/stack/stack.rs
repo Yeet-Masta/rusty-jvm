@@ -24,6 +24,18 @@ impl<T> Stack<T> {
         self.data.pop()
     }
 
+    /// The top `count` entries, bottom first, or `None` if there are fewer.
+    pub(crate) fn top(&self, count: usize) -> Option<&[T]> {
+        let start = self.data.len().checked_sub(count)?;
+        Some(&self.data[start..])
+    }
+
+    /// Removes the top `count` entries, or all of them if there are fewer.
+    pub(crate) fn drop_top(&mut self, count: usize) {
+        let keep = self.data.len().saturating_sub(count);
+        self.data.truncate(keep);
+    }
+
     /// The entries, bottom first, and the size they may not exceed.
     pub(crate) fn parts(&mut self) -> (&mut Vec<T>, usize) {
         (&mut self.data, self.max_size)

@@ -24,6 +24,33 @@ pub(crate) enum SignatureOrigin<'a> {
     EffectiveMethodType(&'a MethodDescriptor),
 }
 
+/// Calls `java_method` if it is interpreted (neither native nor signature-polymorphic), moving its
+/// arguments straight from the caller's operand stack into the callee's locals. Returns `false`,
+/// having touched nothing, for any other method, which [`invoke`] handles.
+///
+/// Nothing between taking the arguments off the caller's stack and publishing the callee frame
+/// allocates on the heap or polls, so the arguments need no root scope of their own.
+pub(crate) fn invoke_interpreted(
+    stack_frames: &mut StackFrames,
+    java_method: &JavaMethod,
+) -> Result<bool> {
+    if java_method.is_native() || java_method.is_polymorphic_signature() {
+        return Ok(false);
+    }
+    let ref_chunks = java_method.arg_ref_chunks()?;
+    let count = ref_chunks.len();
+    validate_arg_slots(ref_chunks, last_frame_mut(stack_frames)?.top_slots(count)?)?;
+    if stack_limit::would_overflow(stack_frames) {
+        last_frame_mut(stack_frames)?.drop_top_slots(count);
+        stack_limit::throw_stack_overflow(stack_frames)?;
+        return Ok(true);
+    }
+    let mut next_frame = java_method.new_stack_frame()?;
+    last_frame_mut(stack_frames)?.move_args_into(count, &mut next_frame)?;
+    stack_frames.new_frame(next_frame);
+    Ok(true)
+}
+
 pub(crate) fn invoke(
     stack_frames: &mut StackFrames,
     full_signature: &str,

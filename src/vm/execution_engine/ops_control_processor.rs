@@ -99,10 +99,18 @@ fn perform_return(
     destination: &mut RootedSlots,
     width: usize,
 ) -> Result<()> {
+    let has_caller = stack_frames.iter().len() > 1;
     let stack_frame = last_frame_mut(stack_frames)?;
     let mut slots = [Slot::Value(0); 2];
     for slot in &mut slots[..width] {
         *slot = stack_frame.pop_slot();
+    }
+    // With no monitor to release, popping the frame cannot block or poll, so the result goes
+    // straight to the caller's operand stack.
+    if has_caller && !stack_frame.is_synchronized_method() {
+        stack_frames.exit_frame();
+        let caller = last_frame_mut(stack_frames)?;
+        return push_slots(caller, &slots[..width]);
     }
     destination.assign(&slots[..width]);
 

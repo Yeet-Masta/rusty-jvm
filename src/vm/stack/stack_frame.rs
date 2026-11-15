@@ -279,6 +279,30 @@ impl StackFrame {
         )
     }
 
+    /// The top `count` operand-stack slots, deepest first: a call's arguments in order.
+    pub(crate) fn top_slots(&self, count: usize) -> Result<&[Slot]> {
+        self.operand_stack
+            .top(count)
+            .ok_or_else(|| Error::new_execution("Operand stack holds fewer slots than the call"))
+    }
+
+    /// Discards the top `count` operand-stack slots.
+    pub(crate) fn drop_top_slots(&mut self, count: usize) {
+        self.operand_stack.drop_top(count);
+    }
+
+    /// Moves the top `count` operand-stack slots into the first locals of `callee`, in order.
+    pub(crate) fn move_args_into(&mut self, count: usize, callee: &mut StackFrame) -> Result<()> {
+        let args = self.top_slots(count)?;
+        let locals = callee
+            .locals
+            .get_mut(..count)
+            .ok_or_else(|| Error::new_execution("Callee has fewer locals than arguments"))?;
+        locals.copy_from_slice(args);
+        self.operand_stack.drop_top(count);
+        Ok(())
+    }
+
     /// A frame for a method whose shared metadata is already built.
     pub(crate) fn from_code(code: Arc<FrameCode>, locals_size: usize, stack_size: usize) -> Self {
         StackFrame {
@@ -560,6 +584,11 @@ impl StackFrame {
         assert!(self.synchronized_monitor.is_none());
         assert_ne!(reference, 0);
         self.synchronized_monitor = Some(reference);
+    }
+
+    /// Whether returning from this frame involves a synchronized method's monitor.
+    pub(crate) fn is_synchronized_method(&self) -> bool {
+        self.synchronized_method
     }
 
     fn release_synchronized_monitor(&self) -> bool {

@@ -3,7 +3,7 @@ use crate::vm::exception::class_cast::throw_class_cast_exception;
 use crate::vm::exception::common::throw_exception_with_ref;
 use crate::vm::exception::helpers::throw_null_pointer_exception;
 use crate::vm::execution_engine::common::{last_frame_mut, push_words, store_ex_pc};
-use crate::vm::execution_engine::invoker::{invoke, SignatureOrigin};
+use crate::vm::execution_engine::invoker::{invoke, invoke_interpreted, SignatureOrigin};
 use crate::vm::execution_engine::opcode::*;
 use crate::vm::execution_engine::static_init::StaticInit;
 use crate::vm::heap::heap::HEAP;
@@ -127,6 +127,18 @@ pub(crate) fn process(
                 get_class_name_and_signature(stack_frames, current_class, MemberRefKind::Method)?;
             let (class_name_by_ref_type, full_signature) =
                 (&member.class_name, &member.full_signature);
+            // The receiver sits below the arguments. A null one takes the path below, which
+            // throws.
+            let receiver = last_frame_mut(stack_frames)?
+                .top_slots(member.arg_slots()? + 1)?
+                .first()
+                .map_or(0, Slot::value);
+            if receiver != 0 {
+                let target = virtual_target(member, receiver, "virtual_method")?;
+                if invoke_interpreted(stack_frames, &target)? {
+                    return Ok(());
+                }
+            }
             let method_args =
                 prepare_invoke_context(stack_frames, member.method_descriptor()?, true)?;
             let reference = method_args
@@ -166,6 +178,9 @@ pub(crate) fn process(
                     Arc::clone(member.special_target.get_or_init(|| resolved))
                 }
             };
+            if invoke_interpreted(stack_frames, &java_method)? {
+                return Ok(());
+            }
             let method_args =
                 prepare_invoke_context(stack_frames, java_method.get_method_descriptor(), true)?;
             let class_name = java_method.class_name();
@@ -200,6 +215,9 @@ pub(crate) fn process(
                     Arc::clone(&member.static_target.get_or_init(|| (klass, resolved)).1)
                 }
             };
+            if invoke_interpreted(stack_frames, &java_method)? {
+                return Ok(());
+            }
             let method_args =
                 prepare_invoke_context(stack_frames, java_method.get_method_descriptor(), false)?;
             invoke(
@@ -216,8 +234,6 @@ pub(crate) fn process(
             store_ex_pc(stack_frames)?;
             let index = last_frame_mut(stack_frames)?.extract_two_bytes() as u16;
             let arg_num = last_frame_mut(stack_frames)?.extract_one_byte() as usize;
-            let method_args = get_args(stack_frames, arg_num)?;
-
             let zero = last_frame_mut(stack_frames)?.extract_one_byte();
             last_frame_mut(stack_frames)?.incr_pc();
             if zero != 0 {
@@ -227,6 +243,19 @@ pub(crate) fn process(
             }
 
             let member = current_class.member_ref(MemberRefKind::InterfaceMethod, index)?;
+            // The receiver is the deepest of the `count` slots. A null one takes the path below,
+            // which throws.
+            let receiver = last_frame_mut(stack_frames)?
+                .top_slots(arg_num)?
+                .first()
+                .map_or(0, Slot::value);
+            if receiver != 0 {
+                let target = virtual_target(member, receiver, "interface implementation")?;
+                if invoke_interpreted(stack_frames, &target)? {
+                    return Ok(());
+                }
+            }
+            let method_args = get_args(stack_frames, arg_num)?;
             let full_signature = &member.full_signature;
             let reference = method_args
                 .first()

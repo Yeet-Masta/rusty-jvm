@@ -132,6 +132,8 @@ pub(crate) struct MemberRef {
     /// `name:descriptor`, the key used by method lookup.
     pub(crate) full_signature: String,
     method_descriptor: OnceLock<jdescriptor::MethodDescriptor>,
+    /// Operand-stack slots the method's parameters take, without a receiver.
+    arg_slots: OnceLock<usize>,
     /// Inline caches for invoke sites using this reference. Resolution is deterministic for a
     /// given (receiver) class, so each is filled once and then only read (a single atomic load).
     /// `invokestatic`: the resolved class and method.
@@ -178,6 +180,18 @@ impl MemberRef {
         }
         let parsed = self.descriptor.parse()?;
         Ok(self.method_descriptor.get_or_init(|| parsed))
+    }
+
+    /// Operand-stack slots the method's parameters take, without a receiver.
+    pub(crate) fn arg_slots(&self) -> Result<usize> {
+        if let Some(&slots) = self.arg_slots.get() {
+            return Ok(slots);
+        }
+        let slots =
+            crate::vm::helper::argument_length(self.method_descriptor()?.parameter_types())?;
+        let slots = usize::try_from(slots)
+            .map_err(|_| crate::vm::error::Error::new_execution("negative argument length"))?;
+        Ok(*self.arg_slots.get_or_init(|| slots))
     }
 }
 
@@ -322,6 +336,7 @@ impl JavaClass {
             name,
             descriptor,
             method_descriptor: OnceLock::new(),
+            arg_slots: OnceLock::new(),
             static_target: OnceLock::new(),
             special_target: OnceLock::new(),
             virtual_target: OnceLock::new(),
