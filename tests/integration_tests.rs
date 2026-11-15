@@ -5723,3 +5723,20 @@ read-only: VM Option "MaxHeapSize" is not writeable
 "#,
     );
 }
+
+#[test]
+fn should_run_resolved_field_and_array_sites_in_the_frame_local_loop() {
+    assert_success(
+        "samples.interpreter.framelocal.FrameLocalHeapAccess",
+        r#"fields 1999000 7849638825444021288 999500.0 true true
+statics 3690400491868337024 true -1999000
+arrays 86336000 -8401314709176545634 65523 -1989 -49
+getfield NPE
+putfield NPE
+Index 16 out of bounds for length 16
+iaload NPE
+Index -1 out of bounds for length 16
+arraylength NPE
+"#,
+    );
+}

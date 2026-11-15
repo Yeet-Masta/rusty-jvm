@@ -9,9 +9,85 @@
 //! Every instruction here does exactly what its handler in the `ops_*_processor` modules does,
 //! including which slots come out tagged as references. Anything else, and any instruction that
 //! could fail (a full operand stack, a zero divisor), is left for those handlers.
+//!
+//! Field and array instructions also run here once their site is resolved: the field's position
+//! (or static storage) is cached, the class it needs is initialized, and the object or array is
+//! present. They read or write the heap without allocating or polling. A null reference, an index
+//! out of bounds or anything not yet resolved stops the loop before the instruction changes
+//! anything, and its handler then does the rest, exceptions included.
 
 use super::StackFrame;
+use crate::vm::heap::heap::HEAP;
+use crate::vm::method_area::java_class::{InstanceField, JavaClass, MemberRefKind, StaticField};
 use crate::vm::stack::slot::Slot;
+
+/// The constant-pool index an instruction at `pc` names in its two operand bytes.
+#[inline(always)]
+fn pool_index(code: &[u8], pc: usize) -> Option<u16> {
+    Some(u16::from_be_bytes([*code.get(pc + 1)?, *code.get(pc + 2)?]))
+}
+
+/// A `getfield`/`putfield` site's field and its position, if the site has been resolved.
+#[inline(always)]
+fn resolved_instance_field<'a>(
+    klass: Option<&'a JavaClass>,
+    code: &[u8],
+    pc: usize,
+) -> Option<(&'a InstanceField, usize, usize)> {
+    let member = klass?.resolved_member_ref(MemberRefKind::Field, pool_index(code, pc)?)?;
+    let field = member.instance_field.get()?;
+    let &(offset, width) = field.position.get()?;
+    Some((field, offset as usize, width as usize))
+}
+
+/// A `getstatic`/`putstatic` site's field, if the site has been resolved and its class is
+/// initialized.
+#[inline(always)]
+fn resolved_static_field<'a>(
+    klass: Option<&'a JavaClass>,
+    code: &[u8],
+    pc: usize,
+) -> Option<&'a StaticField> {
+    let member = klass?.resolved_member_ref(MemberRefKind::Field, pool_index(code, pc)?)?;
+    let field = member.static_field.get()?;
+    field
+        .holder
+        .static_fields_init_state()
+        .is_initialized()
+        .then_some(field)
+}
+
+/// Pushes field or array words as their handlers do: a wide value low word first, a reference
+/// tagged.
+#[inline(always)]
+fn push_words(stack: &mut Vec<Slot>, words: [i32; 2], wide: bool, reference: bool) {
+    if wide {
+        stack.push(Slot::Value(words[1]));
+        stack.push(Slot::Value(words[0]));
+    } else if reference {
+        stack.push(Slot::Ref(words[0]));
+    } else {
+        stack.push(Slot::Value(words[0]));
+    }
+}
+
+/// The value words on top of the stack, top first, as the handlers pop them.
+#[inline(always)]
+fn peek_words(stack: &[Slot], wide: bool) -> Option<[i32; 2]> {
+    let depth = stack.len();
+    let first = stack.get(depth.checked_sub(1)?)?.value();
+    Some(if wide {
+        [first, stack.get(depth.checked_sub(2)?)?.value()]
+    } else {
+        [first, 0]
+    })
+}
+
+/// The slot `depth` below the top, `1` being the top itself.
+#[inline(always)]
+fn peek(stack: &[Slot], depth: usize) -> Option<i32> {
+    Some(stack.get(stack.len().checked_sub(depth)?)?.value())
+}
 
 #[inline(always)]
 fn pop(stack: &mut Vec<Slot>) -> i32 {
@@ -57,6 +133,7 @@ impl StackFrame {
     /// before the first instruction that is not one. Returns how many ran.
     pub(crate) fn run_frame_local(&mut self, budget: u32) -> u32 {
         let code: &[u8] = &self.code.bytecode;
+        let klass: Option<&JavaClass> = self.code.klass.0.get().map(|klass| &**klass);
         let locals: &mut [Slot] = &mut self.locals;
         let (stack, max_stack) = self.operand_stack.parts();
         let mut pc = self.pc;
@@ -513,6 +590,120 @@ impl StackFrame {
                 198 | 199 => {
                     let value = pop(stack);
                     branch!((value == 0) == (opcode == 198));
+                }
+                // iaload, laload, faload, daload, aaload, baload, caload, saload
+                46..=53 => {
+                    let (Some(index), Some(array)) = (peek(stack, 1), peek(stack, 2)) else {
+                        break;
+                    };
+                    if array == 0 {
+                        break;
+                    }
+                    let Ok(Ok(words)) = HEAP.load_array_element(array, index) else {
+                        break;
+                    };
+                    stack.truncate(stack.len() - 2);
+                    push_words(stack, words, matches!(opcode, 47 | 49), opcode == 50);
+                    pc += 1;
+                }
+                // iastore, lastore, fastore, dastore, bastore, castore, sastore (not aastore,
+                // which checks the element type)
+                79..=82 | 84..=86 => {
+                    let wide = matches!(opcode, 80 | 82);
+                    let width = if wide { 2 } else { 1 };
+                    let (Some(words), Some(index), Some(array)) = (
+                        peek_words(stack, wide),
+                        peek(stack, width + 1),
+                        peek(stack, width + 2),
+                    ) else {
+                        break;
+                    };
+                    if array == 0 {
+                        break;
+                    }
+                    let Ok(Ok(())) = HEAP.store_array_element(array, index, words) else {
+                        break;
+                    };
+                    stack.truncate(stack.len() - width - 2);
+                    pc += 1;
+                }
+                // arraylength
+                190 => {
+                    let Some(array) = peek(stack, 1).filter(|array| *array != 0) else {
+                        break;
+                    };
+                    let Ok(length) = HEAP.get_array_len(array) else {
+                        break;
+                    };
+                    stack.pop();
+                    push(stack, length);
+                    pc += 1;
+                }
+                // getstatic
+                178 => {
+                    let Some(field) = resolved_static_field(klass, code, pc) else {
+                        break;
+                    };
+                    room!(if field.wide { 2 } else { 1 });
+                    let Ok(words) = field.value.words() else {
+                        break;
+                    };
+                    push_words(stack, words, field.wide, field.reference);
+                    pc += 3;
+                }
+                // putstatic
+                179 => {
+                    let Some(field) = resolved_static_field(klass, code, pc) else {
+                        break;
+                    };
+                    let Some(words) = peek_words(stack, field.wide) else {
+                        break;
+                    };
+                    if field.value.set_words(words).is_err() {
+                        break;
+                    }
+                    stack.truncate(stack.len() - if field.wide { 2 } else { 1 });
+                    pc += 3;
+                }
+                // getfield
+                180 => {
+                    let Some((field, offset, width)) = resolved_instance_field(klass, code, pc)
+                    else {
+                        break;
+                    };
+                    let Some(object) = peek(stack, 1).filter(|object| *object != 0) else {
+                        break;
+                    };
+                    if field.wide {
+                        room!(1);
+                    }
+                    let Some(words) = HEAP.read_field_at(object, offset, width) else {
+                        break;
+                    };
+                    stack.pop();
+                    push_words(stack, words, field.wide, field.reference);
+                    pc += 3;
+                }
+                // putfield
+                181 => {
+                    let Some((field, offset, width)) = resolved_instance_field(klass, code, pc)
+                    else {
+                        break;
+                    };
+                    let slots = if field.wide { 2 } else { 1 };
+                    let (Some(words), Some(object)) =
+                        (peek_words(stack, field.wide), peek(stack, slots + 1))
+                    else {
+                        break;
+                    };
+                    if object == 0 {
+                        break;
+                    }
+                    if HEAP.write_field_at(object, offset, width, words).is_none() {
+                        break;
+                    }
+                    stack.truncate(stack.len() - slots - 1);
+                    pc += 3;
                 }
                 _ => break,
             }

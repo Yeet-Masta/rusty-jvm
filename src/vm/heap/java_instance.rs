@@ -632,6 +632,17 @@ impl JavaInstance {
         instance.write(offset, width, words)
     }
 
+    /// The words at a field position a `getfield` site has already found.
+    pub(crate) fn read_slots(&self, offset: usize, width: usize) -> Option<[i32; 2]> {
+        self.get_instance().read(offset, width)
+    }
+
+    /// Writes the words at a field position a `putfield` site has already found. The caller holds
+    /// the entry exclusively.
+    pub(crate) fn write_slots(&self, offset: usize, width: usize, words: [i32; 2]) -> Option<()> {
+        self.get_instance().write(offset, width, words)
+    }
+
     fn get_instance(&self) -> &JavaInstanceBase {
         match self {
             Base(instance) => instance,

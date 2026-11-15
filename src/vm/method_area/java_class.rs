@@ -204,6 +204,12 @@ pub struct InitState {
 }
 
 impl InitState {
+    /// Whether initialization has completed successfully.
+    #[inline]
+    pub(crate) fn is_initialized(&self) -> bool {
+        self.initialized.load(std::sync::atomic::Ordering::Acquire)
+    }
+
     /// Returns true only to the elected initializer. Ownership is logical; no
     /// mutex guard survives this call or spans the initializer's Java execution.
     pub(crate) fn begin(&self) -> std::result::Result<bool, i32> {
@@ -300,6 +306,19 @@ impl JavaClass {
     pub(crate) fn cache_constant(&self, index: u16, value: i64) {
         if let Some(slot) = self.constants.get(usize::from(index)) {
             let _ = slot.set(value);
+        }
+    }
+
+    /// The member reference at `index` if an earlier access resolved it as `kind`.
+    #[inline]
+    pub(crate) fn resolved_member_ref(
+        &self,
+        kind: MemberRefKind,
+        index: u16,
+    ) -> Option<&MemberRef> {
+        match self.member_refs.get(usize::from(index))?.get() {
+            Some((cached_kind, member)) if *cached_kind == kind => Some(member),
+            _ => None,
         }
     }
 

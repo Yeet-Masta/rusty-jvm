@@ -125,6 +125,37 @@ impl Heap {
         }
     }
 
+    /// Reads a field at a position its site has already found, or `None` if `objectref` is not a
+    /// plain object or has no such slot.
+    #[inline]
+    pub(crate) fn read_field_at(
+        &self,
+        objectref: i32,
+        offset: usize,
+        width: usize,
+    ) -> Option<[i32; 2]> {
+        match self.data.get(objectref).as_deref() {
+            Some(Object(instance)) => instance.read_slots(offset, width),
+            _ => None,
+        }
+    }
+
+    /// Writes a field at a position its site has already found, under the entry's exclusive lock
+    /// like [`Self::write_field`]. `None` if `objectref` is not a plain object or has no such slot.
+    #[inline]
+    pub(crate) fn write_field_at(
+        &self,
+        objectref: i32,
+        offset: usize,
+        width: usize,
+        words: [i32; 2],
+    ) -> Option<()> {
+        match self.data.get_mut(objectref).as_deref_mut() {
+            Some(Object(instance)) => instance.write_slots(offset, width, words),
+            _ => None,
+        }
+    }
+
     /// Reads the field a `getfield` site names, as JVM words.
     pub(crate) fn read_field(
         &self,
