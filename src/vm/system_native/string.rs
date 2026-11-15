@@ -10,7 +10,7 @@ const CODER_FIELD: &str = "coder";
 
 static COMPACT_STRINGS: OnceLock<bool> = OnceLock::new();
 
-fn compact_strings() -> Result<bool> {
+pub(crate) fn compact_strings() -> Result<bool> {
     if let Some(&value) = COMPACT_STRINGS.get() {
         return Ok(value);
     }

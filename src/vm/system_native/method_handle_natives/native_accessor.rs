@@ -1,8 +1,10 @@
 use crate::vm::error::{Error, Result};
 use crate::vm::execution_engine::executor::Executor;
+use crate::vm::execution_engine::static_init::StaticInit;
 use crate::vm::heap::heap::HEAP;
 use crate::vm::heap::java_instance::Array;
 use crate::vm::helper::{clazz_ref, klass};
+use crate::vm::method_area::java_class::JavaClass;
 use crate::vm::method_area::java_method::JavaMethod;
 use crate::vm::stack::rooted_slots::RootedSlots;
 use crate::vm::stack::stack_value::{StackValue, StackValueKind};
@@ -11,7 +13,11 @@ use std::sync::Arc;
 
 /// `jdk.internal.reflect.DirectMethodHandleAccessor$NativeAccessor.invoke0(Ljava/lang/reflect/Method;Ljava/lang/Object;[Ljava/lang/Object;)Ljava/lang/Object;`
 pub(crate) fn invoke0(method_ref: i32, obj_ref: i32, args_ref: i32) -> Result<i32> {
-    let (method, args) = resolve_method_and_args(method_ref, args_ref)?;
+    let (klass, method, args) = resolve_method_and_args(method_ref, args_ref)?;
+    // Like HotSpot's `Reflection::invoke`, calling a static method initializes its class.
+    if method.is_static() {
+        StaticInit::initialize_java_class(&klass)?;
+    }
 
     let ret = if obj_ref == 0 {
         Executor::invoke_static_method(method.class_name(), method.name_signature(), &args)?
@@ -80,7 +86,9 @@ fn box_return_value(method: &JavaMethod, ret: &RootedSlots) -> Result<i32> {
 
 /// `jdk.internal.reflect.DirectConstructorHandleAccessor$NativeAccessor.newInstance0(Ljava/lang/reflect/Constructor;[Ljava/lang/Object;)Ljava/lang/Object;`
 pub(crate) fn new_instance0(constructor_ref: i32, args_ref: i32) -> Result<i32> {
-    let (method, args) = resolve_method_and_args(constructor_ref, args_ref)?;
+    let (klass, method, args) = resolve_method_and_args(constructor_ref, args_ref)?;
+    // Like `new`, and HotSpot's `Reflection::invoke_constructor`, this initializes the class.
+    StaticInit::initialize_java_class(&klass)?;
 
     let result = Executor::invoke_args_constructor(
         method.class_name(),
@@ -94,7 +102,7 @@ pub(crate) fn new_instance0(constructor_ref: i32, args_ref: i32) -> Result<i32> 
 fn resolve_method_and_args(
     method_or_constructor_ref: i32,
     args_ref: i32,
-) -> Result<(Arc<JavaMethod>, Vec<StackValueKind>)> {
+) -> Result<(Arc<JavaClass>, Arc<JavaMethod>, Vec<StackValueKind>)> {
     let method_name = HEAP.get_instance_name(method_or_constructor_ref)?;
     let clazz_ref =
         HEAP.get_object_field_value(method_or_constructor_ref, method_name.as_str(), "clazz")?[0];
@@ -124,7 +132,7 @@ fn resolve_method_and_args(
             unbox_if_needed(value[0], clazz_ref)
         })
         .collect::<Result<Vec<StackValueKind>>>()?;
-    Ok((method, args))
+    Ok((klass, method, args))
 }
 
 fn unbox_if_needed(obj_ref: i32, clazz_ref_: i32) -> Result<StackValueKind> {

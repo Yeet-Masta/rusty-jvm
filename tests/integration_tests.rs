@@ -5740,3 +5740,24 @@ arraylength NPE
 "#,
     );
 }
+
+#[test]
+fn should_concatenate_strings_of_every_argument_kind() {
+    utils::assert_success_utf8(
+        "samples.javacore.strings.concat.StringConcatSites",
+        "i=-42 l=-9223372036854775808 s=-7 b=120\n\
+         c=\u{416} t=true f=false none=null\n\
+         abc\u{65e5}\u{672c}\u{1f600}abc\n\
+         3 6 55296\n\
+         -42\n\
+         -42\n\
+         abc\n\
+         \u{416}\u{416}\n\
+         9223372036854775807|-2147483648|\u{0}|\n\
+         tag\u{1}arg=-42\u{2}end\n\
+         5\n\
+         fl=1.0E10 d=0.30000000000000004 o=sb n=null i=-42\n\
+         mixed abc\u{416}-9223372036854775808true3.5\n\
+         loop 17171880805\n",
+    );
+}

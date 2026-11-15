@@ -4,6 +4,7 @@ use crate::vm::execution_engine::ldc_resolution_manager::{
     build_methodtype_ref, resolve_method_handle, LdcConstant,
 };
 use crate::vm::execution_engine::ops_reference_processor::prepare_invoke_context;
+use crate::vm::execution_engine::string_concat::ConcatRecipe;
 use crate::vm::execution_engine::string_pool_helper::StringPoolHelper;
 use crate::vm::heap::heap::HEAP;
 use crate::vm::helper::clazz_ref;
@@ -21,21 +22,25 @@ use derive_new::new;
 use getset::{CopyGetters, Getters};
 use jclassmodel::attributes::BootstrapMethodInfo;
 use jdescriptor::MethodDescriptor;
+use std::sync::Arc;
 
 /// The `InvokeDynamicRunner` is responsible for handling the `invokedynamic` instruction in the JVM.
 /// It resolves the dynamic call site, caches the resolved method, and invokes it with the appropriate
 /// arguments.
 #[derive(Debug, Default)]
 pub(crate) struct InvokeDynamicRunner {
-    resolved_methods: DashMap<u16, ResolvedMethod>,
+    resolved_methods: DashMap<u16, Arc<ResolvedMethod>>,
 }
 
-#[derive(Debug, Clone, new, CopyGetters, Getters)]
+#[derive(Debug, new, CopyGetters, Getters)]
 struct ResolvedMethod {
+    /// The call site's target, or `0` for a site run by its [`ConcatRecipe`].
     #[get_copy = "pub"]
     method_handle_dynamic_invoked_ref: i32,
     #[get = "pub"]
     invoke_dynamic_method_type_desc: MethodDescriptor,
+    /// A string concatenation built natively instead of through a method handle.
+    concat: Option<ConcatRecipe>,
 }
 
 /// Contains all relevant metadata required to resolve an `invokedynamic` call site.
@@ -119,6 +124,7 @@ impl InvokeDynamicRunner {
         self.resolved_methods
             .iter()
             .map(|entry| entry.method_handle_dynamic_invoked_ref())
+            .filter(|&reference| reference != 0)
             .collect()
     }
 
@@ -133,17 +139,22 @@ impl InvokeDynamicRunner {
         let cached = self
             .resolved_methods
             .get(&invokedynamic_index)
-            .map(|entry| entry.clone());
+            .map(|entry| Arc::clone(&entry));
         let resolved_method = match cached {
             Some(resolved) => resolved,
             None => {
-                let resolved = Self::resolve(current_class_name, invokedynamic_index)?;
-                self.resolved_methods
-                    .entry(invokedynamic_index)
-                    .or_insert(resolved)
-                    .clone()
+                let resolved = Arc::new(Self::resolve(current_class_name, invokedynamic_index)?);
+                Arc::clone(
+                    &self
+                        .resolved_methods
+                        .entry(invokedynamic_index)
+                        .or_insert(resolved),
+                )
             }
         };
+        if let Some(recipe) = &resolved_method.concat {
+            return recipe.run(stack_frames);
+        }
 
         let method_handle_dynamic_invoked_ref =
             resolved_method.method_handle_dynamic_invoked_ref();
@@ -156,6 +167,16 @@ impl InvokeDynamicRunner {
     fn resolve(current_class_name: &str, invokedynamic_index: u16) -> Result<ResolvedMethod> {
         let bootstrap_info =
             Self::extract_bootstrap_info(current_class_name, invokedynamic_index)?;
+        if bootstrap_info.bootstrap_method_class() == "java/lang/invoke/StringConcatFactory"
+            && bootstrap_info.bootstrap_method_name() == "makeConcatWithConstants"
+        {
+            let descriptor: MethodDescriptor =
+                bootstrap_info.invoke_dynamic_descriptor().parse()?;
+            if let Some(recipe) = ConcatRecipe::link(&descriptor, bootstrap_info.bootstrap_args())?
+            {
+                return Ok(ResolvedMethod::new(0, descriptor, Some(recipe)));
+            }
+        }
         // The caller owns the scope; prepare_args never returns an inner LIFO guard.
         let mut roots = JavaThread::hold_temp_roots(vec![]);
         let args = Self::prepare_args(current_class_name, &bootstrap_info, &mut roots)?;
@@ -164,6 +185,7 @@ impl InvokeDynamicRunner {
         Ok(ResolvedMethod::new(
             method_handle_dynamic_invoked_ref,
             bootstrap_info.invoke_dynamic_descriptor().parse()?,
+            None,
         ))
     }
 
@@ -315,9 +337,10 @@ mod gc_tests {
     fn gc_roots_indy_cache_exposes_only_already_resolved_handles() {
         let runner = InvokeDynamicRunner::default();
         assert!(runner.resolved_refs().is_empty());
-        runner
-            .resolved_methods
-            .insert(7, ResolvedMethod::new(53, "()V".parse().unwrap()));
+        runner.resolved_methods.insert(
+            7,
+            Arc::new(ResolvedMethod::new(53, "()V".parse().unwrap(), None)),
+        );
 
         assert_eq!(runner.resolved_refs(), vec![53]);
     }
