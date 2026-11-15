@@ -18,5 +18,6 @@ mod ops_reference_processor;
 mod ops_stack_processor;
 mod ops_store_processor;
 pub(crate) mod static_init;
+mod frame_local_calls;
 pub(crate) mod string_concat;
 pub(crate) mod string_pool_helper;

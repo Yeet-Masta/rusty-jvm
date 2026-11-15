@@ -94,6 +94,26 @@ pub(crate) fn process(
     Ok(())
 }
 
+/// A return of `width` result slots to a caller in this segment from a method holding no monitor,
+/// done as its handler does. Returns `false`, having changed nothing, for any other return.
+pub(crate) fn return_to_caller(stack_frames: &mut StackFrames, width: usize) -> Result<bool> {
+    if stack_frames.iter().len() < 2 {
+        return Ok(false);
+    }
+    let stack_frame = last_frame_mut(stack_frames)?;
+    if stack_frame.is_synchronized_method() {
+        return Ok(false);
+    }
+    let mut slots = [Slot::Value(0); 2];
+    for slot in &mut slots[..width] {
+        *slot = stack_frame.pop_slot();
+    }
+    stack_frames.exit_frame();
+    let caller = last_frame_mut(stack_frames)?;
+    push_slots(caller, &slots[..width])?;
+    Ok(true)
+}
+
 fn perform_return(
     stack_frames: &mut StackFrames,
     destination: &mut RootedSlots,

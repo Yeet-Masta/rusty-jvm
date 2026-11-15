@@ -145,16 +145,30 @@ fn set_local_long(locals: &mut [Slot], index: usize, value: i64) {
     locals[index + 1] = Slot::Value((value >> 32) as i32);
 }
 
+/// Why [`StackFrame::run_frame_local`] stopped.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FrameLocalStop {
+    /// The budget ran out, or the next instruction is for its handler.
+    Other,
+    /// The next instruction is an `invoke{virtual,special,static,interface}`.
+    Invoke,
+    /// The next instruction returns this many result slots (`return` is `0`).
+    Return(usize),
+}
+
 impl StackFrame {
     /// Runs frame-local instructions from the current pc, at most `budget` of them, stopping
-    /// before the first instruction that is not one. Returns how many ran.
-    pub(crate) fn run_frame_local(&mut self, budget: u32) -> u32 {
+    /// before the first instruction that is not one. Returns how many ran, and why it stopped:
+    /// an invoke or return may still be done without the interpreter loop (see
+    /// `frame_local_calls`).
+    pub(crate) fn run_frame_local(&mut self, budget: u32) -> (u32, FrameLocalStop) {
         let code: &[u8] = &self.code.bytecode;
         let klass: Option<&JavaClass> = self.code.klass.0.get().map(|klass| &**klass);
         let locals: &mut [Slot] = &mut self.locals;
         let (stack, max_stack) = self.operand_stack.parts();
         let mut pc = self.pc;
         let mut done = 0u32;
+        let mut stop = FrameLocalStop::Other;
 
         // Leaves an instruction that would overflow the operand stack to its handler, which
         // reports it.
@@ -915,12 +929,26 @@ impl StackFrame {
                     stack.truncate(stack.len() - slots - 1);
                     pc += 3;
                 }
+                // invokevirtual, invokespecial, invokestatic, invokeinterface
+                182..=185 => {
+                    stop = FrameLocalStop::Invoke;
+                    break;
+                }
+                // ireturn, lreturn, freturn, dreturn, areturn, return
+                172..=177 => {
+                    stop = FrameLocalStop::Return(match opcode {
+                        173 | 175 => 2,
+                        177 => 0,
+                        _ => 1,
+                    });
+                    break;
+                }
                 _ => break,
             }
             done += 1;
         }
 
         self.pc = pc;
-        done
+        (done, stop)
     }
 }

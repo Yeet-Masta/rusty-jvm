@@ -204,8 +204,16 @@ impl<V> ObjectTable<V> {
             .map(|guard| EntryMut { guard })
     }
 
+    /// Whether an object is present, from the chunk's presence bits rather than the slot's lock.
+    /// The bit is set once the value is stored and cleared as it is taken, both under the slot's
+    /// write lock, so a reader racing an insert or removal of the same key sees either outcome.
     pub(crate) fn contains_key(&self, key: i32) -> bool {
-        self.get(key).is_some()
+        let Some((chunk_index, slot)) = Self::locate(key) else {
+            return false;
+        };
+        self.chunk(chunk_index).is_some_and(|chunk| {
+            chunk.present[slot / 64].load(Ordering::Acquire) & (1 << (slot % 64)) != 0
+        })
     }
 
     /// Inserts under a key that must be positive and free, recording the object's charge.
@@ -267,6 +275,17 @@ impl<V> ObjectTable<V> {
                         })
                     })
             })
+    }
+
+    /// [`Self::remove`] of an object recorded with `charge`, or `None`, removing nothing, when it is
+    /// absent or recorded with another charge. The same callers only: the charge is read before
+    /// the slot is locked, which is exact only while nothing inserts.
+    pub(crate) fn remove_charged(&self, key: i32, charge: u64) -> Option<V> {
+        let (chunk_index, slot) = Self::locate(key)?;
+        if self.chunk(chunk_index)?.charges[slot].load(Ordering::Relaxed) != charge {
+            return None;
+        }
+        self.remove(key).map(|(value, _)| value)
     }
 
     /// Removes an object, returning it and its charge. Call only while no other thread can borrow

@@ -508,7 +508,10 @@ impl JavaMethod {
     /// types at any particular call site, so it must not be used to reason about argument or return
     /// values. Only the resolved `MethodType` knows those.
     pub fn is_polymorphic_signature(&self) -> bool {
-        self.has_annotation("Ljava/lang/invoke/MethodHandle$PolymorphicSignature;")
+        // Signature polymorphic methods are native by definition (JVMS 2.9.3); checking that
+        // first keeps every other call from hashing the annotation name.
+        self.native
+            && self.has_annotation("Ljava/lang/invoke/MethodHandle$PolymorphicSignature;")
     }
 
     /// Whether the method carries the runtime-visible annotation of type `descriptor`

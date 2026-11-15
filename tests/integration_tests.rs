@@ -5795,3 +5795,19 @@ fn should_run_warm_switch_compare_dup_ldc_and_type_check_sites_in_the_frame_loca
          after frameless call NPE true\n",
     );
 }
+
+#[test]
+fn should_call_and_return_between_warm_frames_in_the_frame_local_loop() {
+    utils::assert_success_utf8(
+        "samples.interpreter.framelocal.FrameLocalCalls",
+        "statics 2001000 999500.0 3998000.0 b\n\
+         interface 9000\n\
+         virtual 3754000\n\
+         before init;\n\
+         lazy 5050 init;\n\
+         exception at 1000 fails:60 callsFails:65 main\n\
+         caught 1\n\
+         overflow true\n\
+         synchronized 8000\n",
+    );
+}

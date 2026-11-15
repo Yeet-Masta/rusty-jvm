@@ -587,6 +587,23 @@ fn get_args(stack_frames: &mut StackFrames, arg_num: usize) -> Result<RootedSlot
 static MEGAMORPHIC_TARGETS: LazyLock<DashMap<(usize, usize), Arc<JavaMethod>, FastBuildHasher>> =
     LazyLock::new(DashMap::default);
 
+/// The target a virtual or interface site already resolved for receivers of class `klass_id`, if
+/// any: its inline ways, then the shared map past them.
+#[inline]
+pub(crate) fn cached_virtual_target(member: &MemberRef, klass_id: usize) -> Option<Arc<JavaMethod>> {
+    for way in &member.virtual_target {
+        match way.get() {
+            Some((cached_id, cached)) if *cached_id == klass_id => return Some(Arc::clone(cached)),
+            Some(_) => continue,
+            None => return None,
+        }
+    }
+    let site = std::ptr::from_ref(member) as usize;
+    MEGAMORPHIC_TARGETS
+        .get(&(klass_id, site))
+        .map(|found| Arc::clone(found.value()))
+}
+
 fn virtual_target(member: &MemberRef, receiver: i32, what: &str) -> Result<Arc<JavaMethod>> {
     let klass_id = HEAP.instance_klass_id(receiver)?;
     if let Some(id) = klass_id {

@@ -1,4 +1,5 @@
 use crate::vm::error::{Error, Result};
+use crate::vm::execution_engine::frame_local_calls;
 use crate::vm::execution_engine::{
     ops_comparison_processor, ops_constant_processor, ops_control_processor,
     ops_conversion_processor, ops_extended_processor, ops_load_processor, ops_math_processor,
@@ -59,11 +60,12 @@ impl Engine {
                 if !tracing {
                     // Instructions that only touch the frame run in a loop of their own; the
                     // rest of this iteration handles the instruction that loop stopped at.
-                    if let Some(frame) = stack_frames.last_mut() {
-                        let ran = frame.run_frame_local(FRAME_LOCAL_RUN);
-                        if ran > 0 {
-                            safepoint::dispatch_bytecodes(ran);
-                        }
+                    let ran = frame_local_calls::run(&mut stack_frames, FRAME_LOCAL_RUN)?;
+                    if ran > 0 {
+                        safepoint::dispatch_bytecodes(ran);
+                    }
+                    if stack_frames.is_empty() {
+                        break;
                     }
                 }
                 #[cfg(test)]

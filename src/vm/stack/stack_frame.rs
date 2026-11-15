@@ -14,6 +14,8 @@ use tracing::trace;
 #[path = "stack_frame_fast.rs"]
 mod fast;
 
+pub(crate) use fast::FrameLocalStop;
+
 #[derive(Clone, Debug)]
 pub(crate) struct StackFrame {
     /// Per-method metadata shared by every frame of the method: one reference-count update per
@@ -414,6 +416,18 @@ impl StackFrame {
         }
         let klass = crate::vm::method_area::loaded_classes::CLASSES.get(&self.code.class_name)?;
         Ok(Arc::clone(self.code.klass.0.get_or_init(|| klass)))
+    }
+
+    /// The method's class, if already cached.
+    #[inline]
+    pub(crate) fn resolved_class(&self) -> Option<&Arc<crate::vm::method_area::java_class::JavaClass>> {
+        self.code.klass.get()
+    }
+
+    /// The method's bytecode.
+    #[inline]
+    pub(crate) fn code_bytes(&self) -> &[u8] {
+        &self.code.bytecode
     }
 
     /// Whether this method's class is already cached, so [`Self::current_class`] is a load.

@@ -14,6 +14,7 @@
 //! re-checks its own ticket on wake, so a broadcast that also disturbs the entry set is merely
 //! inefficient, never incorrect. Spurious wakeups are permitted by the `Object.wait` contract.
 
+use crate::vm::commons::fast_hash::FastBuildHasher;
 use crate::vm::error::Result;
 use crate::vm::exception::pending_helpers::{
     set_pending_illegal_monitor_state_exception, set_pending_interrupted_exception,
@@ -59,11 +60,13 @@ struct ObjectMonitor {
     cv: Condvar,
 }
 
-static MONITORS: LazyLock<DashMap<i32, Arc<ObjectMonitor>>> = LazyLock::new(DashMap::new);
+static MONITORS: LazyLock<DashMap<i32, Arc<ObjectMonitor>, FastBuildHasher>> =
+    LazyLock::new(DashMap::default);
 
 /// The monitor each currently-waiting thread (by `java.lang.Thread` ref) is blocked on, so
 /// [`interrupt_waiter`] can wake exactly that thread's `Object.wait`.
-static WAIT_TARGETS: LazyLock<DashMap<i32, Arc<ObjectMonitor>>> = LazyLock::new(DashMap::new);
+static WAIT_TARGETS: LazyLock<DashMap<i32, Arc<ObjectMonitor>, FastBuildHasher>> =
+    LazyLock::new(DashMap::default);
 
 /// Active targets are already snapshot roots. Never wait for monitor state held
 /// by a Safe thread reacquiring a lock; leave such a record for a later cycle.

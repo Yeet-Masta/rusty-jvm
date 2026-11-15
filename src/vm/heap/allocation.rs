@@ -74,11 +74,11 @@ impl Heap {
             if live(reference) {
                 continue;
             }
-            if self.data.charge(reference) != Some(recorded) {
+            // One slot lock per freed object: the charge check and the removal together.
+            if self.data.remove_charged(reference, recorded).is_none() {
                 return Err(AllocError::InvalidLayout);
             }
             admission.budget.reclaim(recorded)?;
-            self.data.remove(reference);
             reclaimed = reclaimed
                 .checked_add(recorded)
                 .ok_or(AllocError::Arithmetic)?;
