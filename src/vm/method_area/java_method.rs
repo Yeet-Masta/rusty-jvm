@@ -459,6 +459,30 @@ impl JavaMethod {
             .contains(MethodModifier::Static)
     }
 
+    /// For a getter whose whole body is `aload_0; getfield #index; <x>return`: `index`. Such a
+    /// call can read the field in the caller's frame, as HotSpot's accessor entries do.
+    #[inline]
+    pub(crate) fn accessor_field_index(&self) -> Option<u16> {
+        const ALOAD_0: u8 = 0x2a;
+        const GETFIELD: u8 = 0xb4;
+        if self.is_static() || self.is_synchronized() {
+            return None;
+        }
+        match self.code_context.as_ref()?.bytecode().as_slice() {
+            // ireturn, lreturn, freturn, dreturn, areturn
+            [ALOAD_0, GETFIELD, high, low, 0xac..=0xb0] => Some(u16::from_be_bytes([*high, *low])),
+            _ => None,
+        }
+    }
+
+    /// The method's class, once one of its frames has resolved it.
+    #[inline]
+    pub(crate) fn resolved_class(
+        &self,
+    ) -> Option<&Arc<crate::vm::method_area::java_class::JavaClass>> {
+        self.frame_code.get()?.klass.get()
+    }
+
     /// Whether the body is a lone `return` and the method holds no monitor, so a call to it
     /// (`Object.<init>`, the end of most constructor chains) has no effect beyond consuming its
     /// arguments.

@@ -1,9 +1,11 @@
 use crate::vm::error::{Error, Result};
 use crate::vm::exception::common::throw_exception_with_ref;
-use crate::vm::execution_engine::common::{last_frame_mut, push_slots};
+use crate::vm::execution_engine::common::{last_frame_mut, push_slots, push_words};
 use crate::vm::execution_engine::executor::Executor;
+use crate::vm::heap::heap::HEAP;
 use crate::vm::helper::{get_length, is_reference, ref_arg_chunks, validate_arg_slots};
 use crate::vm::jni::java_thread::JavaThread;
+use crate::vm::method_area::java_class::MemberRefKind;
 use crate::vm::method_area::java_method::JavaMethod;
 use crate::vm::method_area::loaded_classes::CLASSES;
 use crate::vm::stack::rooted_slots::RootedSlots;
@@ -40,6 +42,13 @@ pub(crate) fn invoke_interpreted(
     let ref_chunks = java_method.arg_ref_chunks()?;
     let count = ref_chunks.len();
     validate_arg_slots(ref_chunks, last_frame_mut(stack_frames)?.top_slots(count)?)?;
+    if count == 1 {
+        if let Some(index) = java_method.accessor_field_index() {
+            if run_accessor(stack_frames, java_method, index)? {
+                return Ok(true);
+            }
+        }
+    }
     if java_method.is_empty_void() {
         // Running it would only push a frame and pop it again; the caller's pc already points
         // past the invoke.
@@ -54,6 +63,39 @@ pub(crate) fn invoke_interpreted(
     let mut next_frame = java_method.new_stack_frame()?;
     last_frame_mut(stack_frames)?.move_args_into(count, &mut next_frame)?;
     stack_frames.new_frame(next_frame);
+    Ok(true)
+}
+
+/// Runs a getter (see [`JavaMethod::accessor_field_index`]) without a frame: replaces the
+/// receiver on the caller's operand stack with the field's value. Returns `false`, having touched
+/// nothing, unless the getter's `getfield` already ran once (so its field is resolved and placed)
+/// and the receiver is a non-null plain object; the frame path then runs it and raises whatever
+/// it raises.
+fn run_accessor(
+    stack_frames: &mut StackFrames,
+    java_method: &JavaMethod,
+    index: u16,
+) -> Result<bool> {
+    let Some(field) = java_method
+        .resolved_class()
+        .and_then(|klass| klass.resolved_member_ref(MemberRefKind::Field, index))
+        .and_then(|member| member.instance_field.get())
+    else {
+        return Ok(false);
+    };
+    let Some(&(offset, width)) = field.position.get() else {
+        return Ok(false);
+    };
+    let frame = last_frame_mut(stack_frames)?;
+    let receiver = frame.top_slots(1)?[0].value();
+    if receiver == 0 {
+        return Ok(false);
+    }
+    let Some(words) = HEAP.read_field_at(receiver, offset as usize, width as usize) else {
+        return Ok(false);
+    };
+    frame.drop_top_slots(1);
+    push_words(frame, words, field.wide, field.reference)?;
     Ok(true)
 }
 

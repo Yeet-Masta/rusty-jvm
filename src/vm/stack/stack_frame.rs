@@ -64,6 +64,14 @@ pub(crate) struct FrameCode {
     pub(crate) klass: ClassCache,
 }
 
+impl ClassCache {
+    /// The class, if a frame of the method already resolved it.
+    #[inline]
+    pub(crate) fn get(&self) -> Option<&Arc<crate::vm::method_area::java_class::JavaClass>> {
+        self.0.get()
+    }
+}
+
 impl FrameCode {
     /// Metadata for a native method's synthetic frame: no bytecode, lines or handlers.
     pub(crate) fn native(method_name: Arc<String>, class_name: Arc<String>) -> Self {
@@ -406,6 +414,12 @@ impl StackFrame {
         }
         let klass = crate::vm::method_area::loaded_classes::CLASSES.get(&self.code.class_name)?;
         Ok(Arc::clone(self.code.klass.0.get_or_init(|| klass)))
+    }
+
+    /// Whether this method's class is already cached, so [`Self::current_class`] is a load.
+    #[inline]
+    pub(crate) fn has_resolved_class(&self) -> bool {
+        self.code.klass.get().is_some()
     }
 
     /// The shared class-name handle itself, for identity comparison without touching its count.

@@ -627,6 +627,25 @@ impl StackFrame {
                     stack.truncate(stack.len() - width - 2);
                     pc += 1;
                 }
+                // aastore, once the value's class is known to fit (else the type check runs)
+                83 => {
+                    let (Some(value), Some(index), Some(array)) =
+                        (peek(stack, 1), peek(stack, 2), peek(stack, 3))
+                    else {
+                        break;
+                    };
+                    if array == 0 {
+                        break;
+                    }
+                    if HEAP
+                        .store_reference_unchecked_type(array, index, value)
+                        .is_none()
+                    {
+                        break;
+                    }
+                    stack.truncate(stack.len() - 3);
+                    pc += 1;
+                }
                 // arraylength
                 190 => {
                     let Some(array) = peek(stack, 1).filter(|array| *array != 0) else {

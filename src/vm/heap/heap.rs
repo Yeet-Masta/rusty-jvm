@@ -459,6 +459,86 @@ impl Heap {
         }
     }
 
+    /// Copies `length` elements between arrays of one element type (or an object array into a
+    /// supertype one), as raw bytes. Positions and length are in bounds, checked by the caller.
+    /// The source range is copied out before the destination is locked, so two threads copying
+    /// between the same arrays in opposite directions cannot deadlock.
+    pub(crate) fn copy_array_elements(
+        &self,
+        src: i32,
+        src_pos: usize,
+        dest: i32,
+        dest_pos: usize,
+        length: usize,
+    ) -> Result<()> {
+        let invalid = || Error::new_execution("arraycopy: range outside the array");
+        if src == dest {
+            let mut entry = self.data.get_mut(src).ok_or_else(invalid)?;
+            let Arr(array) = entry.value_mut() else {
+                return Err(invalid());
+            };
+            return array
+                .copy_elements_within(src_pos, dest_pos, length)
+                .ok_or_else(invalid);
+        }
+        let bytes = {
+            let entry = self.data.get(src).ok_or_else(invalid)?;
+            let Arr(array) = entry.value() else {
+                return Err(invalid());
+            };
+            array
+                .element_bytes(src_pos, length)
+                .ok_or_else(invalid)?
+                .to_vec()
+        };
+        let mut entry = self.data.get_mut(dest).ok_or_else(invalid)?;
+        let Arr(array) = entry.value_mut() else {
+            return Err(invalid());
+        };
+        array
+            .write_element_bytes(dest_pos, &bytes)
+            .ok_or_else(invalid)
+    }
+
+    /// `aastore` without the slow path: `None`, having stored nothing, unless `arrayref` is an
+    /// array, `index` is in bounds and `value` needs no element type check (see
+    /// [`Array::admits_without_check`]).
+    #[inline]
+    pub(crate) fn store_reference_unchecked_type(
+        &self,
+        arrayref: i32,
+        index: i32,
+        value: i32,
+    ) -> Option<()> {
+        // An array value has no class id here; its check takes the slow path.
+        let value_klass = if value == 0 {
+            None
+        } else {
+            Some(self.instance_klass_id(value).ok()??)
+        };
+        let mut entry = self.data.get_mut(arrayref)?;
+        let Arr(array) = entry.value_mut() else {
+            return None;
+        };
+        if !array.admits_without_check(value_klass) {
+            return None;
+        }
+        array.store(index, [value, 0]).ok()
+    }
+
+    /// After an `aastore` type check accepted `value` into `arrayref`, lets later stores of
+    /// instances of the same class skip it.
+    pub(crate) fn note_reference_store(&self, arrayref: i32, value: i32) {
+        let Ok(Some(klass_id)) = self.instance_klass_id(value) else {
+            return;
+        };
+        if let Some(mut entry) = self.data.get_mut(arrayref) {
+            if let Arr(array) = entry.value_mut() {
+                array.note_accepted(klass_id);
+            }
+        }
+    }
+
     /// Stores an array element given as JVM words, or returns `Err(length)` when the index is
     /// out of bounds.
     pub(crate) fn store_array_element(

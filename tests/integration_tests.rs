@@ -5761,3 +5761,23 @@ fn should_concatenate_strings_of_every_argument_kind() {
          loop 17171880805\n",
     );
 }
+
+#[test]
+fn should_keep_slow_path_semantics_on_warm_getter_store_and_copy_paths() {
+    utils::assert_success_utf8(
+        "samples.interpreter.hotpaths.HotPathSemantics",
+        "getters 503500 -9223372036854775805 -0.5 x\n\
+         same class 45\n\
+         null receiver NPE\n\
+         ASE java.lang.Double\n\
+         numbers 96 null 98 99\n\
+         objects s 1 4\n\
+         nested ASE\n\
+         ints forward [0, 1, 0, 1, 2, 3, 4, 7]\n\
+         ints back [0, 3, 4, 5, 6, 7, 6, 7]\n\
+         longs [0, -9223372036854775808, -1, 9223372036854775807]\n\
+         chars ello\n\
+         objects [a, b, c]\n\
+         partial copy a null\n",
+    );
+}

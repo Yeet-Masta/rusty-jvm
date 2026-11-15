@@ -77,6 +77,7 @@ impl JavaClass {
         self.mirror_clazz_ref.get().copied()
     }
 
+    #[cfg(test)]
     pub(crate) fn root_refs(&self) -> Result<Vec<i32>> {
         let mut roots = Vec::new();
         self.extend_root_refs(&mut roots)?;

@@ -165,6 +165,18 @@ pub(crate) fn arraycopy(
         return Ok(());
     }
 
+    // Same element type, or an object array into a supertype one: no per-element check, so copy
+    // the bytes in one go.
+    if primitive || fast_path {
+        return HEAP.copy_array_elements(
+            src_ref,
+            src_pos as usize,
+            dest_ref,
+            dest_pos as usize,
+            length as usize,
+        );
+    }
+
     let overlapping = src_ref == dest_ref && dest_pos > src_pos && dest_pos < src_pos + length;
     let dest_element_type_name = if !primitive && !fast_path {
         Some(undecorate(&dest_name[1..]).to_string())

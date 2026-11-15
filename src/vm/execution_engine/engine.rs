@@ -97,8 +97,14 @@ impl Engine {
                     };
                     (frame.get_bytecode_byte(), span)
                 };
+                // Also resolve when the frame's own method has not cached its class yet, though
+                // `klass` holds it from a caller in the same class: the frame-local loop and
+                // frameless calls only see the method's cache.
                 if ((18u8..=20u8).contains(&code) || (178u8..=201u8).contains(&code))
-                    && klass.is_none()
+                    && (klass.is_none()
+                        || stack_frames
+                            .last()
+                            .is_some_and(|frame| !frame.has_resolved_class()))
                 {
                     klass = Some(Self::current_class(&stack_frames)?);
                 }

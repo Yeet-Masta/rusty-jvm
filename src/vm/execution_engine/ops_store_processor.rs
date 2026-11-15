@@ -114,6 +114,9 @@ fn handle_object_array_store(stack_frames: &mut StackFrames) -> Result<()> {
         return Ok(());
     }
     HEAP.set_array_value(arrayref, index, value.to_vec())?;
+    if value.value() != 0 {
+        HEAP.note_reference_store(arrayref, value.value());
+    }
 
     let stack_frame = last_frame_mut(stack_frames)?;
     stack_frame.incr_pc();

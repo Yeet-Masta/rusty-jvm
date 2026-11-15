@@ -194,6 +194,9 @@ pub(crate) enum JavaInstance {
 pub(crate) struct Array {
     type_name: String,
     data: Vec<u8>,
+    /// Registry id of the last class whose instance an `aastore` type check accepted into this
+    /// array. Element types never change, so such instances are accepted again without the check.
+    store_klass: Option<usize>,
 }
 
 impl Array {
@@ -247,6 +250,7 @@ impl Array {
         Ok(Self {
             type_name: copy_string(type_name)?,
             data,
+            store_klass: None,
         })
     }
 
@@ -254,6 +258,7 @@ impl Array {
         Ok(Self {
             type_name: copy_string(&self.type_name)?,
             data: copy_slice(&self.data)?,
+            store_klass: self.store_klass,
         })
     }
 
@@ -291,6 +296,42 @@ impl Array {
     }
 
     /// Bytes per element, from the second character of a one-dimensional primitive array's name.
+    /// `count` elements from `start` as raw bytes, or `None` past the end.
+    pub(crate) fn element_bytes(&self, start: usize, count: usize) -> Option<&[u8]> {
+        let width = self.element_width();
+        self.data
+            .get(start.checked_mul(width)?..start.checked_add(count)?.checked_mul(width)?)
+    }
+
+    /// Overwrites elements from `start` with raw `bytes` taken from an array of the same element
+    /// width, or returns `None`, having written nothing, past the end.
+    pub(crate) fn write_element_bytes(&mut self, start: usize, bytes: &[u8]) -> Option<()> {
+        let from = start.checked_mul(self.element_width())?;
+        self.data
+            .get_mut(from..from.checked_add(bytes.len())?)?
+            .copy_from_slice(bytes);
+        Some(())
+    }
+
+    /// Moves `count` elements from `from` to `to` within this array, as `memmove` does.
+    pub(crate) fn copy_elements_within(
+        &mut self,
+        from: usize,
+        to: usize,
+        count: usize,
+    ) -> Option<()> {
+        let width = self.element_width();
+        let bytes = count.checked_mul(width)?;
+        let (source, target) = (from.checked_mul(width)?, to.checked_mul(width)?);
+        if source.checked_add(bytes)? > self.data.len()
+            || target.checked_add(bytes)? > self.data.len()
+        {
+            return None;
+        }
+        self.data.copy_within(source..source + bytes, target);
+        Some(())
+    }
+
     fn element_width(&self) -> usize {
         match self.type_name.as_bytes() {
             [_, b'B' | b'Z'] => 1,
@@ -335,6 +376,20 @@ impl Array {
 
     /// Stores JVM words (as [`Self::load`] returns them) at `index`, or returns the array's
     /// length when `index` is outside it.
+    /// Whether an `aastore` of an instance of class `value_klass` (`None` for `null`) needs no type
+    /// check: `null`, anything into an `Object[]`, or the class last accepted.
+    #[inline]
+    pub(crate) fn admits_without_check(&self, value_klass: Option<usize>) -> bool {
+        value_klass.is_none()
+            || self.store_klass == value_klass
+            || self.type_name == "[Ljava/lang/Object;"
+    }
+
+    /// Records that the type check accepted an instance of `klass_id`.
+    pub(crate) fn note_accepted(&mut self, klass_id: usize) {
+        self.store_klass = Some(klass_id);
+    }
+
     pub(crate) fn store(&mut self, index: i32, words: [i32; 2]) -> std::result::Result<(), i32> {
         let width = self.element_width();
         let length = self.data.len() / width;
