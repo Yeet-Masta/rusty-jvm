@@ -82,13 +82,18 @@ impl NativeLink {
 
     /// The address of the library symbol implementing this method, resolved once.
     fn library_symbol(&self, clazz_ref: i32) -> Result<i64> {
-        if let Some(&address) = self.library.get() {
-            return Ok(address);
-        }
-        let address = resolve_library_symbol(clazz_ref, &self.short_name, &self.long_name)?;
+        let address = match self.library.get() {
+            Some(&address) => address,
+            None => {
+                let address =
+                    resolve_library_symbol(clazz_ref, &self.short_name, &self.long_name)?;
+                *self.library.get_or_init(|| address)
+            }
+        };
+        // Reported for every call bound to a library symbol, cached or not.
         #[cfg(test)]
         crate::vm::safepoint::event(crate::vm::safepoint::Event::ExternalNativeResolved);
-        Ok(*self.library.get_or_init(|| address))
+        Ok(address)
     }
 }
 
