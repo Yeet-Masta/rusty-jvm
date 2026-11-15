@@ -483,17 +483,39 @@ impl JavaMethod {
         self.frame_code.get()?.klass.get()
     }
 
-    /// Whether the body is a lone `return` and the method holds no monitor, so a call to it
-    /// (`Object.<init>`, the end of most constructor chains) has no effect beyond consuming its
-    /// arguments.
+    /// Whether a call to the method, holding no monitor, has no effect beyond consuming its
+    /// arguments: its body is a lone `return` (`Object.<init>`, the end of most constructor
+    /// chains), or a constructor that only calls such a no-argument super constructor
+    /// (`aload_0; invokespecial; return`), once that `invokespecial` resolved its target.
     #[inline]
     pub(crate) fn is_empty_void(&self) -> bool {
+        const ALOAD_0: u8 = 0x2a;
+        const INVOKESPECIAL: u8 = 0xb7;
         const RETURN: u8 = 0xb1;
-        !self.is_synchronized()
-            && self
-                .code_context
-                .as_ref()
-                .is_some_and(|context| context.bytecode().as_slice() == [RETURN])
+        if self.is_synchronized() {
+            return false;
+        }
+        let Some(context) = self.code_context.as_ref() else {
+            return false;
+        };
+        match *context.bytecode().as_slice() {
+            [RETURN] => true,
+            [ALOAD_0, INVOKESPECIAL, high, low, RETURN] => self
+                .resolved_class()
+                .and_then(|klass| {
+                    klass.resolved_member_ref(
+                        crate::vm::method_area::java_class::MemberRefKind::Method,
+                        u16::from_be_bytes([high, low]),
+                    )
+                })
+                .and_then(|member| member.special_target.get())
+                .is_some_and(|target| {
+                    // The receiver alone: anything else would leave the call's arguments to it.
+                    target.arg_ref_chunks().is_ok_and(|chunks| chunks.len() == 1)
+                        && target.is_empty_void()
+                }),
+            _ => false,
+        }
     }
 
     pub fn is_synchronized(&self) -> bool {

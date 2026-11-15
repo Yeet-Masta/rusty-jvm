@@ -2,7 +2,8 @@ package samples.interpreter.hotpaths;
 
 // Paths the interpreter takes without the general machinery once a site is warm: getters run
 // without a frame, aastore skips the element type check for a class it already accepted, and
-// System.arraycopy copies compatible arrays in bulk. Each must still behave like the slow path.
+// System.arraycopy copies compatible arrays in bulk, and constructors that only call an empty
+// super constructor are skipped. Each must still behave like the slow path.
 public class HotPathSemantics {
     private int count;
     private long total;
@@ -27,6 +28,7 @@ public class HotPathSemantics {
         getters();
         arrayStores();
         arrayCopies();
+        constructors();
     }
 
     static void getters() {
@@ -122,5 +124,27 @@ public class HotPathSemantics {
         } catch (ArrayStoreException e) {
             System.out.println("partial copy " + target[0] + " " + target[1]);
         }
+    }
+
+    static class Empty {}
+    static class EmptyChild extends Empty {}
+    static class Initialized { int x = 5; }
+    // Looks like a constructor that only calls its super constructor, but that one does work.
+    static class InitializedChild extends Initialized {}
+    static int made;
+    static class Counting { Counting() { made++; } }
+    static class CountingChild extends Counting {}
+
+    static void constructors() {
+        long sum = 0;
+        int empties = 0;
+        for (int i = 0; i < 1000; i++) {
+            sum += new InitializedChild().x;
+            new CountingChild();
+            if (new EmptyChild() instanceof Empty) {
+                empties++;
+            }
+        }
+        System.out.println("constructors " + sum + " " + made + " " + empties);
     }
 }

@@ -5778,7 +5778,8 @@ fn should_keep_slow_path_semantics_on_warm_getter_store_and_copy_paths() {
          longs [0, -9223372036854775808, -1, 9223372036854775807]\n\
          chars ello\n\
          objects [a, b, c]\n\
-         partial copy a null\n",
+         partial copy a null\n\
+         constructors 5000 1000 1000\n",
     );
 }
 

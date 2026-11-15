@@ -63,6 +63,10 @@ pub(crate) struct ObjectTable<V> {
     high: AtomicUsize,
     /// Chunks emptied for good, waiting for [`Self::free_retired`].
     retired: Mutex<Vec<Box<Chunk<V>>>>,
+    /// Retired chunks no thread can still be looking into, kept to be handed out again: every
+    /// reference is new, so an allocating program needs a chunk every `CHUNK` objects, and a
+    /// recycled one is already built and in memory.
+    spare: Mutex<Vec<Box<Chunk<V>>>>,
     /// The table owns `V`s behind raw pointers; this ties its auto traits to theirs.
     _owns: PhantomData<Box<Chunk<V>>>,
 }
@@ -139,6 +143,7 @@ impl<V> Default for ObjectTable<V> {
                 .collect(),
             high: AtomicUsize::new(0),
             retired: Mutex::new(Vec::new()),
+            spare: Mutex::new(Vec::new()),
             _owns: PhantomData,
         }
     }
@@ -165,7 +170,7 @@ impl<V> ObjectTable<V> {
         if let Some(chunk) = self.chunk(index) {
             return chunk;
         }
-        let fresh = Box::into_raw(Chunk::new());
+        let fresh = Box::into_raw(self.spare.lock().pop().unwrap_or_else(Chunk::new));
         let chunk = match self.chunks[index].compare_exchange(
             ptr::null_mut(),
             fresh,
@@ -178,7 +183,7 @@ impl<V> ObjectTable<V> {
             }
             Err(existing) => {
                 // SAFETY: `fresh` was never published.
-                drop(unsafe { Box::from_raw(fresh) });
+                self.spare.lock().push(unsafe { Box::from_raw(fresh) });
                 existing
             }
         };
@@ -315,8 +320,19 @@ impl<V> ObjectTable<V> {
     /// Frees retired chunks. Call only while no other thread can borrow from the table and none
     /// has since the chunks were retired.
     pub(crate) fn free_retired(&self) {
+        /// The most spare chunks kept; the rest are freed.
+        const SPARE: usize = 16;
         let retired = std::mem::take(&mut *self.retired.lock());
-        drop(retired);
+        let mut spare = self.spare.lock();
+        for chunk in retired {
+            if spare.len() >= SPARE {
+                break;
+            }
+            // Retired only once every slot was filled and emptied again: nothing is present, so
+            // it is as new once its fill count starts over.
+            chunk.filled.store(0, Ordering::Relaxed);
+            spare.push(chunk);
+        }
     }
 
     /// Every object, in reference order. Weakly consistent: objects added or removed meanwhile
