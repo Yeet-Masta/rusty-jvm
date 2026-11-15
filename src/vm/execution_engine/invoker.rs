@@ -40,6 +40,12 @@ pub(crate) fn invoke_interpreted(
     let ref_chunks = java_method.arg_ref_chunks()?;
     let count = ref_chunks.len();
     validate_arg_slots(ref_chunks, last_frame_mut(stack_frames)?.top_slots(count)?)?;
+    if java_method.is_empty_void() {
+        // Running it would only push a frame and pop it again; the caller's pc already points
+        // past the invoke.
+        last_frame_mut(stack_frames)?.drop_top_slots(count);
+        return Ok(true);
+    }
     if stack_limit::would_overflow(stack_frames) {
         last_frame_mut(stack_frames)?.drop_top_slots(count);
         stack_limit::throw_stack_overflow(stack_frames)?;

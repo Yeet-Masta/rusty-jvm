@@ -30,7 +30,7 @@ pub(super) static FORCE_CLAIM_PATH: std::sync::atomic::AtomicBool =
 pub(crate) struct LoadedClasses {
     loading: super::class_loading::Loading,
     loaded_classes: DashMap<String, Arc<ClassEntry>, FastBuildHasher>,
-    id_index: DashMap<usize, Arc<ClassEntry>>,
+    id_index: DashMap<usize, Arc<ClassEntry>, FastBuildHasher>,
     next_id: AtomicUsize,
 
     construct_stage: AtomicI8,
@@ -57,7 +57,7 @@ impl LoadedClasses {
             .collect();
         let mut roots = Vec::new();
         for class in classes {
-            roots.extend(class.root_refs()?);
+            class.extend_root_refs(&mut roots)?;
         }
         Ok(roots)
     }

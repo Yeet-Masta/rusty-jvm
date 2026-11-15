@@ -459,6 +459,19 @@ impl JavaMethod {
             .contains(MethodModifier::Static)
     }
 
+    /// Whether the body is a lone `return` and the method holds no monitor, so a call to it
+    /// (`Object.<init>`, the end of most constructor chains) has no effect beyond consuming its
+    /// arguments.
+    #[inline]
+    pub(crate) fn is_empty_void(&self) -> bool {
+        const RETURN: u8 = 0xb1;
+        !self.is_synchronized()
+            && self
+                .code_context
+                .as_ref()
+                .is_some_and(|context| context.bytecode().as_slice() == [RETURN])
+    }
+
     pub fn is_synchronized(&self) -> bool {
         MethodModifier::from_bits_truncate(self.access_flags as u16)
             .contains(MethodModifier::Synchronized)

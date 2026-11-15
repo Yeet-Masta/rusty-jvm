@@ -22,6 +22,7 @@ use derive_new::new;
 use getset::{CopyGetters, Getters};
 use jclassmodel::attributes::BootstrapMethodInfo;
 use jdescriptor::MethodDescriptor;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 /// The `InvokeDynamicRunner` is responsible for handling the `invokedynamic` instruction in the JVM.
@@ -30,6 +31,8 @@ use std::sync::Arc;
 #[derive(Debug, Default)]
 pub(crate) struct InvokeDynamicRunner {
     resolved_methods: DashMap<u16, Arc<ResolvedMethod>>,
+    /// Set before the first site is stored, so a root scan can skip a class without sites.
+    any_resolved: AtomicBool,
 }
 
 #[derive(Debug, new, CopyGetters, Getters)]
@@ -120,12 +123,25 @@ impl TryFrom<(BootstrapMethodInfo, &str)> for BootstrapInfo {
 
 impl InvokeDynamicRunner {
     /// Quiescent read only. Resolution runs outside the map's entry guard.
+    #[cfg(test)]
     pub(crate) fn resolved_refs(&self) -> Vec<i32> {
-        self.resolved_methods
-            .iter()
-            .map(|entry| entry.method_handle_dynamic_invoked_ref())
-            .filter(|&reference| reference != 0)
-            .collect()
+        let mut refs = Vec::new();
+        self.extend_resolved_refs(&mut refs);
+        refs
+    }
+
+    /// Quiescent read only. Appends the call sites' targets to `roots`.
+    pub(crate) fn extend_resolved_refs(&self, roots: &mut Vec<i32>) {
+        // Most classes have no invokedynamic site; iterating the map locks every shard.
+        if !self.any_resolved.load(Ordering::Acquire) {
+            return;
+        }
+        roots.extend(
+            self.resolved_methods
+                .iter()
+                .map(|entry| entry.method_handle_dynamic_invoked_ref())
+                .filter(|&reference| reference != 0),
+        );
     }
 
     /// Runs the invokedynamic call site logic, resolving it if not cached,
@@ -144,6 +160,7 @@ impl InvokeDynamicRunner {
             Some(resolved) => resolved,
             None => {
                 let resolved = Arc::new(Self::resolve(current_class_name, invokedynamic_index)?);
+                self.any_resolved.store(true, Ordering::Release);
                 Arc::clone(
                     &self
                         .resolved_methods
@@ -337,6 +354,7 @@ mod gc_tests {
     fn gc_roots_indy_cache_exposes_only_already_resolved_handles() {
         let runner = InvokeDynamicRunner::default();
         assert!(runner.resolved_refs().is_empty());
+        runner.any_resolved.store(true, Ordering::Release);
         runner.resolved_methods.insert(
             7,
             Arc::new(ResolvedMethod::new(53, "()V".parse().unwrap(), None)),

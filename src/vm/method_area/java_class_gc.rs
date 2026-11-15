@@ -79,6 +79,12 @@ impl JavaClass {
 
     pub(crate) fn root_refs(&self) -> Result<Vec<i32>> {
         let mut roots = Vec::new();
+        self.extend_root_refs(&mut roots)?;
+        Ok(roots)
+    }
+
+    /// Appends this class's roots to `roots`, so a scan over every class builds one vector.
+    pub(crate) fn extend_root_refs(&self, roots: &mut Vec<i32>) -> Result<()> {
         roots.extend(self.mirror_ref_if_present());
         for value in &self.static_references {
             roots.push(value.reference_snapshot()?);
@@ -93,9 +99,9 @@ impl JavaClass {
                 .values()
                 .filter_map(|method| method.reflection_ref_if_present()),
         );
-        roots.extend(self.invoke_dynamic_runner.resolved_refs());
+        self.invoke_dynamic_runner.extend_resolved_refs(roots);
         roots.extend(self.static_fields_init_state.failure_root()?);
-        Ok(roots)
+        Ok(())
     }
 }
 

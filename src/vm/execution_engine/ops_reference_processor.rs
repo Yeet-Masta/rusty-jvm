@@ -21,7 +21,9 @@ use crate::vm::stack::slot::Slot;
 use crate::vm::stack::stack_frame::{StackFrame, StackFrames};
 use jclassmodel::constant_pool::ConstantPoolLookup;
 use jdescriptor::MethodDescriptor;
-use std::sync::Arc;
+use crate::vm::commons::fast_hash::FastBuildHasher;
+use dashmap::DashMap;
+use std::sync::{Arc, LazyLock};
 use tracing::trace;
 
 pub(crate) fn process(
@@ -415,6 +417,22 @@ pub(crate) fn process(
             trace!("ATHROW -> throwable_ref={throwable_ref}, exception_name={exception_name}, found_exception_handler={found_exception_handler}");
         }
         CHECKCAST => {
+            // Fast path: null, or an instance whose class this site already checked. The
+            // reference stays on the operand stack, so nothing needs rooting.
+            {
+                let stack_frame = last_frame_mut(stack_frames)?;
+                let index = stack_frame.peek_two_bytes() as u16;
+                let objectref = stack_frame.top_slots(1)?[0].value();
+                let passes = objectref == 0
+                    || matches!(
+                        HEAP.instance_klass_id(objectref)?,
+                        Some(id) if current_class.cached_type_check(index, id) == Some(true)
+                    );
+                if passes {
+                    stack_frame.advance_pc(3);
+                    return Ok(());
+                }
+            }
             let (operand, class_constpool_index) = {
                 let stack_frame = last_frame_mut(stack_frames)?;
                 let class_constpool_index = stack_frame.extract_two_bytes() as u16;
@@ -440,6 +458,9 @@ pub(crate) fn process(
                 let instance_class_name = HEAP.get_instance_name(objectref)?;
 
                 let possible_cast = InstanceChecker::checkcast(&instance_class_name, &class_name)?;
+                if let Some(id) = HEAP.instance_klass_id(objectref)? {
+                    current_class.record_type_check(class_constpool_index, id, possible_cast);
+                }
                 if !possible_cast {
                     // Thrown before moving past the instruction, so its own handler range applies
                     throw_class_cast_exception(&instance_class_name, &class_name, stack_frames)?;
@@ -455,6 +476,22 @@ pub(crate) fn process(
         }
         INSTANCEOF => {
             let stack_frame = last_frame_mut(stack_frames)?;
+            {
+                let index = stack_frame.peek_two_bytes() as u16;
+                let objectref = stack_frame.top_slots(1)?[0].value();
+                let cached = if objectref == 0 {
+                    Some(false)
+                } else {
+                    HEAP.instance_klass_id(objectref)?
+                        .and_then(|id| current_class.cached_type_check(index, id))
+                };
+                if let Some(instance_of) = cached {
+                    stack_frame.pop_slot();
+                    stack_frame.push(i32::from(instance_of))?;
+                    stack_frame.advance_pc(3);
+                    return Ok(());
+                }
+            }
             // todo: merge me with CHECKCAST
             let class_constpool_index = stack_frame.extract_two_bytes() as u16;
             stack_frame.incr_pc();
@@ -478,10 +515,11 @@ pub(crate) fn process(
 
                 let instance_class_name = HEAP.get_instance_name(objectref)?;
 
-                i32::from(InstanceChecker::checkcast(
-                    &instance_class_name,
-                    &class_name,
-                )?)
+                let outcome = InstanceChecker::checkcast(&instance_class_name, &class_name)?;
+                if let Some(id) = HEAP.instance_klass_id(objectref)? {
+                    current_class.record_type_check(class_constpool_index, id, outcome);
+                }
+                i32::from(outcome)
             } else {
                 0
             };
@@ -545,11 +583,27 @@ fn get_args(stack_frames: &mut StackFrames, arg_num: usize) -> Result<RootedSlot
 
 /// Selects the implementation for a virtual or interface call on `receiver`, through the call
 /// site's monomorphic inline cache when the receiver's class matches it.
+/// Virtual call targets for sites that saw more receiver classes than their inline ways hold.
+static MEGAMORPHIC_TARGETS: LazyLock<DashMap<(usize, usize), Arc<JavaMethod>, FastBuildHasher>> =
+    LazyLock::new(DashMap::default);
+
 fn virtual_target(member: &MemberRef, receiver: i32, what: &str) -> Result<Arc<JavaMethod>> {
     let klass_id = HEAP.instance_klass_id(receiver)?;
-    if let (Some(id), Some((cached_id, cached))) = (klass_id, member.virtual_target.get()) {
-        if id == *cached_id {
-            return Ok(Arc::clone(cached));
+    if let Some(id) = klass_id {
+        for way in &member.virtual_target {
+            match way.get() {
+                Some((cached_id, cached)) if *cached_id == id => return Ok(Arc::clone(cached)),
+                Some(_) => continue,
+                None => break,
+            }
+        }
+    }
+    // Past the inline ways: a shared map keyed by (receiver class, site). The site's address is
+    // stable because classes, and the member refs they own, are never freed.
+    let site = std::ptr::from_ref(member) as usize;
+    if let Some(id) = klass_id {
+        if let Some(found) = MEGAMORPHIC_TARGETS.get(&(id, site)) {
+            return Ok(Arc::clone(found.value()));
         }
     }
     let instance_name = HEAP.get_instance_name(receiver)?;
@@ -561,7 +615,15 @@ fn virtual_target(member: &MemberRef, receiver: i32, what: &str) -> Result<Arc<J
             ))
         })?;
     if let Some(id) = klass_id {
-        let _ = member.virtual_target.set((id, Arc::clone(&resolved)));
+        // Claim the first free way. A racing thread may fill it with another class first; then
+        // try the next one, and give up once all are taken.
+        let claimed = member.virtual_target.iter().any(|way| {
+            let (cached_id, _) = way.get_or_init(|| (id, Arc::clone(&resolved)));
+            *cached_id == id
+        });
+        if !claimed {
+            MEGAMORPHIC_TARGETS.insert((id, site), Arc::clone(&resolved));
+        }
     }
     Ok(resolved)
 }

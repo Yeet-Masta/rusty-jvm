@@ -59,8 +59,8 @@ impl StackFramesUtil {
             frames
                 .map(|frame| {
                     (
-                        frame.current_class_name().to_string(),
-                        frame.method_name().to_string(),
+                        frame.current_class_name_arc(),
+                        frame.method_name_arc(),
                     )
                 })
                 .collect::<Vec<_>>()
@@ -69,7 +69,7 @@ impl StackFramesUtil {
         for (n, (class_name, method_name)) in frames.iter().enumerate() {
             let method = CLASSES.get(class_name)?.get_method(method_name)?;
             match n {
-                0 if method_name != GET_CALLER_CLASS || class_name != REFLECTION => {
+                0 if method_name.as_str() != GET_CALLER_CLASS || class_name.as_str() != REFLECTION => {
                     return Ok(CallerClass::Misuse(
                         "JVM_GetCallerClass must only be called from Reflection.getCallerClass"
                             .to_string(),
@@ -84,7 +84,7 @@ impl StackFramesUtil {
                 }
                 _ => {
                     if !Self::is_ignored_by_security_stack_walk(class_name, &method)? {
-                        return Ok(CallerClass::Found(class_name.clone()));
+                        return Ok(CallerClass::Found(class_name.to_string()));
                     }
                 }
             }
@@ -129,8 +129,8 @@ impl StackFramesUtil {
             let newest_to_oldest: Vec<_> = frames
                 .map(|frame| {
                     (
-                        frame.current_class_name().to_string(),
-                        frame.method_name().to_string(),
+                        frame.current_class_name_arc(),
+                        frame.method_name_arc(),
                         Self::extract_line_number(frame.line_numbers(), frame.ex_pc()),
                         frame.bci() as u16,
                     )
@@ -151,7 +151,7 @@ impl StackFramesUtil {
                 .iter()
                 .position(|frame| {
                     let name = frame.1.split(':').next();
-                    !(frame.0 == "java/lang/Throwable" && name == Some("fillInStackTrace"))
+                    !(frame.0.as_str() == "java/lang/Throwable" && name == Some("fillInStackTrace"))
                 })
                 .unwrap_or(newest_to_oldest.len());
 
@@ -160,7 +160,7 @@ impl StackFramesUtil {
             let eligible: Vec<_> = newest_to_oldest[after_fill..]
                 .iter()
                 .rev()
-                .take_while(|frame| frame.0 != throwable_name)
+                .take_while(|frame| frame.0.as_str() != throwable_name)
                 .collect();
 
             // When the stack is deeper than `max_stack_size`, the JVM keeps the *newest* frames
@@ -189,8 +189,8 @@ impl StackFramesUtil {
                 .take(max_stack_size)
                 .map(|frame| {
                     (
-                        frame.current_class_name().to_string(),
-                        frame.method_name().to_string(),
+                        frame.current_class_name_arc(),
+                        frame.method_name_arc(),
                         Self::extract_line_number(frame.line_numbers(), frame.ex_pc()),
                         frame.bci() as u16,
                     )
@@ -210,8 +210,8 @@ impl StackFramesUtil {
                 .iter()
                 .map(|frame| {
                     (
-                        frame.code.class_name.to_string(),
-                        frame.code.method_name.to_string(),
+                        Arc::clone(&frame.code.class_name),
+                        Arc::clone(&frame.code.method_name),
                         Self::extract_line_number(&frame.code.line_numbers, frame.ex_pc),
                         frame.bci as u16,
                     )
@@ -220,7 +220,7 @@ impl StackFramesUtil {
         )
     }
 
-    fn resolve_trace(frames: Vec<(String, String, u16, u16)>) -> Result<Vec<StackElement>> {
+    fn resolve_trace(frames: Vec<(Arc<String>, Arc<String>, u16, u16)>) -> Result<Vec<StackElement>> {
         frames
             .into_iter()
             .map(|(class, method, line, bci)| {

@@ -48,60 +48,46 @@ pub(crate) fn build_backtrace(stack_elements: &[StackElement]) -> Result<i32> {
             .map(|element| Slot::Ref(element.class_ref()))
             .collect(),
     );
-    let depth = stack_elements.len() as i32;
-
-    let mut destination = crate::vm::stack::rooted_slots::RootedSlots::new();
-    let backtrace_ref = HEAP.create_array("[Ljava/lang/Object;", 5, &mut destination)?;
-    roots.add_root(Slot::Ref(backtrace_ref));
-
-    let class_array_ref = HEAP.create_array("[Ljava/lang/Class;", depth, &mut destination)?;
-    roots.add_root(Slot::Ref(class_array_ref));
-    let method_array_ref = HEAP.create_array("[J", depth, &mut destination)?;
-    roots.add_root(Slot::Ref(method_array_ref));
-    let line_array_ref = HEAP.create_array("[I", depth, &mut destination)?;
-    roots.add_root(Slot::Ref(line_array_ref));
-    let tag_array_ref = HEAP.create_array("[I", depth, &mut destination)?;
-    roots.add_root(Slot::Ref(tag_array_ref));
-    let bci_array_ref = HEAP.create_array("[I", depth, &mut destination)?;
-    roots.add_root(Slot::Ref(bci_array_ref));
-
-    HEAP.set_array_value(backtrace_ref, 0, vec![class_array_ref])?;
-    HEAP.set_array_value(backtrace_ref, 1, vec![method_array_ref])?;
-    HEAP.set_array_value(backtrace_ref, 2, vec![line_array_ref])?;
-    HEAP.set_array_value(backtrace_ref, 3, vec![tag_array_ref])?;
-    HEAP.set_array_value(backtrace_ref, 4, vec![bci_array_ref])?;
-
-    for (index, stack_element) in stack_elements.iter().enumerate() {
-        HEAP.set_array_value(
-            class_array_ref,
-            index as i32,
-            vec![stack_element.class_ref()],
-        )?;
-        HEAP.set_array_value(
-            method_array_ref,
-            index as i32,
-            i64_to_vec(stack_element.method_ref()),
-        )?;
-        HEAP.set_array_value(
-            line_array_ref,
-            index as i32,
-            vec![stack_element.line_number() as i32],
-        )?;
-        HEAP.set_array_value(
-            tag_array_ref,
-            index as i32,
-            vec![if stack_element.is_native() {
+    let classes: Vec<i32> = stack_elements.iter().map(StackElement::class_ref).collect();
+    let methods: Vec<i32> = stack_elements
+        .iter()
+        .flat_map(|element| i64_to_vec(element.method_ref()))
+        .collect();
+    let lines: Vec<i32> = stack_elements
+        .iter()
+        .map(|element| element.line_number() as i32)
+        .collect();
+    let tags: Vec<i32> = stack_elements
+        .iter()
+        .map(|element| {
+            if element.is_native() {
                 NATIVE_METHOD
             } else {
                 INTERPRETED_METHOD
-            }],
-        )?;
-        HEAP.set_array_value(
-            bci_array_ref,
-            index as i32,
-            vec![stack_element.bci() as i32],
-        )?;
+            }
+        })
+        .collect();
+    let bcis: Vec<i32> = stack_elements
+        .iter()
+        .map(|element| element.bci() as i32)
+        .collect();
+
+    // Each array is created already filled; every one stays rooted until the holder publishes it.
+    let mut destination = crate::vm::stack::rooted_slots::RootedSlots::new();
+    let mut parts = [0i32; 5];
+    for (part, (type_name, values)) in parts.iter_mut().zip([
+        ("[Ljava/lang/Class;", &classes),
+        ("[J", &methods),
+        ("[I", &lines),
+        ("[I", &tags),
+        ("[I", &bcis),
+    ]) {
+        *part = HEAP.create_array_with_values(type_name, values, &mut destination)?;
+        roots.add_root(Slot::Ref(*part));
     }
+    let backtrace_ref =
+        HEAP.create_array_with_values("[Ljava/lang/Object;", &parts, &mut destination)?;
+    roots.add_root(Slot::Ref(backtrace_ref));
 
     Ok(backtrace_ref)
 }

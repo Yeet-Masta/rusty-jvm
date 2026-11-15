@@ -105,6 +105,9 @@ pub(crate) struct JavaClass {
     /// Classes named by this class's constant pool, by index, once an opcode resolved them:
     /// the class's id in the registry and the class.
     class_refs: Box<[OnceLock<(usize, Arc<JavaClass>)>]>,
+    /// `checkcast`/`instanceof` outcomes by constant pool index, for the first receiver classes
+    /// seen there (by registry id). Allocated on first use, since most entries never need one.
+    type_checks: Box<[OnceLock<Box<TypeCheckWays>>]>,
     /// The loader that defined this class, when it is not one of the built-in loaders; `None`
     /// for the shared built-in namespace, where symbolic names are registry keys as they stand.
     #[get_copy = "pub(crate)"]
@@ -123,6 +126,13 @@ pub(crate) enum MemberRefKind {
     Field,
 }
 
+/// How many receiver classes one `checkcast`/`instanceof` site caches.
+const TYPE_CHECK_WAYS: usize = 4;
+type TypeCheckWays = [OnceLock<(usize, bool)>; TYPE_CHECK_WAYS];
+
+/// How many receiver classes one `invokevirtual`/`invokeinterface` site caches.
+pub(crate) const VIRTUAL_CACHE_WAYS: usize = 4;
+
 /// A resolved `CONSTANT_{Methodref,InterfaceMethodref,Fieldref}` entry.
 #[derive(Debug)]
 pub(crate) struct MemberRef {
@@ -140,9 +150,11 @@ pub(crate) struct MemberRef {
     pub(crate) static_target: OnceLock<(Arc<JavaClass>, Arc<JavaMethod>)>,
     /// `invokespecial`: the resolved method.
     pub(crate) special_target: OnceLock<Arc<JavaMethod>>,
-    /// `invokevirtual`/`invokeinterface`: the first receiver class seen and its implementation
-    /// (monomorphic). Other receiver classes take the full lookup.
-    pub(crate) virtual_target: OnceLock<(usize, Arc<JavaMethod>)>,
+    /// `invokevirtual`/`invokeinterface`: the first receiver classes seen and their
+    /// implementations (polymorphic up to `VIRTUAL_CACHE_WAYS`). Further receiver classes take the
+    /// full lookup. Shared library code (e.g. `HashMap.hash`) sees several receiver classes, so a
+    /// single entry would often be taken by a class only used during startup.
+    pub(crate) virtual_target: [OnceLock<(usize, Arc<JavaMethod>)>; VIRTUAL_CACHE_WAYS],
     /// `getstatic`/`putstatic`: the resolved field.
     pub(crate) static_field: OnceLock<StaticField>,
     /// `getfield`/`putfield`: the resolved field.
@@ -278,6 +290,37 @@ pub enum InnerState {
 impl JavaClass {
     /// The class a `CONSTANT_Class` entry of this class's constant pool names, loaded (but not
     /// initialized) on first use, with its id in the class registry.
+    /// The cached outcome of the `checkcast`/`instanceof` at constant pool `index` for an
+    /// instance of the class with registry id `klass_id`, if one was recorded.
+    #[inline]
+    pub(crate) fn cached_type_check(&self, index: u16, klass_id: usize) -> Option<bool> {
+        let ways = self.type_checks.get(usize::from(index))?.get()?;
+        for way in ways.iter() {
+            match way.get() {
+                Some((id, outcome)) if *id == klass_id => return Some(*outcome),
+                Some(_) => continue,
+                None => return None,
+            }
+        }
+        None
+    }
+
+    /// Records a `checkcast`/`instanceof` outcome for [`Self::cached_type_check`]. The outcome
+    /// only depends on the two classes, so it holds for as long as they exist (classes are
+    /// never unloaded). Dropped once the site has seen `TYPE_CHECK_WAYS` classes.
+    pub(crate) fn record_type_check(&self, index: u16, klass_id: usize, outcome: bool) {
+        let Some(slot) = self.type_checks.get(usize::from(index)) else {
+            return;
+        };
+        let ways = slot.get_or_init(Default::default);
+        for way in ways.iter() {
+            let (id, _) = way.get_or_init(|| (klass_id, outcome));
+            if *id == klass_id {
+                return;
+            }
+        }
+    }
+
     pub(crate) fn class_ref(&self, index: u16) -> Result<&(usize, Arc<JavaClass>)> {
         let missing =
             || Error::new_constant_pool(&format!("Error getting class name by index {index}"));
@@ -358,7 +401,7 @@ impl JavaClass {
             arg_slots: OnceLock::new(),
             static_target: OnceLock::new(),
             special_target: OnceLock::new(),
-            virtual_target: OnceLock::new(),
+            virtual_target: Default::default(),
             static_field: OnceLock::new(),
             instance_field: OnceLock::new(),
         };
@@ -606,6 +649,7 @@ impl JavaClass {
             member_refs: (0..member_ref_slots).map(|_| OnceLock::new()).collect(),
             constants: (0..member_ref_slots).map(|_| OnceLock::new()).collect(),
             class_refs: (0..member_ref_slots).map(|_| OnceLock::new()).collect(),
+            type_checks: (0..member_ref_slots).map(|_| OnceLock::new()).collect(),
             defining_loader: None,
             hidden: false,
             nest_host: OnceLock::new(),

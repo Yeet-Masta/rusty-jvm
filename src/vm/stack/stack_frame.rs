@@ -438,6 +438,14 @@ impl StackFrame {
         ((byte1 << 24) | (byte2 << 16) | (byte3 << 8) | byte4) as i32
     }
 
+    /// The two operand bytes following the current opcode, without moving the pc.
+    #[inline]
+    pub(crate) fn peek_two_bytes(&self) -> i16 {
+        let high = self.code.bytecode[self.pc + 1] as i16;
+        let low = self.code.bytecode[self.pc + 2] as i16;
+        (high << 8) | low
+    }
+
     pub fn extract_one_byte(&mut self) -> u8 {
         self.incr_pc();
         self.get_bytecode_byte()
@@ -630,6 +638,10 @@ impl StackFrame {
 
     pub fn method_name(&self) -> &str {
         &self.code.method_name
+    }
+
+    pub(crate) fn method_name_arc(&self) -> Arc<String> {
+        Arc::clone(&self.code.method_name)
     }
 
     /// Returns the exception program counter (ex_pc) if it is set, otherwise returns the current program counter (pc).
