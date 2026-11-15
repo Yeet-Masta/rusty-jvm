@@ -18,9 +18,10 @@ pub(crate) use fast::FrameLocalStop;
 
 #[derive(Clone, Debug)]
 pub(crate) struct StackFrame {
-    /// Per-method metadata shared by every frame of the method: one reference-count update per
-    /// call instead of one per field.
-    code: Arc<FrameCode>,
+    /// Per-method metadata shared by every frame of the method. It lives as long as its method,
+    /// and so for the life of the VM (class unloading is disabled): a call takes no reference
+    /// count on it.
+    code: &'static FrameCode,
     pc: usize,
     /// Start pc of the instruction currently being dispatched, stamped by the interpreter loop
     /// before the opcode's operands are decoded. Unlike `pc` (which the handler advances while
@@ -52,7 +53,8 @@ impl std::fmt::Debug for ClassCache {
     }
 }
 
-/// The immutable, per-method part of a frame. Built once per method and shared by its frames.
+/// The immutable, per-method part of a frame. Built once per method and shared by its frames,
+/// and never freed: methods live for the life of the VM.
 #[derive(Debug)]
 pub(crate) struct FrameCode {
     pub(crate) method_name: Arc<String>,
@@ -266,6 +268,8 @@ pub(crate) fn observe_frame_pops<R>(
 }
 
 impl StackFrame {
+    /// A frame with metadata of its own, which it leaks: for tests only.
+    #[cfg(test)]
     pub fn new(
         method_name: Arc<String>,
         locals_size: usize,
@@ -276,14 +280,14 @@ impl StackFrame {
         exception_table: Arc<ExceptionTable>,
     ) -> Self {
         Self::from_code(
-            Arc::new(FrameCode {
+            Box::leak(Box::new(FrameCode {
                 method_name,
                 bytecode: bytecode_ref,
                 class_name: current_class_name,
                 line_numbers,
                 exception_table,
                 klass: ClassCache::default(),
-            }),
+            })),
             locals_size,
             stack_size,
         )
@@ -314,7 +318,11 @@ impl StackFrame {
     }
 
     /// A frame for a method whose shared metadata is already built.
-    pub(crate) fn from_code(code: Arc<FrameCode>, locals_size: usize, stack_size: usize) -> Self {
+    pub(crate) fn from_code(
+        code: &'static FrameCode,
+        locals_size: usize,
+        stack_size: usize,
+    ) -> Self {
         StackFrame {
             code,
             pc: 0,
@@ -353,19 +361,23 @@ impl StackFrame {
     /// stack before dispatch, so this frame is the only place a reference argument — the receiver
     /// included — can be seen as a root while the native runs. That window is not brief: resolving
     /// a native symbol re-enters Java, and any native may call back.
+    ///
+    /// Its metadata is its own, and leaked: for tests only. The VM builds these frames with
+    /// [`JavaMethod::new_native_stack_frame`](crate::vm::method_area::java_method::JavaMethod::new_native_stack_frame).
+    #[cfg(test)]
     pub fn new_native(
         method_name: Arc<String>,
         current_class_name: Arc<String>,
         args: Vec<Slot>,
     ) -> Self {
         Self::native_from_code(
-            Arc::new(FrameCode::native(method_name, current_class_name)),
+            Box::leak(Box::new(FrameCode::native(method_name, current_class_name))),
             args,
         )
     }
 
     /// A native method's synthetic frame over already-built shared metadata.
-    pub(crate) fn native_from_code(code: Arc<FrameCode>, args: Vec<Slot>) -> Self {
+    pub(crate) fn native_from_code(code: &'static FrameCode, args: Vec<Slot>) -> Self {
         StackFrame {
             code,
             pc: 0,
@@ -386,7 +398,7 @@ impl StackFrame {
     /// What a stack trace needs of this frame, detached from the frame itself.
     pub(crate) fn snapshot(&self) -> crate::vm::safepoint::FrameSnapshot {
         crate::vm::safepoint::FrameSnapshot {
-            code: Arc::clone(&self.code),
+            code: self.code,
             ex_pc: self.ex_pc(),
             bci: self.bci,
         }

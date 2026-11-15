@@ -40,7 +40,8 @@ pub(crate) struct JavaMethod {
     /// Which of this method's argument chunks are references — see [`JavaMethod::arg_ref_chunks`].
     arg_ref_chunks: OnceCell<Vec<bool>>,
     /// Shared metadata for this method's frames, built on first call (after `with_class_name`).
-    frame_code: OnceCell<Arc<FrameCode>>,
+    /// Built on the method's first frame and never freed, as the method itself is not.
+    frame_code: OnceCell<&'static FrameCode>,
     /// What calling this native method needs that no call changes, resolved on its first call.
     native_link: OnceCell<NativeLink>,
 }
@@ -61,6 +62,17 @@ pub(crate) struct CodeContext {
     /// variable names in helpful `NullPointerException` messages (JEP 358).
     #[get = "pub"]
     local_variable_table: Arc<Vec<LocalVariableInfo>>,
+}
+
+/// `method` for the life of the VM, without a reference count.
+///
+/// Sound because class unloading is disabled: every `JavaMethod` that runs belongs to a loaded
+/// class, which the method registry holds for good (the invariant `Throwable.backtrace` and stack
+/// walking rely on), and so does every call-site cache that resolved to it.
+#[inline]
+pub(crate) fn immortal(method: &Arc<JavaMethod>) -> &'static JavaMethod {
+    // SAFETY: see above; the pointee is never freed while the VM runs.
+    unsafe { &*Arc::as_ptr(method) }
 }
 
 impl JavaMethod {
@@ -135,18 +147,18 @@ impl JavaMethod {
                 self.class_name, self.name_signature
             ))
         })?;
-        let code = self.frame_code.get_or_init(|| {
-            Arc::new(FrameCode {
+        let code = *self.frame_code.get_or_init(|| {
+            Box::leak(Box::new(FrameCode {
                 method_name: Arc::clone(&self.name_signature),
                 bytecode: Arc::clone(context.bytecode()),
                 class_name: Arc::clone(&self.class_name),
                 line_numbers: Arc::clone(context.line_numbers()),
                 exception_table: Arc::clone(context.exception_table()),
                 klass: Default::default(),
-            })
+            }))
         });
         let mut frame = StackFrame::from_code(
-            Arc::clone(code),
+            code,
             context.max_locals() as usize,
             context.max_stack() as usize,
         );
@@ -158,13 +170,13 @@ impl JavaMethod {
     /// chain while it executes (native methods carry no `code_context`, hence no `new_stack_frame`),
     /// holding `args` so its reference arguments stay visible as roots for the duration.
     pub fn new_native_stack_frame(&self, args: Vec<Slot>) -> StackFrame {
-        let code = self.frame_code.get_or_init(|| {
-            Arc::new(FrameCode::native(
+        let code = *self.frame_code.get_or_init(|| {
+            Box::leak(Box::new(FrameCode::native(
                 Arc::clone(&self.name_signature),
                 Arc::clone(&self.class_name),
-            ))
+            )))
         });
-        StackFrame::native_from_code(Arc::clone(code), args)
+        StackFrame::native_from_code(code, args)
     }
 
     pub fn get_method_descriptor(&self) -> &MethodDescriptor {

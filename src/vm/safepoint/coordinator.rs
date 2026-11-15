@@ -30,7 +30,7 @@ pub(crate) struct Snapshot {
 /// One frame of a published stack: the method's shared metadata and where it was executing.
 #[derive(Debug, Clone)]
 pub(crate) struct FrameSnapshot {
-    pub(crate) code: Arc<crate::vm::stack::stack_frame::FrameCode>,
+    pub(crate) code: &'static crate::vm::stack::stack_frame::FrameCode,
     pub(crate) ex_pc: usize,
     pub(crate) bci: usize,
 }

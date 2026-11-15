@@ -12,7 +12,7 @@ use crate::vm::method_area::instance_checker::InstanceChecker;
 use crate::vm::method_area::java_class::{
     InstanceField, JavaClass, MemberRef, MemberRefKind, StaticField,
 };
-use crate::vm::method_area::java_method::JavaMethod;
+use crate::vm::method_area::java_method::{immortal, JavaMethod};
 use crate::vm::method_area::loaded_classes::CLASSES;
 use crate::vm::method_area::lookup;
 use crate::vm::monitor;
@@ -590,10 +590,13 @@ static MEGAMORPHIC_TARGETS: LazyLock<DashMap<(usize, usize), Arc<JavaMethod>, Fa
 /// The target a virtual or interface site already resolved for receivers of class `klass_id`, if
 /// any: its inline ways, then the shared map past them.
 #[inline]
-pub(crate) fn cached_virtual_target(member: &MemberRef, klass_id: usize) -> Option<Arc<JavaMethod>> {
+pub(crate) fn cached_virtual_target(
+    member: &MemberRef,
+    klass_id: usize,
+) -> Option<&'static JavaMethod> {
     for way in &member.virtual_target {
         match way.get() {
-            Some((cached_id, cached)) if *cached_id == klass_id => return Some(Arc::clone(cached)),
+            Some((cached_id, cached)) if *cached_id == klass_id => return Some(immortal(cached)),
             Some(_) => continue,
             None => return None,
         }
@@ -601,7 +604,7 @@ pub(crate) fn cached_virtual_target(member: &MemberRef, klass_id: usize) -> Opti
     let site = std::ptr::from_ref(member) as usize;
     MEGAMORPHIC_TARGETS
         .get(&(klass_id, site))
-        .map(|found| Arc::clone(found.value()))
+        .map(|found| immortal(found.value()))
 }
 
 fn virtual_target(member: &MemberRef, receiver: i32, what: &str) -> Result<Arc<JavaMethod>> {

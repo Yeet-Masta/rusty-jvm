@@ -13,10 +13,9 @@ use crate::vm::execution_engine::ops_control_processor::return_to_caller;
 use crate::vm::execution_engine::ops_reference_processor::cached_virtual_target;
 use crate::vm::heap::heap::HEAP;
 use crate::vm::method_area::java_class::MemberRefKind;
-use crate::vm::method_area::java_method::JavaMethod;
+use crate::vm::method_area::java_method::{immortal, JavaMethod};
 use crate::vm::stack::stack_frame::{FrameLocalStop, StackFrames};
 use crate::vm::stack::stack_limit;
-use std::sync::Arc;
 
 const INVOKEVIRTUAL: u8 = 182;
 const INVOKESPECIAL: u8 = 183;
@@ -70,12 +69,12 @@ fn invoke(stack_frames: &mut StackFrames) -> Result<bool> {
     frame.set_bci(pc);
     frame.store_ex_pc();
     frame.advance_pc(length);
-    invoke_interpreted(stack_frames, &target)
+    invoke_interpreted(stack_frames, target)
 }
 
 /// The target and instruction length of the invoke at the top frame's pc, if its site already
 /// resolved one for this call.
-fn warm_target(stack_frames: &StackFrames) -> Result<Option<(Arc<JavaMethod>, i16)>> {
+fn warm_target(stack_frames: &StackFrames) -> Result<Option<(&'static JavaMethod, i16)>> {
     let Some(frame) = stack_frames.last() else {
         return Ok(None);
     };
@@ -107,10 +106,10 @@ fn warm_target(stack_frames: &StackFrames) -> Result<Option<(Arc<JavaMethod>, i1
             if !holder.static_fields_init_state().is_initialized() {
                 return Ok(None);
             }
-            Arc::clone(method)
+            immortal(method)
         }
         INVOKESPECIAL => match member.special_target.get() {
-            Some(method) => Arc::clone(method),
+            Some(method) => immortal(method),
             None => return Ok(None),
         },
         INVOKEVIRTUAL | INVOKEINTERFACE => {
